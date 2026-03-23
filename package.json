@@ -1,0 +1,15 @@
+{
+  "name": "finance",
+  "version": "1.0.0",
+  "description": "本指南整合了安装.md的全部要求与指令，并补充了 Autodl 云端 GPU 环境创建、在本地 Cursor 通过 SSH 远程开发、将项目上传到远端、以及按步骤完成依赖安装、MCP 配置、模型下载/训练、测试与常见问题排查的一站式流程。面向初学者，逐步执行即可。",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@anthropic-ai/claude-code": "^2.0.37"
+  }
+}

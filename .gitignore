@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Env & secrets
+.env
+.env.*
+!.env.example
+
+# Node / frontend
+node_modules/
+dist/
+*.local
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Logs & runtime
+*.log
+logs/
+Financial-MCP-Agent/logs/
+
+# Local SQLite / 开发库（勿提交）
+backend/finance.db
+
+# 内含独立 .git 的子目录：勿当普通目录提交；需纳入版本请见文档说明（子模块或删除内层 .git）
+FinRL_DeepSeek/
+
+# ---------------------------------------------------------------------------
+# 数据集与训练数据（体积大，仅本地/下载使用，不入库）
+# 来源见 README.md / docs/安装.md（HuggingFace：risk_nasdaq、nasdaq_news_sentiment 等）
+# ---------------------------------------------------------------------------
+risk_nasdaq/
+risk_nasdaq_news/
+frontend/nasdaq_news_sentiment/
+
+# 常见大文件后缀（模型权重、大块数组；若需提交小样本请用 !path/to/keep.pt 例外）
+*.safetensors
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.parquet
+*.arrow
+*.fea

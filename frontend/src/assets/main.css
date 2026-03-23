@@ -1,0 +1,122 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    @apply bg-[#0F172A] text-slate-100 font-sans;
+    font-family: 'Noto Sans SC', system-ui, sans-serif;
+  }
+
+  h1, h2, h3 {
+    font-family: 'Noto Serif SC', Georgia, serif;
+  }
+
+  /* 自定义滚动条 */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    @apply bg-transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply bg-slate-600 rounded-full;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-slate-500;
+  }
+}
+
+@layer components {
+  /* Markdown 报告渲染样式 */
+  .prose-finance {
+    @apply text-slate-200 leading-relaxed;
+  }
+  .prose-finance h1 {
+    @apply text-2xl font-bold text-amber-400 mb-4 pb-2 border-b border-slate-700 font-serif;
+  }
+  .prose-finance h2 {
+    @apply text-xl font-semibold text-amber-300 mt-6 mb-3 font-serif;
+  }
+  .prose-finance h3 {
+    @apply text-lg font-medium text-slate-200 mt-4 mb-2;
+  }
+  .prose-finance p {
+    @apply mb-3 text-slate-300;
+  }
+  .prose-finance ul {
+    @apply list-disc pl-5 mb-3 space-y-1;
+  }
+  .prose-finance ol {
+    @apply list-decimal pl-5 mb-3 space-y-1;
+  }
+  .prose-finance li {
+    @apply text-slate-300;
+  }
+  .prose-finance strong {
+    @apply text-slate-100 font-semibold;
+  }
+  .prose-finance em {
+    @apply text-amber-300 not-italic;
+  }
+  .prose-finance code {
+    @apply bg-slate-800 text-amber-300 px-1.5 py-0.5 rounded text-sm font-mono;
+  }
+  .prose-finance pre {
+    @apply bg-slate-900 border border-slate-700 rounded-lg p-4 mb-4 overflow-x-auto;
+  }
+  .prose-finance pre code {
+    @apply bg-transparent p-0 text-slate-300;
+  }
+  .prose-finance table {
+    @apply w-full border-collapse mb-4 text-sm;
+  }
+  .prose-finance th {
+    @apply bg-slate-800 text-amber-400 font-semibold px-3 py-2 text-left border border-slate-700;
+  }
+  .prose-finance td {
+    @apply px-3 py-2 border border-slate-800 text-slate-300;
+  }
+  .prose-finance tr:nth-child(even) td {
+    @apply bg-slate-900/50;
+  }
+  .prose-finance blockquote {
+    @apply border-l-4 border-amber-500 pl-4 py-1 my-3 bg-slate-900/50 text-slate-400 italic;
+  }
+  .prose-finance hr {
+    @apply border-slate-700 my-6;
+  }
+  .prose-finance a {
+    @apply text-amber-400 hover:text-amber-300 underline;
+  }
+}
+
+@layer utilities {
+  /* Phase 2：流式光标闪烁动画 */
+  @keyframes blink {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0; }
+  }
+  .animate-blink {
+    animation: blink 0.8s step-end infinite;
+  }
+
+  /* 三点跳动加载动画 */
+  @keyframes pulse-dot {
+    0%, 100% { transform: translateY(0); opacity: 0.5; }
+    50% { transform: translateY(-4px); opacity: 1; }
+  }
+  .animate-pulse-dot {
+    animation: pulse-dot 0.8s ease-in-out infinite;
+  }
+
+  /* 消息淡入动画 */
+  @keyframes fade-in {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .animate-fade-in {
+    animation: fade-in 0.2s ease-out;
+  }
+}

@@ -1,0 +1,28 @@
+\section{实习经历}
+\datedsubsection{\textbf{西门子（中国）有限公司} | AI应用开发实习生}{2025.11-2026.2}
+\textbf{项目背景：}所在团队负责开发面向客户和销售工程师的产品技术支持问答助手，服务于产品选型、参数查询、故障排查等场景。针对现有系统在长对话上下文管理、多模态文档检索方面的瓶颈，我负责记忆机制与多模态理解的算法开发工作。
+\begin{itemize}
+  \item \textbf{短期记忆与意图理解：} 针对技术支持场景中用户多轮对话指代不清、会话跨度长的问题，基于LangChain实现短期记忆管理，采用"\textbf{N轮窗口+总结}"混合策略，在问题理解环节加载历史对话和摘要实现\textbf{指代消解与主语补全}，并根据用户意图动态选择检索category，实现\textbf{细粒度文档召回}，提升多轮对话场景下的问答准确性。针对摘要生成阻塞主线程导致响应延迟2-3秒的问题，将摘要调用提交线程池异步执行，响应时间降至\textbf{500ms}。
+  \item \textbf{多模态文档解析优化：}技术文档中存在大量专业元器件图片和参数表格，现有文档解析存在表格错位、图片检测不完整等问题，经过技术选型采用\textbf{DotsOCR + vLLM部署}的端到端解析方案。针对VL生成图像描述无法贴合产品选型等场景的问题，设计\textbf{图片类型路由 + 结构化业务元数据填充}方案，文档解析准确率从78\%提升至\textbf{91\%}。
+  \item \textbf{混合检索架构设计：}针对技术问答需同时召回文字与技术图片的需求，基于入库阶段VLM生成的图片语义描述，采用\textbf{Qwen3-VL-embedding}实现图文统一向量化；设计\textbf{BM25+HNSW}混合索引（稀疏关键词+稠密语义），检索前按意图category过滤候选集，粗排后经Qwen3-VL-Reranker精排，支持文搜文/文搜图等\textbf{跨模态检索}模式。
+\end{itemize}
+
+\section{项目经历}
+\datedsubsection{\textbf{股票投资顾问Agent系统} | \textit{LangGraph、ReAct、MCP、FastAPI、PostgreSQL、Mem0、pgvector、Vue}}{2025.12-2026.3}
+\textbf{项目背景：}针对通用大模型结合网页检索在投研场景下的金融数据不一致、分析维度单一、以及多轮对话缺记忆与跨会话难个性化等问题，搭建覆盖\textbf{A股全市场}的\textbf{对话咨询 + 深度报告}双模式智能投研助手，为个人投资者提供可溯源的数据支撑与连贯交互体验。
+
+\begin{itemize}
+  \item \textbf{报告模式与多Agent协作：}基于\textbf{MCP协议}封装A股金融数据工具链（40+接口、统一Schema）。使用\textbf{LangGraph}实现多分析Agent（基本面、技术面、估值、新闻）并行与总结Agent汇总，各Agent通过\textbf{ReAct框架}自主调用MCP拉取实时数据并输出分维度结论。在报告中接入\textbf{长期记忆读取节点}，将\textbf{结构化用户画像}与\textbf{语义记忆}注入总结Prompt，使报告表述贴合用户风险偏好与关注领域。
+  \item \textbf{对话模式短期记忆：}针对会话变长带来的\textbf{上下文膨胀与早期信息丢失}，在对话链路中实现会话级\textbf{滚动摘要}与消息压缩策略：按未压缩条数触发总结并保留最近若干条原文，并支持流式压缩进度反馈；将摘要与消息落库关联，在控制Token的同时维持多轮指代与投研追问的连贯性。
+  \item \textbf{长期记忆与Mem0记忆框架：}采用\textbf{PostgreSQL结构化画像}（冷启动表单+侧栏显式编辑）与\textbf{Mem0 + pgvector}语义增强层的\textbf{双轨存储}，基于\textbf{Mem0记忆框架}实现跨会话向量存储与语义召回。主链路经统一\textbf{MemoryService}合并画像与召回结果并注入Prompt；写入侧使用\textbf{Outbox+ 后台Worker}异步同步Mem0，避免阻塞请求。结合\textbf{对话滚动摘要}在压缩轮次触发\textbf{偏好线索推断入队}，保证画像与对话核心链路可用。
+\end{itemize}
+  
+
+\datedsubsection{\textbf{基于LangGraph的多模态知识问答助手} |\textit{某国有企业横向}}{2024.11-2025.4}
+\textbf{项目背景：}服务于新入职员工了解企业内部专业知识的智能问答助手，基于LangGraph构建问答工作流（意图路由、检索、总结），采用FastAPI+PostgreSQL+Streamlit+DeepSeek技术栈。
+
+\begin{itemize}
+  \item \textbf{RAG流程搭建：}采用\textbf{MinerU}进行文档解析，将复杂版面转换为结构化Markdown；调用\textbf{Qwen-VL}生成图片结构化描述，设计标题层级+语义理解的分块策略；基于\textbf{PostgreSQL + pgvector}的HNSW索引实现向量检索，结合元数据过滤提升检索精度。在自建QA集上验证，Top-3准确率约\textbf{90\%}。
+  \item \textbf{全栈工程开发：}基于\textbf{FastAPI}构建RESTful API，使用SQLAlchemy ORM设计四表关联数据模型，实现异步数据访问与向量检索；前端采用\textbf{Streamlit}组件化UI，通过API Client统一请求与错误处理。服务采用Docker编排部署，配置超时重试与存储降级以提升可用性。
+  \item \textbf{反馈闭环机制：}设计用户反馈系统（approve/reject + 详细意见），反馈数据用于badcase分析与Prompt迭代；累计收集用户反馈\textbf{500+条}，用户采纳率约\textbf{78\%}。
+\end{itemize}
