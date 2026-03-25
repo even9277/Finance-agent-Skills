@@ -5,9 +5,8 @@ Summary Agent: Consolidates analyses from other agents into a final report.
 import os
 import time
 from typing import Dict, Any
+from pathlib import Path
 from langchain_openai import ChatOpenAI  # 恢复OpenAI导入
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
 import re
 
 from src.utils.state_definition import AgentState
@@ -19,6 +18,10 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 logger = setup_logger(__name__)
+
+_DEFAULT_FINR1_MODEL_PATH = str(
+    Path(os.getenv("FINR1_MODEL_PATH", "")).expanduser()
+) if os.getenv("FINR1_MODEL_PATH") else "/app/FinR1"
 
 
 def truncate_report_at_baseline_time(report_content: str, current_time_info: str) -> str:
@@ -101,11 +104,15 @@ def _should_truncate_report() -> bool:
     return os.getenv("TRUNCATE_REPORT_AT_BASELINE_TIME", "false").lower() in ("true", "1", "yes")
 
 
-def load_finr1_model(model_path="/root/code/Finance/FinR1"):
+def load_finr1_model(model_path: str | None = None):
     """加载FinR1模型"""
+    model_path = model_path or _DEFAULT_FINR1_MODEL_PATH
     logger.info(f"{WAIT_ICON} Loading FinR1 model from {model_path}...")
     
     try:
+        import torch
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+
         # 加载tokenizer
         tokenizer = AutoTokenizer.from_pretrained(model_path)
         
@@ -130,6 +137,8 @@ def generate_report_with_finr1(model, tokenizer, prompt, max_new_tokens=5000):
     """使用FinR1模型生成报告"""
     
     try:
+        import torch
+
         # 编码输入
         inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096)
         inputs = {k: v.to(model.device) for k, v in inputs.items()}
@@ -489,11 +498,11 @@ async def summary_agent(state: AgentState) -> Dict[str, Any]:
                 "model": "FinR1",
                 "temperature": 0.5,
                 "max_tokens": 5000,
-                "model_path": "/root/code/Finance/FinR1"
+                "model_path": _DEFAULT_FINR1_MODEL_PATH
             }
 
             # 加载FinR1模型
-            model, tokenizer = load_finr1_model()
+            model, tokenizer = load_finr1_model(_DEFAULT_FINR1_MODEL_PATH)
 
             # 组合完整的提示词
             full_prompt = f"{system_prompt}\n\n{user_prompt}"

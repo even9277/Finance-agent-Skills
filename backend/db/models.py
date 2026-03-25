@@ -45,6 +45,28 @@ class User(Base):
 
     sessions: Mapped[list["Session"]] = relationship(back_populates="user")
     reports: Mapped[list["Report"]] = relationship(back_populates="user")
+    auth_account: Mapped["AuthAccount | None"] = relationship(back_populates="user")
+
+
+class AuthAccount(Base):
+    __tablename__ = "auth_accounts"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    username: Mapped[str] = mapped_column(String(50), unique=True, index=True, nullable=False)
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    user_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        unique=True,
+        index=True,
+        nullable=False,
+    )
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+    user: Mapped["User"] = relationship(back_populates="auth_account")
 
 
 # ─────────────────────────────────────────────────────────────

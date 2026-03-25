@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref } from 'vue'
 
 const props = defineProps<{ selected: string[]; readonly?: boolean }>()
 const emit = defineEmits<{ (e: 'update', val: string[]): void }>()

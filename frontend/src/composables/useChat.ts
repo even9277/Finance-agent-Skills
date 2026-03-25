@@ -1,5 +1,5 @@
 import { ref } from 'vue'
-import { chatApi, buildWsUrl, parseWsFrame, type ChatMessage, type ChatSession, type ChatTemplate } from '@/api'
+import { chatApi, buildWsUrl, parseWsFrame, type ChatMessage, type ChatTemplate } from '@/api'
 import { useChatStore } from '@/stores/chatStore'
 import { useUserStore } from '@/stores/userStore'
 import { useMemory } from '@/composables/useMemory'

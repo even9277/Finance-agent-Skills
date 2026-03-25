@@ -1,14 +1,33 @@
 <script setup lang="ts">
 import { useRouter, useRoute } from 'vue-router'
+import { useAuthStore } from '@/stores/authStore'
+import { useChatStore } from '@/stores/chatStore'
+import { useMemoryStore } from '@/stores/memoryStore'
 import { useUserStore } from '@/stores/userStore'
 import ModeToggle from './ModeToggle.vue'
 
 const router = useRouter()
 const route = useRoute()
+const authStore = useAuthStore()
+const chatStore = useChatStore()
+const memoryStore = useMemoryStore()
 const userStore = useUserStore()
 
-const isReport = () => route.name === 'Report'
-const isChat = () => route.name === 'Chat'
+async function logout() {
+  await authStore.logout()
+  userStore.reset()
+  chatStore.reset()
+  memoryStore.resetProfile()
+  router.push('/login')
+}
+
+async function switchAccount() {
+  await authStore.logout()
+  userStore.reset()
+  chatStore.reset()
+  memoryStore.resetProfile()
+  router.push('/login?switch=1')
+}
 </script>
 
 <template>
@@ -51,6 +70,18 @@ const isChat = () => route.name === 'Chat'
       <div v-if="userStore.displayName" class="text-xs text-slate-400 hidden sm:block">
         {{ userStore.displayName }}
       </div>
+      <button
+        class="text-xs text-slate-500 hover:text-amber-300 transition-colors"
+        @click="switchAccount"
+      >
+        切换账号
+      </button>
+      <button
+        class="text-xs text-slate-500 hover:text-slate-300 transition-colors"
+        @click="logout"
+      >
+        退出
+      </button>
     </div>
   </header>
 </template>

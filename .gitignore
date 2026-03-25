@@ -2,10 +2,12 @@
 __pycache__/
 *.py[cod]
 .venv/
+.venv_lg1_test/
 venv/
 *.egg-info/
 .pytest_cache/
 .mypy_cache/
+a-share-mcp-is-just-i-need/.venv/
 
 # Env & secrets
 .env
@@ -18,6 +20,7 @@ dist/
 *.local
 
 # IDE / OS
+.cursor/
 .idea/
 .vscode/
 .DS_Store
@@ -26,9 +29,12 @@ dist/
 *.log
 logs/
 Financial-MCP-Agent/logs/
+Financial-MCP-Agent/reports/
 
 # Local SQLite / 开发库（勿提交）
 backend/finance.db
+backend/*.db
+*.sqlite3
 
 # 内含独立 .git 的子目录：勿当普通目录提交；需纳入版本请见文档说明（子模块或删除内层 .git）
 FinRL_DeepSeek/
@@ -50,3 +56,58 @@ frontend/nasdaq_news_sentiment/
 *.parquet
 *.arrow
 *.fea
+
+# LaTeX / resume build artifacts
+*.aux
+*.bbl
+*.bcf
+*.blg
+*.fdb_latexmk
+*.fls
+*.lof
+*.log
+*.lot
+*.nav
+*.out
+*.pdf
+*.run.xml
+*.snm
+*.synctex.gz
+*.toc
+
+# ---------------------------------------------------------------------------
+# 公开仓库前的内容收敛
+# 目标：保留“别人能看懂并跑通这个项目”的最小必要内容，
+# 忽略个人材料、内部开发记录、训练脚本、实验数据与无关资产。
+# ---------------------------------------------------------------------------
+
+# 个人材料 / 非项目交付物
+docs/resume.tex
+
+# 根目录实验/训练脚本与研究记录（与当前开源主项目无关）
+requirements.txt
+data_process.py
+download.py
+deep-research-report.md
+test_qwen_sentiment.py
+test_risk_model.py
+train_qwen_risk.py
+train_qwen_sentiment.py
+
+# 根目录与前端根目录的独立 node 工程文件（非当前前端主应用）
+package.json
+package-lock.json
+node_modules/
+
+# docs 目录仅保留对公开读者有帮助的文档，其余内部记录默认忽略
+docs/*.md
+!docs/skill功能集成技术说明.md
+!docs/tushare-skill-vendoring.md
+!docs/项目代码架构说明.md
+!docs/安装.md
+!docs/部署指南-PostgreSQL-Docker.md
+!docs/images/
+!docs/images/**
+
+# 与当前公开仓库关系较弱的 MCP 子项目本地测试文件
+a-share-mcp-is-just-i-need/test_*.py

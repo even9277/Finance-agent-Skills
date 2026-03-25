@@ -98,6 +98,8 @@ async def get_mcp_tools():
         # 步骤5：缓存成功加载的工具
         _mcp_tools = loaded_tools
         logger.info(f"{SUCCESS_ICON} Successfully loaded {len(_mcp_tools)} tools from 'a_share_mcp_v2'.")
+        tool_types = sorted({type(tool).__name__ for tool in loaded_tools})
+        logger.info(f"MCP tool runtime types: {tool_types}")
 
         # 可选：打印工具名称列表（用于调试）
         # tool_names = [tool.name for tool in _mcp_tools]

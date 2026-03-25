@@ -18,7 +18,9 @@ STM/LTM 分工：
   - LTM：跨会话画像，存 user_invest_profiles（权威）+ Mem0（语义增强）
 """
 
+import asyncio
 import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -36,6 +38,11 @@ if str(_AGENT_ROOT) not in sys.path:
     sys.path.insert(0, str(_AGENT_ROOT))
 
 from src.utils.logging_config import setup_logger  # noqa: E402
+from src.agents.skill_executor_node import execute_skill  # noqa: E402
+from src.agents.skill_router_node import route_chat_skill  # noqa: E402
+from src.skills.skill_registry import get_skill_registry  # noqa: E402
+from src.tools.skill_trace import log_model_stage, log_reply_completed, log_router_decision  # noqa: E402
+from src.tools.tushare_client import TushareClient, configure_tushare_client_factory  # noqa: E402
 
 logger = setup_logger("chat_service", log_dir=str(_AGENT_ROOT / "logs"))
 
@@ -44,6 +51,8 @@ logger = setup_logger("chat_service", log_dir=str(_AGENT_ROOT / "logs"))
 # ─────────────────────────────────────────────────────────────
 _RECENT_MSG_LIMIT = 12          # Phase 1/2 保留最近 N 条消息作为上下文
 _STM_COMPRESS_THRESHOLD = 10    # 对话模式 STM 压缩触发阈值（未压缩消息数）
+_CHAT_STREAM_CHUNK_SIZE = 48
+_skill_runtime_checked = False
 
 # ─────────────────────────────────────────────────────────────
 # Phase 3：画像 action 规范化（修复“模型输出枚举混乱/不在范围内”）
@@ -310,6 +319,212 @@ def _get_llm():
         openai_api_base=os.getenv("OPENAI_COMPATIBLE_BASE_URL", ""),
         temperature=0.7,
     )
+
+
+def _profile_to_summary(profile: dict) -> str:
+    if not profile:
+        return ""
+
+    summary_lines: list[str] = []
+    for label, key in (
+        ("风险偏好", "risk_level"),
+        ("投资周期", "investment_horizon"),
+        ("回答偏好", "response_pref"),
+    ):
+        value = profile.get(key)
+        if value:
+            summary_lines.append(f"{label}: {value}")
+
+    sectors = profile.get("sectors") or []
+    if sectors:
+        summary_lines.append(f"关注板块: {', '.join(str(item) for item in sectors)}")
+
+    return "\n".join(summary_lines)
+
+
+def _ensure_skill_runtime_ready() -> None:
+    global _skill_runtime_checked
+    if _skill_runtime_checked:
+        return
+
+    try:
+        get_skill_registry(refresh=True)
+    except Exception as exc:
+        logger.warning("[chat-skill] skill registry init failed: %s", exc, exc_info=True)
+
+    configure_tushare_client_factory(
+        lambda: TushareClient(token=settings.tushare_token or "")
+    )
+    _skill_runtime_checked = True
+
+
+async def _load_memory_context_for_chat(
+    db: AsyncSession,
+    user_id: str,
+    user_message: str,
+) -> tuple[dict, str]:
+    memory_profile = {}
+    memory_system_prompt = ""
+    if settings.enable_memory and user_id:
+        try:
+            ctx = await _memory_svc.get_memory_context_for_chat(user_id, user_message, db)
+            memory_profile = ctx.get("profile", {})
+            semantic_memories = ctx.get("semantic_memories", [])
+            memory_system_prompt = _build_memory_system_prompt(memory_profile, semantic_memories)
+            if memory_system_prompt:
+                print(f"[LTM-chat] 注入用户画像到对话上下文 (user={user_id[:8]}...)")
+                logger.info(
+                    f"[LTM-chat] 注入 memory_context: user={user_id}, len={len(memory_system_prompt)}"
+                )
+        except Exception as exc:
+            logger.warning(f"[LTM-chat] 读取画像失败（不影响对话）: {exc}")
+    return memory_profile, memory_system_prompt
+
+
+async def _build_skill_route_context(db: AsyncSession, session: Session) -> str:
+    parts: list[str] = []
+    if settings.enable_stm and session.running_summary:
+        parts.append(f"running_summary:\n{session.running_summary[:600]}")
+
+    if settings.enable_stm:
+        history_result = await db.execute(
+            select(Message)
+            .where(Message.session_id == session.id, Message.is_compressed == False)  # noqa: E712
+            .order_by(Message.created_at.desc())
+            .limit(6)
+        )
+    else:
+        history_result = await db.execute(
+            select(Message)
+            .where(Message.session_id == session.id)
+            .order_by(Message.created_at.desc())
+            .limit(6)
+        )
+
+    recent_messages = list(reversed(history_result.scalars().all()))
+    if recent_messages:
+        dialogue_lines = []
+        for msg in recent_messages:
+            role = "用户" if msg.role == "user" else "助手"
+            dialogue_lines.append(f"{role}: {msg.content[:240]}")
+        parts.append("recent_messages:\n" + "\n".join(dialogue_lines))
+    return "\n\n".join(parts)
+
+
+async def _run_skill_chat_if_enabled(
+    *,
+    db: AsyncSession,
+    session: Session,
+    user_id: str,
+    user_message: str,
+) -> tuple[str | None, dict, dict]:
+    if not settings.enable_chat_skills:
+        return None, {}, {}
+
+    _ensure_skill_runtime_ready()
+    memory_profile, memory_system_prompt = await _load_memory_context_for_chat(db, user_id, user_message)
+    route_context = await _build_skill_route_context(db, session)
+    route = await route_chat_skill(user_message, conversation_context=route_context)
+    log_model_stage(
+        stage="router",
+        model=(route.arguments or {}).get("router_model"),
+        execution_path="routing",
+        session_id=session.id,
+        user_id=user_id,
+    )
+    log_router_decision(
+        selected_skill=route.selected_skill,
+        confidence=route.confidence,
+        why=route.why,
+        needs_realtime_data=route.needs_realtime_data,
+        needs_professional_analysis=route.needs_professional_analysis,
+        analysis_mode=route.analysis_mode,
+        router_model=(route.arguments or {}).get("router_model"),
+        session_id=session.id,
+        user_id=user_id,
+    )
+    logger.info(
+        "[chat-skill] route=%s confidence=%.2f why=%s realtime=%s professional=%s mode=%s follow_up=%s",
+        route.selected_skill,
+        route.confidence,
+        route.why,
+        route.needs_realtime_data,
+        route.needs_professional_analysis,
+        route.analysis_mode,
+        bool((route.arguments or {}).get("is_follow_up")),
+    )
+
+    if route.selected_skill == "fallback":
+        return None, memory_profile, route.to_dict()
+
+    result = await execute_skill(
+        selected_skill=route.selected_skill,
+        user_message=user_message,
+        memory_context=memory_system_prompt,
+        running_summary=session.running_summary or "",
+        profile_summary=_profile_to_summary(memory_profile),
+        session_id=session.id,
+        user_id=user_id,
+        route_trace=route.to_dict(),
+        enable_tushare_skills=settings.enable_tushare_skills,
+        enable_tushare_planner=settings.enable_tushare_planner,
+        enable_tushare_market_tools=settings.enable_tushare_market_tools,
+        enable_tushare_index_tools=settings.enable_tushare_index_tools,
+        enable_tushare_sector_tools=settings.enable_tushare_sector_tools,
+        enable_fundamental_analysis=settings.enable_fundamental_analysis,
+        enable_sector_analysis=settings.enable_sector_analysis,
+        enable_stock_selection=settings.enable_stock_selection,
+        enable_deterministic_skill_execution=settings.enable_deterministic_skill_execution,
+        enable_tool_prefetch_concurrency=settings.enable_tool_prefetch_concurrency,
+    )
+    trace = route.to_dict()
+    trace["executor"] = result.trace
+    return result.reply_text, memory_profile, trace
+
+
+def _chunk_text(text: str, chunk_size: int = _CHAT_STREAM_CHUNK_SIZE) -> list[str]:
+    if not text:
+        return []
+    return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
+
+
+def _strip_profile_actions_from_reply(reply_text: str) -> str:
+    cleaned = (reply_text or "").strip()
+    if not cleaned:
+        return ""
+
+    # 清理规范的 <action>...</action> 标签
+    cleaned = re.sub(r"<action>.*?</action>", "", cleaned, flags=re.DOTALL).strip()
+
+    # 清理模型裸输出的画像动作 JSON，例如 {"action":"sectors","value":["半导体"]}
+    cleaned = re.sub(
+        r'^\s*\{[\s\S]*?"action"\s*:\s*"(?:update_profile|risk_level|sectors|investment_horizon|response_pref)"[\s\S]*?\}\s*$',
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip()
+    cleaned = re.sub(
+        r'\n?\s*\{[\s\S]*?"action"\s*:\s*"(?:update_profile|risk_level|sectors|investment_horizon|response_pref)"[\s\S]*?\}\s*$',
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    return cleaned
+
+
+async def _prepare_reply_for_user(
+    reply_text: str,
+    *,
+    user_id: str,
+    db: AsyncSession,
+) -> str:
+    processed = (reply_text or "").strip()
+    if not processed:
+        return ""
+    if settings.enable_memory and user_id:
+        await _handle_profile_action_in_reply(processed, user_id, db)
+    return _strip_profile_actions_from_reply(processed)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -614,77 +829,95 @@ async def chat_single_turn(
         session.title = user_message[:30]
         await db.flush()
 
-    # ── Phase 3 LTM：读取用户画像，构建个性化 system prompt ─────
-    memory_profile = {}
-    memory_system_prompt = ""
-    if settings.enable_memory and user_id:
-        try:
-            ctx = await _memory_svc.get_memory_context_for_chat(user_id, user_message, db)
-            memory_profile = ctx.get("profile", {})
-            semantic_memories = ctx.get("semantic_memories", [])
-            memory_system_prompt = _build_memory_system_prompt(memory_profile, semantic_memories)
-            if memory_system_prompt:
-                print(f"[LTM-chat] 注入用户画像到对话上下文 (user={user_id[:8]}...)")
-                logger.info(f"[LTM-chat] 注入 memory_context: user={user_id}, len={len(memory_system_prompt)}")
-        except Exception as exc:
-            logger.warning(f"[LTM-chat] 读取画像失败（不影响对话）: {exc}")
+    skill_reply_text, memory_profile, skill_trace = await _run_skill_chat_if_enabled(
+        db=db,
+        session=session,
+        user_id=user_id,
+        user_message=user_message,
+    )
 
-    # 构建 LLM messages 上下文
-    from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-
-    lc_messages = [SystemMessage(content=_CHAT_SYSTEM_PROMPT)]
-
-    # 注入 LTM 画像（ENABLE_MEMORY=true 且有实质内容时）
-    if memory_system_prompt:
-        lc_messages.append(SystemMessage(content=memory_system_prompt))
-
-    # Phase 2 STM：若有 running_summary，前置注入
-    if settings.enable_stm and session.running_summary:
-        stm_hint = (
-            f"【对话历史摘要（已压缩 {session.turn_count} 轮早期对话）】\n"
-            f"{session.running_summary}\n\n以下是最近的对话记录："
-        )
-        lc_messages.append(SystemMessage(content=stm_hint))
-        print(f"[STM-chat] 注入 running_summary（{len(session.running_summary)} 字）到上下文")
+    reply_prepared = False
+    if skill_reply_text is not None:
+        reply_text = await _prepare_reply_for_user(skill_reply_text, user_id=user_id, db=db)
+        reply_prepared = True
         logger.info(
-            f"[STM-chat] 注入 running_summary: session={session.id[:8]}, "
-            f"summary_len={len(session.running_summary)}"
+            "[chat-skill] sync executed: session=%s skill=%s",
+            session.id,
+            skill_trace.get("selected_skill"),
         )
-
-    # 加载最近消息（STM 模式只取未压缩的；非 STM 模式取最近 N 条）
-    if settings.enable_stm:
-        history_result = await db.execute(
-            select(Message)
-            .where(Message.session_id == session.id, Message.is_compressed == False)  # noqa: E712
-            .order_by(Message.created_at.desc())
-            .limit(_RECENT_MSG_LIMIT + 1)
+        log_reply_completed(
+            mode="skill",
+            session_id=session.id,
+            user_id=user_id,
+            selected_skill=skill_trace.get("selected_skill"),
+            analysis_mode=skill_trace.get("analysis_mode"),
         )
     else:
-        history_result = await db.execute(
-            select(Message)
-            .where(Message.session_id == session.id)
-            .order_by(Message.created_at.desc())
-            .limit(_RECENT_MSG_LIMIT + 1)
+        # ── Phase 3 LTM：读取用户画像，构建个性化 system prompt ─────
+        memory_profile, memory_system_prompt = await _load_memory_context_for_chat(
+            db, user_id, user_message
         )
-    recent_messages = list(reversed(history_result.scalars().all()))
 
-    for msg in recent_messages:
-        if msg.role == "user":
-            lc_messages.append(HumanMessage(content=msg.content))
-        elif msg.role == "assistant":
-            lc_messages.append(AIMessage(content=msg.content))
+        # 构建 LLM messages 上下文
+        from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-    # 调用 LLM（同步返回）
-    llm = _get_llm()
-    response = await llm.ainvoke(lc_messages)
-    reply_text = response.content
+        lc_messages = [SystemMessage(content=_CHAT_SYSTEM_PROMPT)]
+
+        # 注入 LTM 画像（ENABLE_MEMORY=true 且有实质内容时）
+        if memory_system_prompt:
+            lc_messages.append(SystemMessage(content=memory_system_prompt))
+
+        # Phase 2 STM：若有 running_summary，前置注入
+        if settings.enable_stm and session.running_summary:
+            stm_hint = (
+                f"【对话历史摘要（已压缩 {session.turn_count} 轮早期对话）】\n"
+                f"{session.running_summary}\n\n以下是最近的对话记录："
+            )
+            lc_messages.append(SystemMessage(content=stm_hint))
+            print(f"[STM-chat] 注入 running_summary（{len(session.running_summary)} 字）到上下文")
+            logger.info(
+                f"[STM-chat] 注入 running_summary: session={session.id[:8]}, "
+                f"summary_len={len(session.running_summary)}"
+            )
+
+        # 加载最近消息（STM 模式只取未压缩的；非 STM 模式取最近 N 条）
+        if settings.enable_stm:
+            history_result = await db.execute(
+                select(Message)
+                .where(Message.session_id == session.id, Message.is_compressed == False)  # noqa: E712
+                .order_by(Message.created_at.desc())
+                .limit(_RECENT_MSG_LIMIT + 1)
+            )
+        else:
+            history_result = await db.execute(
+                select(Message)
+                .where(Message.session_id == session.id)
+                .order_by(Message.created_at.desc())
+                .limit(_RECENT_MSG_LIMIT + 1)
+            )
+        recent_messages = list(reversed(history_result.scalars().all()))
+
+        for msg in recent_messages:
+            if msg.role == "user":
+                lc_messages.append(HumanMessage(content=msg.content))
+            elif msg.role == "assistant":
+                lc_messages.append(AIMessage(content=msg.content))
+
+        # 调用 LLM（同步返回）
+        llm = _get_llm()
+        response = await llm.ainvoke(lc_messages)
+        reply_text = response.content
+        log_reply_completed(
+            mode="fallback",
+            session_id=session.id,
+            user_id=user_id,
+            selected_skill="fallback",
+            analysis_mode="general_chat",
+        )
 
     # ── Phase 3 LTM：解析 LLM 回复中的显式 profile update action ──
-    if settings.enable_memory:
-        await _handle_profile_action_in_reply(reply_text, user_id, db)
-        # 清理 reply 中的 <action> 标签（不暴露给用户）
-        import re as _re
-        reply_text = _re.sub(r'<action>.*?</action>', '', reply_text, flags=_re.DOTALL).strip()
+    if settings.enable_memory and not reply_prepared:
+        reply_text = await _prepare_reply_for_user(reply_text, user_id=user_id, db=db)
 
     # 保存 assistant 消息
     ai_msg = Message(
@@ -713,7 +946,6 @@ async def chat_single_turn(
         compress_result = await compress_if_needed(db, session.id)
         # P3 钩子：压缩成功后从高质量摘要中提取画像
         if compress_result and settings.enable_memory and user_id:
-            import asyncio
             asyncio.create_task(
                 _extract_from_summary(
                     session_id=session.id,
@@ -724,7 +956,6 @@ async def chat_single_turn(
 
     # Phase 3 LTM：非阻塞触发 LTM 更新（asyncio.create_task 后台执行）
     if settings.enable_memory and user_id:
-        import asyncio
         asyncio.create_task(
             maybe_update_ltm_from_chat(session.id, user_id, session.turn_count)
         )
@@ -769,6 +1000,73 @@ async def stream_chat_single_turn(
 
     # 通知前端会话 ID（新建会话时前端需要更新 currentSessionId）
     yield json.dumps({"type": "session_id", "session_id": session.id}, ensure_ascii=False)
+
+    skill_reply_text, _, skill_trace = await _run_skill_chat_if_enabled(
+        db=db,
+        session=session,
+        user_id=user_id,
+        user_message=user_message,
+    )
+    if skill_reply_text is not None:
+        skill_reply_text = await _prepare_reply_for_user(skill_reply_text, user_id=user_id, db=db)
+        logger.info(
+            "[chat-skill] stream executed: session=%s skill=%s",
+            session.id,
+            skill_trace.get("selected_skill"),
+        )
+        for chunk in _chunk_text(skill_reply_text):
+            yield chunk
+
+        ai_msg = Message(session_id=session.id, role="assistant", content=skill_reply_text)
+        db.add(ai_msg)
+        session.turn_count = (session.turn_count or 0) + 1
+        session.updated_at = datetime.utcnow()
+        await db.commit()
+
+        if settings.enable_memory and user_id:
+            asyncio.create_task(maybe_update_ltm_from_chat(session.id, user_id, session.turn_count))
+
+        if settings.enable_stm:
+            yield json.dumps(
+                {
+                    "type": "compress_start",
+                    "session_id": session.id,
+                    "progress": 0,
+                    "eta_seconds": 8,
+                },
+                ensure_ascii=False,
+            )
+            compress_start = datetime.utcnow()
+            result = await compress_if_needed(db, session.id)
+            compress_elapsed = max(1, int((datetime.utcnow() - compress_start).total_seconds()))
+            if result:
+                yield json.dumps(
+                    {
+                        "type": "compress_done",
+                        "session_id": session.id,
+                        "progress": 100,
+                        "eta_seconds": 0,
+                        "elapsed_seconds": compress_elapsed,
+                        "snapshot_id": result.get("snapshot_id"),
+                        "compressed_message_count": result.get("compressed_message_count"),
+                        "total_message_count": result.get("total_message_count"),
+                        "percent": result.get("percent"),
+                    },
+                    ensure_ascii=False,
+                )
+            else:
+                yield json.dumps(
+                    {
+                        "type": "compress_skip",
+                        "session_id": session.id,
+                        "progress": 100,
+                        "eta_seconds": 0,
+                    },
+                    ensure_ascii=False,
+                )
+
+        yield json.dumps({"type": "done", "session_id": session.id}, ensure_ascii=False)
+        return
 
     # 构建上下文（与 chat_single_turn 逻辑保持一致，包含 LTM 画像注入）
     from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -838,6 +1136,13 @@ async def stream_chat_single_turn(
                 yield token
 
         reply_text = "".join(reply_chunks)
+        log_reply_completed(
+            mode="fallback-stream",
+            session_id=session.id,
+            user_id=user_id,
+            selected_skill="fallback",
+            analysis_mode="general_chat",
+        )
 
         # 保存 assistant 消息
         ai_msg = Message(session_id=session.id, role="assistant", content=reply_text)
@@ -857,14 +1162,10 @@ async def stream_chat_single_turn(
 
         # Phase 3: 流式模式也要解析 LLM 回复中的 <action> 并更新画像
         if settings.enable_memory and user_id:
-            try:
-                await _handle_profile_action_in_reply(reply_text, user_id, db)
-            except Exception as e:
-                logger.warning(f"[chat-stream] 处理 action 标签失败（不影响对话）: {e}")
+            reply_text = await _prepare_reply_for_user(reply_text, user_id=user_id, db=db)
 
         # Phase 3: 流式模式也要后台更新 LTM
         if settings.enable_memory and user_id:
-            import asyncio
             asyncio.create_task(maybe_update_ltm_from_chat(session.id, user_id, session.turn_count))
 
         # Phase 2 STM 压缩（推送进度帧）
@@ -903,8 +1204,7 @@ async def stream_chat_single_turn(
                 )
                 # P3 钩子：从高质量摘要中提取画像（非阻塞）
                 if settings.enable_memory and user_id:
-                    import asyncio as _asyncio
-                    _asyncio.create_task(
+                    asyncio.create_task(
                         _extract_from_summary(
                             session_id=session.id,
                             user_id=user_id,

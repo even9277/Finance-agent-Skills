@@ -6,8 +6,9 @@ Phase 4: 完整实现
 
 import uuid
 
-from fastapi import APIRouter, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, UploadFile
 
+from backend.middleware.auth import AuthContext, require_auth, require_query_user
 from backend.schemas.portfolio import (
     HoldingCreateRequest,
     HoldingItem,
@@ -22,52 +23,52 @@ _STUB_NOTE = "Phase 1 预留接口，Phase 4 完整实现"
 
 
 @router.post("/holdings/upload", summary="CSV 批量上传持仓（Phase 4）")
-async def upload_holdings(file: UploadFile):
+async def upload_holdings(file: UploadFile, _: AuthContext = Depends(require_auth)):
     return {"message": _STUB_NOTE, "filename": file.filename}
 
 
 @router.post("/holdings", summary="单条录入持仓（Phase 4）")
-async def create_holding(body: HoldingCreateRequest):
+async def create_holding(body: HoldingCreateRequest, _: AuthContext = Depends(require_auth)):
     return {"message": _STUB_NOTE}
 
 
 @router.get("/holdings", response_model=list[HoldingItem], summary="获取持仓列表（Phase 4）")
-async def get_holdings(user_id: str):
+async def get_holdings(user_id: str = Depends(require_query_user)):
     return []
 
 
 @router.put("/holdings/{holding_id}", summary="修改持仓（Phase 4）")
-async def update_holding(holding_id: str, body: HoldingCreateRequest):
+async def update_holding(holding_id: str, body: HoldingCreateRequest, _: AuthContext = Depends(require_auth)):
     return {"message": _STUB_NOTE}
 
 
 @router.delete("/holdings/{holding_id}", summary="删除持仓（Phase 4）")
-async def delete_holding(holding_id: str):
+async def delete_holding(holding_id: str, _: AuthContext = Depends(require_auth)):
     return {"message": _STUB_NOTE}
 
 
 @router.post("/watchlist", summary="添加自选股（Phase 4）")
-async def add_watchlist(user_id: str, body: WatchlistAddRequest):
+async def add_watchlist(body: WatchlistAddRequest, user_id: str = Depends(require_query_user)):
     return {"message": _STUB_NOTE}
 
 
 @router.get("/watchlist", response_model=list[WatchlistItem], summary="获取自选股列表（Phase 4）")
-async def get_watchlist(user_id: str):
+async def get_watchlist(user_id: str = Depends(require_query_user)):
     return []
 
 
 @router.delete("/watchlist/{stock_code}", summary="删除自选股（Phase 4）")
-async def delete_watchlist(user_id: str, stock_code: str):
+async def delete_watchlist(stock_code: str, user_id: str = Depends(require_query_user)):
     return {"message": _STUB_NOTE}
 
 
 @router.get("/prices/daily", summary="批量获取前日收盘价及涨跌幅（Phase 4）")
-async def get_daily_prices(user_id: str):
+async def get_daily_prices(user_id: str = Depends(require_query_user)):
     return {"prices": {}, "note": _STUB_NOTE}
 
 
 @router.post("/sync", response_model=SyncResponse, summary="一键同步最新行情（Phase 4）")
-async def sync_prices(user_id: str):
+async def sync_prices(user_id: str = Depends(require_query_user)):
     return SyncResponse(task_id=str(uuid.uuid4()))
 
 

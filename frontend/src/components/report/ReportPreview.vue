@@ -2,7 +2,7 @@
 import { onMounted, onUnmounted } from 'vue'
 import ReportRenderer from './ReportRenderer.vue'
 
-const props = defineProps<{ content: string; open: boolean }>()
+defineProps<{ content: string; open: boolean }>()
 const emit = defineEmits<{ (e: 'close'): void }>()
 
 function handleKey(e: KeyboardEvent) {

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-const props = defineProps<{
+defineProps<{
   reportId: string
   onDownload: () => void
   onPreview: () => void

@@ -5,6 +5,9 @@
 
 import axios from 'axios'
 
+export const ACCESS_TOKEN_KEY = 'finance_access_token'
+export const AUTH_USER_KEY = 'finance_auth_user'
+
 // ─────────────────────────────────────────────────────────────
 // Axios 实例
 // ─────────────────────────────────────────────────────────────
@@ -12,6 +15,15 @@ export const http = axios.create({
   baseURL: '/api',
   timeout: 30000,
   headers: { 'Content-Type': 'application/json' },
+})
+
+http.interceptors.request.use((config) => {
+  const token = localStorage.getItem(ACCESS_TOKEN_KEY)
+  if (token) {
+    config.headers = config.headers || {}
+    config.headers.Authorization = `Bearer ${token}`
+  }
+  return config
 })
 
 http.interceptors.response.use(
@@ -116,6 +128,25 @@ export interface UserProfile {
   display_name?: string
   cold_start_done: boolean
   created_at: string
+}
+
+export interface AuthUser {
+  user_id: string
+  username: string
+  display_name?: string
+  cold_start_done: boolean
+  created_at: string
+}
+
+export interface AuthLoginResponse extends AuthUser {
+  access_token: string
+  token_type: 'bearer'
+}
+
+export interface AuthRegisterRequest {
+  username: string
+  password: string
+  display_name?: string
 }
 
 export interface MemoryProfile {
@@ -235,6 +266,21 @@ export const userApi = {
 }
 
 // ─────────────────────────────────────────────────────────────
+// 鉴权 API
+// ─────────────────────────────────────────────────────────────
+export const authApi = {
+  login: (username: string, password: string) =>
+    http.post<AuthLoginResponse>('/auth/login', { username, password }),
+
+  register: (payload: AuthRegisterRequest) =>
+    http.post<AuthLoginResponse>('/auth/register', payload),
+
+  me: () => http.get<AuthUser>('/auth/me'),
+
+  logout: () => http.post<{ message: string }>('/auth/logout'),
+}
+
+// ─────────────────────────────────────────────────────────────
 // 记忆 API（Phase 3 完整实现）
 // ─────────────────────────────────────────────────────────────
 export const memoryApi = {
@@ -338,5 +384,10 @@ export function parseWsFrame(raw: string): WsControlFrame | null {
 export function buildWsUrl(path: string): string {
   const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws'
   const host = window.location.host
-  return `${protocol}://${host}/api${path}`
+  const url = new URL(`${protocol}://${host}/api${path}`)
+  const token = localStorage.getItem(ACCESS_TOKEN_KEY)
+  if (token) {
+    url.searchParams.set('token', token)
+  }
+  return url.toString()
 }

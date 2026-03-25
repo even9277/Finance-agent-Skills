@@ -119,6 +119,21 @@ export const useChatStore = defineStore('chat', () => {
     currentRunningSummary.value = summary || null
   }
 
+  function reset() {
+    sessions.value = []
+    currentSessionId.value = null
+    messages.value = []
+    isLoading.value = false
+    isSending.value = false
+    isStreaming.value = false
+    currentRunningSummary.value = null
+    streamingMessageId.value = null
+    isCompressing.value = false
+    compressProgress.value = 0
+    compressEtaSeconds.value = null
+    lastCompressPercent.value = null
+  }
+
   return {
     sessions,
     currentSessionId,
@@ -146,5 +161,6 @@ export const useChatStore = defineStore('chat', () => {
     removeSession,
     renameSession,
     setRunningSummary,
+    reset,
   }
 })

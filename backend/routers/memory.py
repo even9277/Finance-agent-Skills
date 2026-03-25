@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.db.database import get_db
+from backend.middleware.auth import require_query_user
 from backend.schemas.memory import (
     MemoryAddRequest,
     MemoryEvidenceResponse,
@@ -45,7 +46,7 @@ router = APIRouter()
 
 @router.get("/profile", response_model=MemoryProfileResponse, summary="获取用户 LTM 结构化画像")
 async def get_memory_profile(
-    user_id: str = Query(..., description="用户ID"),
+    user_id: str = Depends(require_query_user),
     db: AsyncSession = Depends(get_db),
 ):
     profile_data = await memory_service.get_user_profile(user_id, db)
@@ -70,7 +71,7 @@ async def get_memory_profile(
 
 @router.put("/profile/risk", summary="更新风险偏好（RiskProfileCard 调用）")
 async def update_risk(
-    user_id: str = Query(...),
+    user_id: str = Depends(require_query_user),
     body: MemoryUpdateRiskRequest = ...,
     db: AsyncSession = Depends(get_db),
 ):
@@ -86,7 +87,7 @@ async def update_risk(
 
 @router.put("/profile/sectors", summary="更新关注板块（SectorTagSelector 调用）")
 async def update_sectors(
-    user_id: str = Query(...),
+    user_id: str = Depends(require_query_user),
     body: MemoryUpdateSectorsRequest = ...,
     db: AsyncSession = Depends(get_db),
 ):
@@ -102,7 +103,7 @@ async def update_sectors(
 
 @router.put("/profile/return", summary="更新期望收益（ReturnExpectation 调用）")
 async def update_return(
-    user_id: str = Query(...),
+    user_id: str = Depends(require_query_user),
     body: MemoryUpdateReturnRequest = ...,
     db: AsyncSession = Depends(get_db),
 ):
@@ -131,7 +132,7 @@ async def update_return(
 
 @router.put("/profile/horizon", summary="更新投资周期")
 async def update_horizon(
-    user_id: str = Query(...),
+    user_id: str = Depends(require_query_user),
     body: MemoryUpdateHorizonRequest = ...,
     db: AsyncSession = Depends(get_db),
 ):
@@ -149,7 +150,7 @@ async def update_horizon(
 
 @router.put("/profile/pref", summary="更新回答偏好")
 async def update_pref(
-    user_id: str = Query(...),
+    user_id: str = Depends(require_query_user),
     body: MemoryUpdateResponsePrefRequest = ...,
     db: AsyncSession = Depends(get_db),
 ):
@@ -164,7 +165,7 @@ async def update_pref(
 
 @router.get("/items", response_model=MemoryItemsResponse, summary="获取所有记忆条目（分页）")
 async def get_memory_items(
-    user_id: str = Query(...),
+    user_id: str = Depends(require_query_user),
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
@@ -180,7 +181,7 @@ async def get_memory_items(
 
 @router.post("/items", summary="手动添加记忆条目")
 async def add_memory_item(
-    user_id: str = Query(...),
+    user_id: str = Depends(require_query_user),
     body: MemoryAddRequest = ...,
     db: AsyncSession = Depends(get_db),
 ):
@@ -198,7 +199,7 @@ async def add_memory_item(
 @router.put("/items/{memory_id}", summary="编辑记忆条目")
 async def update_memory_item(
     memory_id: str,
-    user_id: str = Query(...),
+    user_id: str = Depends(require_query_user),
     body: MemoryUpdateRequest = ...,
     db: AsyncSession = Depends(get_db),
 ):
@@ -218,7 +219,7 @@ async def update_memory_item(
 @router.delete("/items/{memory_id}", summary="删除记忆条目")
 async def delete_memory_item(
     memory_id: str,
-    user_id: str = Query(...),
+    user_id: str = Depends(require_query_user),
     db: AsyncSession = Depends(get_db),
 ):
     ok = await memory_service.delete_memory_item(user_id, memory_id, db)
@@ -234,7 +235,7 @@ async def delete_memory_item(
 
 @router.delete("/all", summary="清空所有记忆（二次确认后调用）")
 async def delete_all_memories(
-    user_id: str = Query(...),
+    user_id: str = Depends(require_query_user),
     confirm: bool = Query(False, description="必须传 true 才执行"),
     db: AsyncSession = Depends(get_db),
 ):
@@ -260,7 +261,7 @@ async def delete_all_memories(
 )
 async def get_memory_evidence(
     memory_id: str,
-    user_id: str = Query(...),
+    user_id: str = Depends(require_query_user),
     db: AsyncSession = Depends(get_db),
 ):
     result = await memory_service.get_memory_evidence(user_id, memory_id, db)

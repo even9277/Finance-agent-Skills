@@ -2,7 +2,7 @@
 import { ref } from 'vue'
 import NavBar from './NavBar.vue'
 
-const props = defineProps<{
+defineProps<{
   sidebar?: boolean  // 是否显示侧边栏插槽
 }>()
 

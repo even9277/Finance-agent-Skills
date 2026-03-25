@@ -1,5 +1,5 @@
 <script setup lang="ts">
-const props = defineProps<{ value?: string; readonly?: boolean }>()
+defineProps<{ value?: string; readonly?: boolean }>()
 const emit = defineEmits<{ (e: 'update', val: string): void }>()
 
 const options = [

@@ -8,6 +8,7 @@
 from pathlib import Path
 from typing import List
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
 
 _BACKEND_DIR = Path(__file__).resolve().parent
@@ -45,6 +46,18 @@ class Settings(BaseSettings):
     # ── Feature Flags ─────────────────────────────────────
     enable_stm: bool = False    # Phase 2 激活
     enable_memory: bool = False  # Phase 3 激活
+    enable_chat_skills: bool = False  # Phase 1 skill-first chat
+    enable_tushare_skills: bool = False  # Phase 1 tushare skill bundle
+    enable_tushare_planner: bool = False
+    enable_tushare_market_tools: bool = False
+    enable_tushare_index_tools: bool = False
+    enable_tushare_sector_tools: bool = False
+    enable_fundamental_analysis: bool = False
+    enable_sector_analysis: bool = False
+    enable_stock_selection: bool = False
+    enable_deterministic_skill_execution: bool = True
+    enable_tool_prefetch_concurrency: bool = True
+    auth_enabled: bool = True
 
     # ── Mem0 / pgvector 配置（Phase 3）────────────────────
     # PostgreSQL 连接（Mem0 向量库使用，SQLite 环境下这些配置被忽略）
@@ -57,6 +70,16 @@ class Settings(BaseSettings):
     embed_dims: int = 1536
     # 嵌入模型（留空则复用 OPENAI_COMPATIBLE_MODEL）
     embed_model: str = ""
+    # Skill Chat 模型分层
+    chat_router_model: str = "kimi-k2.5"
+    chat_resolver_model: str = "kimi-k2.5"
+    chat_skill_synthesis_model: str = ""
+    # Tushare（Phase 1）
+    tushare_token: str = ""
+    # Auth/JWT
+    jwt_secret_key: str = "change-me-in-production-please-use-a-long-random-secret"
+    jwt_algorithm: str = "HS256"
+    jwt_expire_minutes: int = 60 * 24 * 7
     # LTM Worker 轮询间隔（秒）
     ltm_worker_interval_sec: int = 5
     # LTM 触发最小间隔（秒，同一会话两次 enqueue_add_conversation 的最小间隔）
@@ -70,6 +93,21 @@ class Settings(BaseSettings):
     @property
     def project_root(self) -> Path:
         return _PROJECT_ROOT
+
+    @field_validator("debug", mode="before")
+    @classmethod
+    def _normalize_debug(cls, value):
+        """
+        Be permissive with historical env values like DEBUG=release/debug.
+        Pydantic v2 no longer treats these as booleans automatically.
+        """
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"release", "prod", "production"}:
+                return False
+            if normalized in {"debug", "dev", "development"}:
+                return True
+        return value
 
     model_config = {
         "env_file": [

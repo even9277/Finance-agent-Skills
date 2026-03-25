@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
-import type { MemoryProfile, MemoryItem } from '@/api'
+import type { MemoryProfile, MemoryItem, MemoryStats } from '@/api'
 
 export const useMemoryStore = defineStore('memory', () => {
   // ── 结构化画像（来自 user_invest_profiles 权威表）──────────
@@ -24,7 +24,7 @@ export const useMemoryStore = defineStore('memory', () => {
   const totalMemories = ref(0)
 
   // ── Phase 3 统计数据 ────────────────────────────────────────
-  const stats = ref({
+  const stats = ref<MemoryStats>({
     from_conversations: 0,
     from_reports: 0,
     from_manual: 0,
@@ -47,7 +47,7 @@ export const useMemoryStore = defineStore('memory', () => {
     loaded.value = true
   }
 
-  function setStats(data: Record<string, number>) {
+  function setStats(data: MemoryStats) {
     stats.value = { ...stats.value, ...data }
   }
 

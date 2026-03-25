@@ -5,14 +5,12 @@ TechnicalAnalysis Agent: Performs technical analysis of a stock using ReAct Agen
 import os
 import json
 from typing import Dict, Any, List, Optional
-from langchain_core.prompts import PromptTemplate
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, BaseMessage
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.outputs import ChatResult, ChatGeneration
-from langgraph.prebuilt import create_react_agent
+from langchain_core.messages import HumanMessage
 import time
 
+from src.agents.agent_factory import build_analysis_agent
+from src.agents.response_normalizer import extract_final_text
 from src.utils.state_definition import AgentState
 from src.tools.mcp_client import get_mcp_tools
 from src.utils.logging_config import setup_logger, ERROR_ICON, SUCCESS_ICON, WAIT_ICON
@@ -106,7 +104,10 @@ async def technical_agent(state: AgentState) -> AgentState:
 
             # 3. 创建ReAct Agent - 只传入LLM和工具
             logger.info(f"{WAIT_ICON} TechnicalAgent: Creating ReAct agent...")
-            agent = create_react_agent(llm, mcp_tools)
+            agent = build_analysis_agent(
+                model=llm,
+                tools=mcp_tools,
+            )
 
             # 4. 准备输入数据，构建详细的分析请求
             stock_code = current_data.get('stock_code', 'Unknown')
@@ -153,28 +154,7 @@ async def technical_agent(state: AgentState) -> AgentState:
             logger.info(f"ReAct agent execution completed in {execution_time:.2f} seconds")
 
             # 6. 提取分析结果
-            final_output = "No analysis generated."
-            
-            if "messages" in response and isinstance(response["messages"], list):
-                messages = response["messages"]
-                # 查找最后一条AI消息，这通常包含最终的分析结果
-                ai_messages = [msg for msg in messages if isinstance(msg, AIMessage)]
-                if ai_messages:
-                    last_ai_message = ai_messages[-1]
-                    final_output = last_ai_message.content
-                    logger.info(f"Successfully extracted analysis from AI message.")
-                else:
-                    logger.warning("No AI messages found in response")
-                    # 如果没有AI消息，尝试获取所有消息的内容
-                    all_content = []
-                    for msg in messages:
-                        if hasattr(msg, 'content') and msg.content:
-                            all_content.append(str(msg.content))
-                    if all_content:
-                        final_output = "\n".join(all_content)
-            else:
-                logger.error(f"Unexpected response format: {type(response)}")
-                logger.error(f"Response keys: {response.keys() if isinstance(response, dict) else 'Not a dict'}")
+            final_output = extract_final_text(response)
 
             logger.info(f"Final extracted analysis length: {len(final_output)} characters")
             print(f"TECHNICALAGENT: {final_output}")

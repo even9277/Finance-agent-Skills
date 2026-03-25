@@ -15,8 +15,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.config import settings
-from backend.db.database import init_db
-from backend.routers import chat, memory, portfolio, report, user
+from backend.db.database import AsyncSessionFactory, init_db
+from backend.middleware.auth import AuthMiddleware
+from backend.routers import auth, chat, memory, portfolio, report, user
 
 _AGENT_ROOT = Path(__file__).resolve().parent.parent / "Financial-MCP-Agent"
 if str(_AGENT_ROOT) not in sys.path:
@@ -43,6 +44,18 @@ async def lifespan(app: FastAPI):
     await init_db()
     print("[backend] 数据库初始化完成 ✓")
     logger.info("[backend] 数据库初始化完成")
+
+    if settings.auth_enabled:
+        try:
+            from backend.services.auth_service import ensure_seed_accounts
+
+            async with AsyncSessionFactory() as session:
+                await ensure_seed_accounts(session)
+            print("[backend] 预置登录账号已校准 ✓")
+            logger.info("[backend] 预置登录账号已校准")
+        except Exception as exc:
+            print(f"[backend] 预置登录账号初始化失败: {exc}")
+            logger.error(f"[backend] 预置登录账号初始化失败: {exc}", exc_info=True)
 
     # 2. Phase 3 LTM：初始化 Mem0 + 启动 ltm_worker
     if settings.enable_memory:
@@ -122,7 +135,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(AuthMiddleware)
 
+app.include_router(auth.router, prefix="/api/auth", tags=["鉴权"])
 app.include_router(report.router, prefix="/api/report", tags=["调研报告"])
 app.include_router(chat.router, prefix="/api/chat", tags=["对话"])
 app.include_router(memory.router, prefix="/api/memory", tags=["记忆画像"])

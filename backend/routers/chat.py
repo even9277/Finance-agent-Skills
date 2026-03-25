@@ -8,6 +8,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSock
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.db.database import get_db, AsyncSessionFactory
+from backend.middleware.auth import (
+    AuthContext,
+    authenticate_websocket,
+    ensure_user_access,
+    require_auth,
+    require_query_user,
+)
 from backend.schemas.chat import (
     ChatMessage,
     ChatMessageRequest,
@@ -40,10 +47,15 @@ _TEMPLATES = [
 # POST /api/chat/message
 # ─────────────────────────────────────────────────────────────
 @router.post("/message", response_model=ChatMessageResponse, summary="发送消息（同步返回）")
-async def send_message(body: ChatMessageRequest, db: AsyncSession = Depends(get_db)):
+async def send_message(
+    body: ChatMessageRequest,
+    db: AsyncSession = Depends(get_db),
+    auth: AuthContext = Depends(require_auth),
+):
+    effective_user_id = ensure_user_access(body.user_id, auth)
     reply, session_id, memory_profile = await chat_service.chat_single_turn(
         db=db,
-        user_id=body.user_id,
+        user_id=effective_user_id,
         user_message=body.message,
         session_id=body.session_id,
     )
@@ -78,6 +90,7 @@ async def chat_stream(websocket: WebSocket):
     print("[WS /chat/stream] 新连接建立")
 
     try:
+        auth = await authenticate_websocket(websocket)
         # 接收请求体
         raw = await websocket.receive_text()
         try:
@@ -95,6 +108,7 @@ async def chat_stream(websocket: WebSocket):
             await websocket.send_json({"type": "error", "message": "user_id 和 message 不能为空"})
             await websocket.close()
             return
+        effective_user_id = ensure_user_access(user_id, auth)
 
         print(f"[WS /chat/stream] user={user_id[:8]} msg={user_message[:40]}...")
         logger.info(f"[WS /chat/stream] user={user_id}, session={session_id}, msg_len={len(user_message)}")
@@ -103,7 +117,7 @@ async def chat_stream(websocket: WebSocket):
         async with AsyncSessionFactory() as db:
             async for chunk in chat_service.stream_chat_single_turn(
                 db=db,
-                user_id=user_id,
+                user_id=effective_user_id,
                 user_message=user_message,
                 session_id=session_id,
             ):
@@ -131,7 +145,7 @@ async def chat_stream(websocket: WebSocket):
 # ─────────────────────────────────────────────────────────────
 @router.get("/sessions", response_model=list[ChatSessionListItem], summary="会话列表")
 async def list_sessions(
-    user_id: str,
+    user_id: str = Depends(require_query_user),
     q: Optional[str] = Query(None, description="搜索关键词（会话标题）"),
     db: AsyncSession = Depends(get_db),
 ):
@@ -158,8 +172,8 @@ async def list_sessions(
 @router.patch("/sessions/{session_id}", summary="重命名会话")
 async def rename_session(
     session_id: str,
-    user_id: str,
     body: ChatSessionRenameRequest,
+    user_id: str = Depends(require_query_user),
     db: AsyncSession = Depends(get_db),
 ):
     ok = await chat_service.rename_session(db, session_id, user_id, body.title)
@@ -173,7 +187,9 @@ async def rename_session(
 # ─────────────────────────────────────────────────────────────
 @router.get("/sessions/{session_id}/messages", response_model=ChatSessionMessages, summary="会话完整消息历史")
 async def get_session_messages(
-    session_id: str, user_id: str, db: AsyncSession = Depends(get_db)
+    session_id: str,
+    user_id: str = Depends(require_query_user),
+    db: AsyncSession = Depends(get_db),
 ):
     messages = await chat_service.get_session_messages(db, session_id, user_id)
     return ChatSessionMessages(
@@ -201,7 +217,9 @@ async def get_session_messages(
     summary="会话摘要历史（压缩快照）",
 )
 async def get_session_summaries(
-    session_id: str, user_id: str, db: AsyncSession = Depends(get_db)
+    session_id: str,
+    user_id: str = Depends(require_query_user),
+    db: AsyncSession = Depends(get_db),
 ):
     items = await chat_service.get_session_summaries(db, session_id, user_id)
     return ChatSessionSummaries(
@@ -215,7 +233,9 @@ async def get_session_summaries(
 # ─────────────────────────────────────────────────────────────
 @router.delete("/sessions/{session_id}", summary="删除会话")
 async def delete_session(
-    session_id: str, user_id: str, db: AsyncSession = Depends(get_db)
+    session_id: str,
+    user_id: str = Depends(require_query_user),
+    db: AsyncSession = Depends(get_db),
 ):
     ok = await chat_service.delete_session(db, session_id, user_id)
     if not ok:
@@ -227,5 +247,5 @@ async def delete_session(
 # GET /api/chat/templates
 # ─────────────────────────────────────────────────────────────
 @router.get("/templates", response_model=list[ChatTemplateItem], summary="获取模板问题列表")
-async def get_templates():
+async def get_templates(_: AuthContext = Depends(require_auth)):
     return _TEMPLATES

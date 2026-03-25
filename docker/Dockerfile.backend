@@ -1,0 +1,27 @@
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    UV_SYSTEM_PYTHON=1 \
+    FINANCE_MCP_SERVER_DIR=/app/a-share-mcp-is-just-i-need
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY backend/requirements.txt /tmp/backend-requirements.txt
+RUN pip install -U pip && pip install uv && uv pip install --system --index-strategy unsafe-best-match -r /tmp/backend-requirements.txt
+
+COPY a-share-mcp-is-just-i-need /app/a-share-mcp-is-just-i-need
+RUN cd /app/a-share-mcp-is-just-i-need && uv sync
+
+COPY . /app
+
+EXPOSE 8000
+
+CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]

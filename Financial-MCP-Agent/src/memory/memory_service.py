@@ -231,6 +231,14 @@ class MemoryService:
 
             results = []
             for item in (raw_results or []):
+                if isinstance(item, str):
+                    item = {"memory": item, "score": 1.0, "metadata": {}}
+                if not isinstance(item, dict):
+                    logger.warning(
+                        "[MemoryService] search_semantic 跳过非 dict 结果: type=%s",
+                        type(item).__name__,
+                    )
+                    continue
                 score = item.get("score", 1.0)
                 if score < threshold:
                     continue

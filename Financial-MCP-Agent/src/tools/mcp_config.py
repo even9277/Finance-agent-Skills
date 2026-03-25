@@ -1,7 +1,20 @@
 """
-MCP服务器配置模块 - 包含连接A股MCP服务器的配置信息
-部署时请将 --directory 改为你机器上 a-share-mcp-is-just-i-need 的绝对路径（Linux/WSL 路径）。
+MCP服务器配置模块。
+
+优先从环境变量 `FINANCE_MCP_SERVER_DIR` 读取 MCP 子项目目录；
+若未配置，则退回到仓库相对路径，兼容本地开发与 Docker 部署。
 """
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+_DEFAULT_MCP_SERVER_DIR = _PROJECT_ROOT / "a-share-mcp-is-just-i-need"
+_MCP_SERVER_DIR = os.getenv("FINANCE_MCP_SERVER_DIR") or str(_DEFAULT_MCP_SERVER_DIR)
+
 
 SERVER_CONFIGS = {
     "a_share_mcp_v2": {
@@ -9,9 +22,9 @@ SERVER_CONFIGS = {
         "args": [
             "run",
             "--directory",
-            "/root/Finance/a-share-mcp-is-just-i-need",  # 改为你的项目根目录/a-share-mcp-is-just-i-need 绝对路径
+            _MCP_SERVER_DIR,
             "python",
-            "mcp_server.py"
+            "mcp_server.py",
         ],
         "transport": "stdio",
     }
