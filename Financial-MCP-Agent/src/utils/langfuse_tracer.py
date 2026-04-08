@@ -1,10 +1,16 @@
 """
-Langfuse追踪器 - 与现有日志系统集成
-提供细粒度的LLM调用和Agent执行监控
+Legacy Langfuse 兼容封装。
+
+注意：
+1. 当前主 trace 入口已经迁移到 `src.tools.skill_trace`
+2. 新代码不应再直接把它作为主 tracing 接口
+3. 这里保留仅用于兼容历史调用与初始化 Langfuse runtime
 """
 import os
 from typing import Dict, Any, Optional
 from dotenv import load_dotenv
+
+from src.tools.skill_trace import initialize_trace_runtime
 
 load_dotenv()
 
@@ -24,6 +30,7 @@ class LangfuseTracer:
     """Langfuse追踪器封装"""
     
     def __init__(self):
+        initialize_trace_runtime()
         if not LANGFUSE_ENABLED:
             self.client = None
             self.trace = None
@@ -32,8 +39,10 @@ class LangfuseTracer:
         self.client = Langfuse(
             public_key=os.getenv("LANGFUSE_PUBLIC_KEY"),
             secret_key=os.getenv("LANGFUSE_SECRET_KEY"),
+            base_url=os.getenv("LANGFUSE_BASE_URL") or None,
             host=os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com")
         )
+        self.trace_id = None
         self.trace = None
         
     def start_trace(self, name: str, input_data: Dict[str, Any], 
@@ -41,13 +50,18 @@ class LangfuseTracer:
         """开始追踪一次完整的执行"""
         if not LANGFUSE_ENABLED:
             return None
-            
-        self.trace = self.client.trace(
+
+        self.trace_id = self.client.create_trace_id()
+        self.trace = self.client.start_observation(
+            trace_context={"trace_id": self.trace_id},
             name=name,
+            as_type="span",
             input=input_data,
-            user_id=user_id,
-            metadata=metadata or {},
-            tags=["stock_analysis", "production"]
+            metadata={
+                "user_id": user_id,
+                **(metadata or {}),
+                "tags": ["stock_analysis", "production"],
+            },
         )
         return self.trace
     
@@ -58,8 +72,9 @@ class LangfuseTracer:
         if not LANGFUSE_ENABLED or not self.trace:
             return None
         
-        span = self.trace.span(
+        span = self.trace.start_observation(
             name=agent_name,
+            as_type="agent",
             input=input_data,
             output=output_data if success else {"error": error},
             metadata={
@@ -89,16 +104,16 @@ class LangfuseTracer:
             elif isinstance(msg, dict):
                 formatted_messages.append(msg)
         
-        generation = self.trace.generation(
+        generation = self.trace.start_observation(
             name="llm_generation",
+            as_type="generation",
             model=model,
             input=formatted_messages,
             output=response,
-            usage={
+            usage_details={
                 "input": token_usage.get("prompt_tokens", 0) if token_usage else 0,
                 "output": token_usage.get("completion_tokens", 0) if token_usage else 0,
                 "total": token_usage.get("total_tokens", 0) if token_usage else 0,
-                "unit": "TOKENS"
             },
             metadata={
                 "execution_time_seconds": execution_time
@@ -118,8 +133,9 @@ class LangfuseTracer:
         if len(output_str) > 2000:
             output_str = output_str[:2000] + "... (truncated)"
         
-        span = self.trace.span(
+        span = self.trace.start_observation(
             name=f"tool_{tool_name}",
+            as_type="tool",
             input=tool_input,
             output={"result": output_str} if success else {"error": error},
             metadata={
@@ -135,7 +151,7 @@ class LangfuseTracer:
         """添加评分（用于质量评估）"""
         if not LANGFUSE_ENABLED or not self.trace:
             return None
-        
+
         self.trace.score(
             name=name,
             value=value,
@@ -153,6 +169,7 @@ class LangfuseTracer:
                 metadata={"success": success},
                 level="ERROR" if not success else "DEFAULT"
             )
+            self.trace.end()
         
         # 确保数据上传
         if self.client:

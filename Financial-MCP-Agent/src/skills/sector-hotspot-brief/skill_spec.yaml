@@ -1,0 +1,65 @@
+skill_name: sector-hotspot-brief
+skill_family: financial-sop
+version: "1.0.0"
+execution_policy: deterministic
+allowed_tools:
+  - get_sector_snapshot
+  - get_sector_constituents
+  - get_index_bars
+tool_plan_steps:
+  - step: inspect_sector_snapshot
+    tool: get_sector_snapshot
+    required: true
+    arguments:
+      limit: 10
+  - step: inspect_sector_constituents
+    tool: get_sector_constituents
+    required: false
+    arguments:
+      limit: 12
+  - step: inspect_index_context
+    tool: get_index_bars
+    required: false
+    arguments:
+      limit: 10
+required_evidence:
+  must_have_any:
+    - sector_snapshot
+    - index_daily
+output_template:
+  default_section_order:
+    - conclusion
+    - hotspot_signal
+    - leaders
+    - risks
+    - next_steps
+    - sources
+  response_pref_overrides:
+    risk_first:
+      section_order:
+        - risks
+        - conclusion
+        - hotspot_signal
+        - leaders
+        - next_steps
+        - sources
+      style_variant: risk_first
+    concise:
+      section_order:
+        - conclusion
+        - hotspot_signal
+        - risks
+        - sources
+      style_variant: concise
+degrade_policy:
+  stages:
+    - name: primary
+      next_stage: partial_brief
+    - name: partial_brief
+      next_stage: graceful_decline
+    - name: graceful_decline
+      next_stage: none
+  when_missing_evidence: graceful_decline
+concurrency:
+  enabled: true
+  batch_size: 3

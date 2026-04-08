@@ -1,0 +1,84 @@
+skill_name: fund-compare
+skill_family: financial-sop
+version: "1.0.0"
+execution_policy: deterministic
+allowed_tools:
+  - get_fund_basic_info
+  - get_etf_basic_info
+  - get_fund_nav
+  - get_fund_market_bars
+  - get_fund_share
+tool_plan_steps:
+  - step: discover_funds
+    tool: get_fund_basic_info
+    required: true
+    repeat_for_each_subject: true
+    arguments:
+      limit: 5
+  - step: discover_etf_context
+    tool: get_etf_basic_info
+    required: false
+    repeat_for_each_subject: true
+    arguments:
+      limit: 5
+  - step: compare_nav
+    tool: get_fund_nav
+    required: false
+    repeat_for_each_subject: true
+    arguments:
+      limit: 6
+  - step: compare_market_bars
+    tool: get_fund_market_bars
+    required: false
+    repeat_for_each_subject: true
+    arguments:
+      limit: 10
+  - step: compare_share
+    tool: get_fund_share
+    required: false
+    repeat_for_each_subject: true
+    arguments:
+      limit: 6
+required_evidence:
+  min_distinct_symbols: 2
+  must_have_all:
+    - fund_basic
+  per_symbol_must_have_any:
+    - fund_nav
+    - fund_daily
+    - fund_share
+output_template:
+  default_section_order:
+    - conclusion
+    - comparison
+    - risks
+    - fit
+    - sources
+  response_pref_overrides:
+    risk_first:
+      section_order:
+        - risks
+        - conclusion
+        - comparison
+        - fit
+        - sources
+      style_variant: risk_first
+    concise:
+      section_order:
+        - conclusion
+        - comparison
+        - risks
+        - sources
+      style_variant: concise
+degrade_policy:
+  stages:
+    - name: primary
+      next_stage: partial_compare
+    - name: partial_compare
+      next_stage: graceful_decline
+    - name: graceful_decline
+      next_stage: none
+  when_missing_evidence: graceful_decline
+concurrency:
+  enabled: true
+  batch_size: 5

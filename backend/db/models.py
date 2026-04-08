@@ -8,7 +8,6 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
-    BigInteger,
     Boolean,
     DateTime,
     Float,
@@ -84,6 +83,12 @@ class Session(Base):
     running_summary: Mapped[str | None] = mapped_column(Text)      # Phase 2 STM 压缩摘要
     turn_count: Mapped[int] = mapped_column(Integer, default=0)    # Phase 2 压缩阈值
     last_compress_at: Mapped[datetime | None] = mapped_column(DateTime)
+    context_token_count: Mapped[int] = mapped_column(Integer, default=0)
+    context_budget_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    summary_token_count: Mapped[int] = mapped_column(Integer, default=0)
+    summary_version: Mapped[int] = mapped_column(Integer, default=0)
+    compression_status: Mapped[str] = mapped_column(String(20), default="idle")
+    context_updated_at: Mapped[datetime | None] = mapped_column(DateTime)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
 
@@ -262,4 +267,22 @@ class SessionSummary(Base):
     end_created_at: Mapped[datetime | None] = mapped_column(DateTime)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class StmCompactionTask(Base):
+    __tablename__ = "stm_compaction_tasks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("sessions.id", ondelete="CASCADE"), index=True
+    )
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    cutoff_message_id: Mapped[int | None] = mapped_column(Integer)
+    summary_version_before: Mapped[int] = mapped_column(Integer, default=0)
+    estimated_tokens_before: Mapped[int] = mapped_column(Integer, default=0)
+    error_msg: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime)
 

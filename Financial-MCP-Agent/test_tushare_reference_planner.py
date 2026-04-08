@@ -19,6 +19,7 @@ class TushareReferencePlannerTests(unittest.TestCase):
             enable_index_tools=False,
             enable_sector_tools=False,
         )
+        self.assertEqual(plan.planner_type, "fallback_planner")
         tool_names = [item.tool_name for item in plan.tool_calls]
         self.assertIn("get_market_bars", tool_names)
         self.assertIn("get_fina_indicator", tool_names)

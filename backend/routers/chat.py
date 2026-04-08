@@ -6,8 +6,10 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 
 from backend.db.database import get_db, AsyncSessionFactory
+from backend.db.models import Session
 from backend.middleware.auth import (
     AuthContext,
     authenticate_websocket,
@@ -27,6 +29,7 @@ from backend.schemas.chat import (
     ChatTemplateItem,
 )
 from backend.services import chat_service
+from backend.services.stm_context_service import build_context_window_payload
 
 logger = logging.getLogger("chat_router")
 
@@ -53,7 +56,7 @@ async def send_message(
     auth: AuthContext = Depends(require_auth),
 ):
     effective_user_id = ensure_user_access(body.user_id, auth)
-    reply, session_id, memory_profile = await chat_service.chat_single_turn(
+    reply, session_id, memory_profile, context_window = await chat_service.chat_single_turn(
         db=db,
         user_id=effective_user_id,
         user_message=body.message,
@@ -64,6 +67,7 @@ async def send_message(
         reply=reply,
         session_id=session_id,
         memory_profile=memory_profile if memory_profile else None,
+        context_window=context_window,
     )
 
 
@@ -159,6 +163,7 @@ async def list_sessions(
             mode=s.mode,
             title=s.title,
             running_summary=s.running_summary,
+            context_window=build_context_window_payload(s),
             created_at=s.created_at,
             updated_at=s.updated_at,
         )
@@ -192,6 +197,10 @@ async def get_session_messages(
     db: AsyncSession = Depends(get_db),
 ):
     messages = await chat_service.get_session_messages(db, session_id, user_id)
+    session_result = await db.execute(
+        select(Session).where(Session.id == session_id, Session.user_id == user_id)
+    )
+    session = session_result.scalar_one_or_none()
     return ChatSessionMessages(
         session_id=session_id,
         messages=[
@@ -205,6 +214,7 @@ async def get_session_messages(
             )
             for m in messages
         ],
+        context_window=build_context_window_payload(session) if session else None,
     )
 
 

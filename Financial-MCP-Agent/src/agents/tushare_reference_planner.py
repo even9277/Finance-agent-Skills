@@ -18,6 +18,7 @@ class PlannedToolCall:
 class TushareToolPlan:
     selected_skill: str
     analysis_mode: str
+    planner_type: str = "fallback_planner"
     references: list[dict[str, str]] = field(default_factory=list)
     tool_calls: list[PlannedToolCall] = field(default_factory=list)
 
@@ -253,6 +254,7 @@ def build_tushare_tool_plan(
     return TushareToolPlan(
         selected_skill="tushare-data",
         analysis_mode=analysis_mode,
+        planner_type="fallback_planner",
         references=refs,
         tool_calls=deduped,
     )

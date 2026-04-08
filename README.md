@@ -14,7 +14,8 @@
 - 对话模式：多轮追问、STM/LTM、用户画像、Tushare Skill 数据增强
 - 报告模式：多 Agent 协作生成基本面、技术面、估值、新闻等综合分析报告
 - 账号体系：登录、注册、切换账号、JWT 登录态恢复
-- 工程化链路：Router / Planner / Executor / Evidence 校验、日志 trace、Docker 部署
+- 工程化链路：Router / Planner / Executor / Evidence 校验、结构化 Trace、可选 Langfuse 观测、Docker 部署
+- 金融领域 workspace Skills：除官方 Tushare vendor 外，内置个股首轮研判、板块热点、行情异动解释、ETF 筛选、基金对比等场景化 Skill
 
 当前仓库已经整理为可公开运行的版本，支持本地开发、Docker 启动，以及基于官方 Tushare Skill vendor 的对话增强链路。
 
@@ -25,6 +26,8 @@
 - [项目亮点](#项目亮点)
 - [页面预览](#页面预览)
 - [核心能力](#核心能力)
+- [可观测性：Trace 与 Langfuse](#可观测性trace-与-langfuse)
+- [金融领域扩展 Skills](#金融领域扩展-skills)
 - [系统结构](#系统结构)
 - [快速开始](#快速开始)
 - [Docker 部署](#docker-部署)
@@ -55,7 +58,8 @@
   - 官方 Tushare Skill vendor 接入
   - Router / Planner / Executor / Evidence 校验完整闭环
   - 高频结构化问题支持确定性并发取数
-  - 运行过程带完整 trace 日志，便于调试与复盘
+  - 本地结构化 Trace（JSONL / 日志）+ 可选 Langfuse 云端观测，便于调试、复盘与延迟分析
+  - 工作区内置多枚金融领域扩展 Skill（个股首轮研判、板块热点、行情异动解释、ETF 筛选、基金对比等），与 Tushare 工具链协同
 
 - 账号登录与权限隔离
   - JWT 登录态恢复
@@ -185,6 +189,7 @@
   - 会话内滚动摘要
   - 最近消息保留 + 早期消息压缩
   - 长对话下维持指代消解和连续追问能力
+  - 开启 `ENABLE_STM` 时，前端对话输入区可展示上下文占用环形指示（`ContextUsageRing`），便于感知压缩触发前的预算占用
 
 - 长期记忆 LTM
   - PostgreSQL 结构化画像
@@ -213,20 +218,37 @@
 
 这一部分的重点是保留官方 Skill 的知识边界和接口说明，同时让它能直接接入现有对话系统。
 
-### 5. 登录与用户隔离
+Workspace 金融场景扩展与 Trace / Langfuse 配置见下面两节。
 
-当前版本已支持：
+## 可观测性：Trace 与 Langfuse
 
-- 登录页
-- 注册页
-- JWT 登录态恢复
-- 切换账号
-- 退出登录
-- 测试账号 `test1/test1`、`test2/test2`
+对话 Skill 链路在运行时会写入**结构化 Trace**（默认开启），用于记录路由决策、工具计划、执行阶段、Evidence 与回复完成等事件。主实现位于 `Financial-MCP-Agent/src/tools/skill_trace.py`，导出器在 `Financial-MCP-Agent/src/tools/trace_exporters/`（含 Langfuse）。
 
-登录后，系统会将账号映射到固定 `user_id`，现有对话、记忆、画像、报告等能力继续围绕同一业务用户运行。若你想体验全新的账号流程，也可以直接在前端登录页切换到“注册”，系统会创建新的业务用户并继续沿用现有冷启动、对话、报告和记忆链路。
+- **本地 Trace（主审计）**
+  - 汇总日志：`Financial-MCP-Agent/logs/skill_trace.log`
+  - 行式记录：`Financial-MCP-Agent/logs/chat_traces.jsonl`
+  - 可选产物目录：`TRACE_ARTIFACT_DIR`（默认 `Financial-MCP-Agent/logs/chat_trace_artifacts`）
+- **Langfuse（可选）**  
+  在**本地 Trace 正常**的前提下，可将同一条链路导出到 Langfuse 项目，在网页端按 session、skill、延迟与错误排查。  
+  - 配置开关与密钥见 `backend/.env`：`ENABLE_TRACE`、`ENABLE_LANGFUSE`、`LANGFUSE_PUBLIC_KEY`、`LANGFUSE_SECRET_KEY`、`LANGFUSE_BASE_URL` / `LANGFUSE_HOST` 等（完整列表见 `backend/.env.example`）。
+  - **推荐顺序**：先只开本地 Trace 验证 → 再设 `ENABLE_LANGFUSE=true` 并填入密钥后重启后端。
+  - **详细联调步骤**（含 Cloud / 采样率 / flush）：[`docs/部署指南-Langfuse-本机开发联调.md`](docs/部署指南-Langfuse-本机开发联调.md)。
 
-这一层让系统具备了基本的多用户隔离能力，也更适合作为公开仓库和面试展示项目。
+历史草稿 [`Financial-MCP-Agent/INTEGRATION_LANGFUSE.md`](Financial-MCP-Agent/INTEGRATION_LANGFUSE.md) 仅作参考；当前以 `skill_trace` → `langfuse_exporter` 与上述部署指南为准。
+
+## 金融领域扩展 Skills
+
+在官方 `vendor/tushare-skills` 能力源之外，仓库在 `Financial-MCP-Agent/src/skills/` 下内置多枚**面向投研高频场景**的 workspace Skill（与注册表、Router 协同，多为确定性工具执行）：
+
+| Skill ID | 用途概要 |
+|----------|----------|
+| `stock-first-pass` | 单股首轮研判：行情 + 核心财务，回答「是否值得继续跟踪」类问题 |
+| `sector-hotspot-brief` | 板块 / 主题热点简报：强弱、龙头、是否可持续关注 |
+| `market-move-explain` | 个股 / ETF / 指数 / 板块「为什么涨跌」：基于可核对盘面事实的保守解释 |
+| `etf-screen` | ETF / 场内基金筛选与 shortlist（宽基、行业、黄金、红利等） |
+| `fund-compare` | 两只或多只基金 / ETF 横向对比，结论需有数据支撑 |
+
+启用对话 Skill 与 Tushare 工具后，Router 会按问题类型在官方 bundle 与上述扩展之间做路由；具体以 `skill_registry` 与运行时配置为准。
 
 ## 系统结构
 
@@ -384,6 +406,25 @@ TUSHARE_TOKEN=your_tushare_token
 ```
 
 如果要体验长期记忆，建议补齐 PostgreSQL 与 Mem0 相关配置。
+
+对话链路的 **Trace / Langfuse**（可选）在 `backend/.env` 中配置，与 `backend/.env.example` 保持一致即可。典型片段：
+
+```env
+ENABLE_TRACE=true
+ENABLE_EVIDENCE_LINEAGE=true
+ENABLE_LANGFUSE=false
+
+# 打开 Langfuse 时改为 true，并填入 Cloud 或自托管项目的密钥
+# ENABLE_LANGFUSE=true
+# LANGFUSE_BASE_URL=https://cloud.langfuse.com
+# LANGFUSE_HOST=https://cloud.langfuse.com
+# LANGFUSE_PUBLIC_KEY=pk-lf-...
+# LANGFUSE_SECRET_KEY=sk-lf-...
+# LANGFUSE_ENV=dev
+# LANGFUSE_SAMPLE_RATE=1.0
+```
+
+联调说明见 [`docs/部署指南-Langfuse-本机开发联调.md`](docs/部署指南-Langfuse-本机开发联调.md)。
 
 ### 6. 安装 MCP 子项目依赖
 
@@ -593,7 +634,9 @@ python src/main.py --command "帮我看看贵州茅台值不值得长期持有"
 
 日志主要在：
 
-- `Financial-MCP-Agent/logs/`
+- `Financial-MCP-Agent/logs/`（应用日志、按模块拆分）
+- **结构化 Trace**：`Financial-MCP-Agent/logs/chat_traces.jsonl`（行式事件）、`Financial-MCP-Agent/logs/skill_trace.log`（汇总）
+- 可选：`TRACE_ARTIFACT_DIR` 下的对话产物
 
 Skill 对话链路会记录这些关键事件：
 
@@ -611,6 +654,8 @@ Skill 对话链路会记录这些关键事件：
 1. `chat.router.decision`
 2. `chat.tool.plan`
 3. `chat.reply.completed`
+
+若已开启 **Langfuse**，可在控制台按 trace / session 查看与本地 JSONL 对应的观测数据；配置与排障见 [`docs/部署指南-Langfuse-本机开发联调.md`](docs/部署指南-Langfuse-本机开发联调.md)。
 
 ## 项目结构
 
@@ -640,7 +685,10 @@ Finance/
 - `Financial-MCP-Agent/src/tools/`
   - Tushare SDK 封装
   - 可调用工具
-  - Skill trace 日志
+  - `skill_trace` 与 `trace_exporters/`（含 Langfuse 导出）
+
+- `Financial-MCP-Agent/src/skills/`
+  - workspace 金融领域扩展 Skill（如 `stock-first-pass`、`etf-screen` 等）
 
 - `Financial-MCP-Agent/src/memory/`
   - MemoryService
@@ -650,14 +698,16 @@ Finance/
 ## 当前已实现的关键工程点
 
 - 报告模式多 Agent 协作
-- 对话模式 STM / LTM
+- 对话模式 STM / LTM（含动态预算压缩与后台 compaction worker；前端上下文占用可视化）
 - 用户画像与跨会话记忆
 - 登录、切换账号、JWT 鉴权
 - 新账号注册与登录态恢复
 - 官方 Tushare Skill vendor 接入
+- Workspace 金融领域扩展 Skills（个股首轮、板块热点、异动解释、ETF 筛选、基金对比等）
 - Router / Planner / Executor / Evidence 完整链路
 - deterministic + agentic 混合执行路径
 - router / resolver / synthesis 模型分层
+- 本地结构化 Trace（JSONL / 日志）与可选 Langfuse 导出
 - 基金 / ETF、板块、个股等高频咨询场景支持
 
 ## 后续计划

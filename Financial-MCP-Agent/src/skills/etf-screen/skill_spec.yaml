@@ -1,0 +1,85 @@
+skill_name: etf-screen
+skill_family: financial-sop
+version: "1.0.0"
+execution_policy: deterministic
+allowed_tools:
+  - get_fund_basic_info
+  - get_etf_basic_info
+  - get_fund_nav
+  - get_fund_market_bars
+  - get_fund_share
+tool_plan_steps:
+  - step: discover_fund_candidates
+    tool: get_fund_basic_info
+    required: true
+    arguments:
+      limit: 15
+  - step: discover_etf_candidates
+    tool: get_etf_basic_info
+    required: false
+    arguments:
+      limit: 15
+  - step: inspect_candidate_nav
+    tool: get_fund_nav
+    required: false
+    arguments:
+      limit: 6
+  - step: inspect_candidate_market
+    tool: get_fund_market_bars
+    required: false
+    arguments:
+      limit: 10
+  - step: inspect_candidate_share
+    tool: get_fund_share
+    required: false
+    arguments:
+      limit: 6
+candidate_expansion:
+  trigger_tools:
+    - get_fund_basic_info
+    - get_etf_basic_info
+  top_n: 3
+required_evidence:
+  must_have_all:
+    - fund_basic
+  must_have_any:
+    - fund_nav
+    - fund_daily
+    - fund_share
+output_template:
+  default_section_order:
+    - conclusion
+    - shortlist
+    - selection_logic
+    - risks
+    - fit
+    - sources
+  response_pref_overrides:
+    risk_first:
+      section_order:
+        - risks
+        - conclusion
+        - shortlist
+        - selection_logic
+        - fit
+        - sources
+      style_variant: risk_first
+    concise:
+      section_order:
+        - conclusion
+        - shortlist
+        - risks
+        - sources
+      style_variant: concise
+degrade_policy:
+  stages:
+    - name: primary
+      next_stage: shortlist_only
+    - name: shortlist_only
+      next_stage: graceful_decline
+    - name: graceful_decline
+      next_stage: none
+  when_missing_evidence: graceful_decline
+concurrency:
+  enabled: true
+  batch_size: 5

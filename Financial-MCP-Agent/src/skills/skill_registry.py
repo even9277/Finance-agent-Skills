@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from src.utils.logging_config import setup_logger
 
 _SRC_ROOT = Path(__file__).resolve().parent.parent
@@ -30,6 +32,9 @@ class SkillMetadata:
     aliases: list[str] = field(default_factory=list)
     reference_index: list[dict[str, str]] = field(default_factory=list)
     scripts_dir: Path | None = None
+    spec_file: Path | None = None
+    has_skill_file: bool = True
+    has_skill_spec: bool = False
 
 
 def _parse_scalar(value: str) -> Any:
@@ -112,6 +117,22 @@ def _read_meta_json(skill_dir: Path) -> dict[str, Any]:
     except Exception as exc:
         logger.warning("[skill_registry] failed to read %s: %s", meta_file, exc, exc_info=True)
         return {}
+
+
+def _load_yaml_file(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("[skill_registry] failed to read yaml %s: %s", path, exc, exc_info=True)
+        return None
+    if payload is None:
+        return {}
+    if not isinstance(payload, dict):
+        logger.warning("[skill_registry] yaml root must be a mapping: %s", path)
+        return None
+    return payload
 
 
 def _build_reference_index(skill_dir: Path) -> list[dict[str, str]]:
@@ -219,19 +240,43 @@ class SkillRegistry:
                     )
                     continue
 
-                if meta.name in skills:
-                    if source == "workspace":
+                existing_key = self._find_existing_skill_key(skills, meta)
+                if existing_key is not None:
+                    existing = skills[existing_key]
+                    if source == "workspace" and existing.source != "workspace":
                         logger.info(
-                            "[skill_registry] workspace skill overrides vendor skill: %s",
+                            "[skill_registry] workspace skill overrides vendor skill: %s -> %s",
+                            existing_key,
                             meta.name,
                         )
+                        if existing_key != meta.name:
+                            del skills[existing_key]
                         skills[meta.name] = meta
                         continue
-                    raise ValueError(f"Duplicate skill name detected: {meta.name}")
+                    raise ValueError(
+                        f"Duplicate skill identity detected: incoming={meta.name}, existing={existing.name}"
+                    )
                 skills[meta.name] = meta
 
         self._skills = skills
         logger.info("[skill_registry] loaded %s skills", len(self._skills))
+
+    @staticmethod
+    def _identity_keys(skill: SkillMetadata) -> set[str]:
+        keys = {skill.name.strip(), skill.official_name.strip()}
+        keys.update(alias.strip() for alias in skill.aliases if alias and alias.strip())
+        return {item for item in keys if item}
+
+    def _find_existing_skill_key(
+        self,
+        skills: dict[str, SkillMetadata],
+        incoming: SkillMetadata,
+    ) -> str | None:
+        incoming_keys = self._identity_keys(incoming)
+        for key, existing in skills.items():
+            if incoming_keys & self._identity_keys(existing):
+                return key
+        return None
 
     def _load_skill(self, skill_file: Path, *, source: str) -> SkillMetadata:
         meta = _parse_frontmatter(skill_file.read_text(encoding="utf-8"))
@@ -279,9 +324,13 @@ class SkillRegistry:
         slug = str(upstream_meta.get("slug") or "").strip()
         if slug and slug not in aliases:
             aliases.append(slug)
+        canonical_name = canonical_name.strip()
+        if canonical_name and canonical_name not in aliases:
+            aliases.append(canonical_name)
 
         references_dir = skill_file.parent / "references" if (skill_file.parent / "references").exists() else None
         scripts_dir = skill_file.parent / "scripts" if (skill_file.parent / "scripts").exists() else None
+        spec_file = skill_file.parent / "skill_spec.yaml"
 
         return SkillMetadata(
             name=canonical_name,
@@ -299,6 +348,9 @@ class SkillRegistry:
             aliases=aliases,
             reference_index=_build_reference_index(skill_file.parent),
             scripts_dir=scripts_dir,
+            spec_file=spec_file if spec_file.exists() else None,
+            has_skill_file=skill_file.exists(),
+            has_skill_spec=spec_file.exists(),
         )
 
     def list_skills(self) -> list[SkillMetadata]:
@@ -322,9 +374,69 @@ class SkillRegistry:
                 "source": skill.source,
                 "execution_mode": skill.execution_mode,
                 "version": skill.version or "",
+                "has_skill_file": str(skill.has_skill_file).lower(),
+                "has_skill_spec": str(skill.has_skill_spec).lower(),
             }
             for skill in self.list_skills()
         ]
+
+    def discoverable_sop_skills(self) -> list[SkillMetadata]:
+        return [
+            skill
+            for skill in self.list_skills()
+            if skill.source == "workspace"
+            and skill.name != "tushare-data"
+            and skill.has_skill_file
+            and skill.has_skill_spec
+        ]
+
+    def load_skill_spec(self, name: str) -> dict[str, Any] | None:
+        skill = self.get_skill(name)
+        if skill is None or skill.spec_file is None:
+            return None
+        return _load_yaml_file(skill.spec_file)
+
+    def load_skill_markdown(self, name: str) -> str:
+        skill = self.get_skill(name)
+        if skill is None or skill.skill_file is None or not skill.skill_file.exists():
+            return ""
+        try:
+            return skill.skill_file.read_text(encoding="utf-8")
+        except Exception as exc:
+            logger.warning("[skill_registry] failed to read skill markdown %s: %s", name, exc, exc_info=True)
+            return ""
+
+    def load_reference_texts(self, name: str, query: str, limit: int = 3) -> list[dict[str, str]]:
+        skill = self.get_skill(name)
+        if skill is None or skill.skill_dir is None:
+            return []
+
+        results: list[dict[str, str]] = []
+        for item in self.find_references(name, query, limit=limit):
+            rel_path = item.get("path") or ""
+            if not rel_path:
+                continue
+            file_path = skill.skill_dir / rel_path
+            try:
+                content = file_path.read_text(encoding="utf-8")
+            except Exception as exc:
+                logger.warning(
+                    "[skill_registry] failed to read reference %s for %s: %s",
+                    rel_path,
+                    name,
+                    exc,
+                    exc_info=True,
+                )
+                continue
+            results.append(
+                {
+                    "title": item.get("title", ""),
+                    "category": item.get("category", ""),
+                    "path": rel_path,
+                    "content": content,
+                }
+            )
+        return results
 
     def find_references(self, name: str, query: str, limit: int = 5) -> list[dict[str, str]]:
         skill = self.get_skill(name)

@@ -25,6 +25,16 @@ dist/
 .vscode/
 .DS_Store
 
+# 本地工具 / 占位（非项目源码）
+.codex/
+
+# Langfuse / 观测导出（本机调试产生，勿入库）
+*lf-events-export*.jsonl
+*-lf-events-export-*.jsonl
+
+# TypeScript / Vite 构建缓存（若曾提交过，需执行 git rm --cached -- 'frontend/*.tsbuildinfo'）
+**/*.tsbuildinfo
+
 # Logs & runtime
 *.log
 logs/
@@ -104,6 +114,8 @@ docs/*.md
 !docs/skill功能集成技术说明.md
 !docs/tushare-skill-vendoring.md
 !docs/项目代码架构说明.md
+!docs/股票Agent项目技术总览.md
+!docs/部署指南-Langfuse-本机开发联调.md
 !docs/安装.md
 !docs/部署指南-PostgreSQL-Docker.md
 !docs/images/

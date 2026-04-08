@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 import re
+import time
 from typing import Any
+import uuid
 
 try:
     from langchain.tools import tool
@@ -13,7 +15,7 @@ except Exception:  # pragma: no cover - optional import path
         return _decorator
 
 from src.tools.tushare_client import TushareClientError, get_tushare_client
-from src.tools.skill_trace import log_tool_call
+from src.tools.skill_trace import log_tool_call, new_evidence_id
 
 _INDEX_ALIAS_MAP = {
     "上证指数": "000001.SH",
@@ -26,10 +28,32 @@ _INDEX_ALIAS_MAP = {
     "上证50": "000016.SH",
 }
 _FUND_HINTS = ("基金", "etf", "lof", "qdii", "联接")
+_FUND_GENERIC_TERMS = ("基金", "etf", "lof", "qdii", "联接基金", "联接")
+_TOOL_EVIDENCE_TYPE_MAP = {
+    "stock_basic": "stock_basic",
+    "daily": "stock_daily",
+    "fina_indicator": "financial_indicator",
+    "income": "income_statement",
+    "balancesheet": "balance_sheet",
+    "cashflow": "cashflow_statement",
+    "pro_bar": "stock_market",
+    "index_pro_bar": "index_daily",
+    "sw_daily": "sector_snapshot",
+    "index_member": "sector_constituents",
+    "fund_basic": "fund_basic",
+    "etf_basic": "fund_basic",
+    "fund_nav": "fund_nav",
+    "fund_daily": "fund_daily",
+    "fund_share": "fund_share",
+}
 
 
 def _now_text() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="milliseconds")
+
+
+def _new_tool_result_id() -> str:
+    return f"toolr_{uuid.uuid4().hex}"
 
 
 def _to_tushare_ts_code(symbol: str) -> str:
@@ -98,6 +122,50 @@ def _query_tokens(query: str) -> list[str]:
     return seen[:12]
 
 
+def _normalize_search_text(text: str) -> str:
+    normalized = (text or "").strip().lower()
+    normalized = re.sub(r"[\s\-_()/（）【】\[\]，。！？,.!?:：；;]+", "", normalized)
+    return normalized
+
+
+def _fund_semantic_tokens(query: str) -> list[str]:
+    raw = (query or "").strip()
+    if not raw:
+        return []
+
+    tokens: list[str] = []
+    base = _normalize_search_text(raw)
+    for generic in _FUND_GENERIC_TERMS:
+        base = base.replace(generic.lower(), "")
+    base = re.sub(r"[abc]$", "", base)
+    if len(base) >= 2:
+        tokens.append(base)
+
+    chinese_parts = re.findall(r"[\u4e00-\u9fff]{2,}", raw)
+    for part in chinese_parts:
+        part = part.strip()
+        if len(part) >= 2 and part not in tokens:
+            tokens.append(part)
+        compact = part
+        for generic in ("基金", "联接基金", "联接"):
+            compact = compact.replace(generic, "")
+        if len(compact) >= 4:
+            head = compact[:2]
+            tail = compact[-2:]
+            if head not in tokens:
+                tokens.append(head)
+            if tail not in tokens:
+                tokens.append(tail)
+
+    for token in _query_tokens(raw):
+        if token.lower() in {"etf", "lof", "qdii"}:
+            continue
+        if len(token) >= 2 and token not in tokens:
+            tokens.append(token)
+
+    return tokens[:12]
+
+
 def _score_row(row: dict[str, Any], query: str, fields: tuple[str, ...]) -> int:
     tokens = _query_tokens(query)
     if not tokens:
@@ -113,6 +181,56 @@ def _score_row(row: dict[str, Any], query: str, fields: tuple[str, ...]) -> int:
     return score
 
 
+def _score_fund_row(row: dict[str, Any], query: str) -> tuple[int, int]:
+    semantic_tokens = _fund_semantic_tokens(query)
+    query_core = _normalize_search_text(query)
+    for generic in _FUND_GENERIC_TERMS:
+        query_core = query_core.replace(generic.lower(), "")
+    query_core = re.sub(r"[abc]$", "", query_core)
+
+    weighted_fields = (
+        ("name", 10),
+        ("csname", 10),
+        ("extname", 10),
+        ("cname", 10),
+        ("fullname", 9),
+        ("fund_fullname", 9),
+        ("benchmark", 4),
+        ("index_name", 6),
+        ("management", 3),
+        ("mgr_name", 2),
+    )
+    score = 0
+    matched_tokens: set[str] = set()
+
+    for field, weight in weighted_fields:
+        value = str(row.get(field) or "").strip()
+        if not value:
+            continue
+        normalized_value = _normalize_search_text(value)
+        if query_core:
+            if normalized_value == query_core:
+                score += 120
+            elif query_core and query_core in normalized_value:
+                score += 70
+            elif normalized_value and normalized_value in query_core and len(normalized_value) >= 4:
+                score += 40
+        for token in semantic_tokens:
+            normalized_token = _normalize_search_text(token)
+            if not normalized_token:
+                continue
+            if normalized_token in normalized_value:
+                matched_tokens.add(normalized_token)
+                score += weight * (4 if len(normalized_token) >= 4 else 2)
+
+    score += _score_row(
+        row,
+        query,
+        ("name", "csname", "extname", "cname", "fullname", "fund_fullname", "index_name", "benchmark", "management", "mgr_name"),
+    )
+    return score, len(matched_tokens)
+
+
 def _df_to_payload(data: Any) -> Any:
     if data is None:
         return []
@@ -124,10 +242,31 @@ def _df_to_payload(data: Any) -> Any:
     return data
 
 
-def _build_response(symbol: str, payload: Any, error: str | None = None) -> dict[str, Any]:
+def _build_response(
+    symbol: str,
+    payload: Any,
+    error: str | None = None,
+    *,
+    source_api: str = "",
+    evidence_type: str = "",
+    started_at: str | None = None,
+    ended_at: str | None = None,
+    duration_ms: float | int | None = None,
+    cache_hit: bool = False,
+    retry_count: int = 0,
+) -> dict[str, Any]:
     return {
         "ok": error is None,
         "source": "tushare",
+        "source_api": source_api,
+        "evidence_type": evidence_type,
+        "evidence_id": new_evidence_id(),
+        "tool_result_id": _new_tool_result_id(),
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "duration_ms": duration_ms,
+        "cache_hit": cache_hit,
+        "retry_count": retry_count,
         "trade_date": _pick_trade_date(payload),
         "data_time": _now_text(),
         "symbol": symbol,
@@ -259,10 +398,9 @@ async def _search_fund_candidates(
         item["ts_code"] = _to_tushare_ts_code(str(item.get("ts_code") or ""))
         if "name" not in item:
             item["name"] = _first_non_empty(item.get("csname"), item.get("extname"), item.get("cname")) or ""
-        item["_score"] = _score_row(
+        item["_score"], item["_matched_semantic_tokens"] = _score_fund_row(
             item,
             clean_query or clean_symbol,
-            ("name", "csname", "extname", "cname", "index_name", "benchmark", "management", "mgr_name"),
         )
         normalized_rows.append(item)
 
@@ -270,8 +408,23 @@ async def _search_fund_candidates(
     if clean_symbol:
         normalized_rows = [row for row in normalized_rows if row.get("ts_code") == clean_symbol]
     elif clean_query:
-        normalized_rows = [row for row in normalized_rows if int(row.get("_score") or 0) > 0]
+        semantic_tokens = _fund_semantic_tokens(clean_query)
+        require_semantic_match = len(semantic_tokens) >= 2
+        normalized_rows = [
+            row
+            for row in normalized_rows
+            if int(row.get("_score") or 0) > 0
+            and (
+                not require_semantic_match
+                or int(row.get("_matched_semantic_tokens") or 0) >= 1
+            )
+        ]
         normalized_rows.sort(key=lambda row: (-int(row.get("_score") or 0), str(row.get("ts_code") or "")))
+        if normalized_rows:
+            top_score = int(normalized_rows[0].get("_score") or 0)
+            top_matches = int(normalized_rows[0].get("_matched_semantic_tokens") or 0)
+            if top_score < 8 or (require_semantic_match and top_matches < 1):
+                return [], None, "unable to confidently resolve fund symbol"
 
     if limit > 0:
         normalized_rows = normalized_rows[:limit]
@@ -304,10 +457,44 @@ async def _resolve_fund_symbol(
     return top_name, str(top.get("ts_code") or ""), None
 
 
+def _timed_response(
+    *,
+    symbol: str,
+    payload: Any,
+    error: str | None,
+    source_api: str,
+    evidence_type: str,
+    started_at: str,
+    started_perf: float,
+) -> dict[str, Any]:
+    return _build_response(
+        symbol=symbol,
+        payload=payload,
+        error=error,
+        source_api=source_api,
+        evidence_type=evidence_type,
+        started_at=started_at,
+        ended_at=_now_text(),
+        duration_ms=round((time.perf_counter() - started_perf) * 1000, 2),
+        cache_hit=False,
+        retry_count=0,
+    )
+
+
 async def _run_tool(method_name: str, symbol: str = "", query: str = "", **kwargs) -> dict[str, Any]:
+    started_at = _now_text()
+    started_perf = time.perf_counter()
     company_name, resolved_symbol, resolve_error = await _resolve_symbol(query=query, symbol=symbol)
     if not resolved_symbol:
-        return _build_response(symbol=symbol or query, payload={}, error=resolve_error or "unable to resolve stock symbol")
+        return _timed_response(
+            symbol=symbol or query,
+            payload={},
+            error=resolve_error or "unable to resolve stock symbol",
+            source_api=method_name,
+            evidence_type=_TOOL_EVIDENCE_TYPE_MAP.get(method_name, "unknown"),
+            started_at=started_at,
+            started_perf=started_perf,
+        )
 
     client = get_tushare_client()
     try:
@@ -316,25 +503,63 @@ async def _run_tool(method_name: str, symbol: str = "", query: str = "", **kwarg
             raw = await method(ts_code=resolved_symbol, **kwargs)
             payload = _df_to_payload(raw)
             if payload in (None, [], {}):
-                return _build_response(
+                return _timed_response(
                     symbol=resolved_symbol,
                     payload=payload,
                     error="empty result from Tushare",
+                    source_api=method_name,
+                    evidence_type=_TOOL_EVIDENCE_TYPE_MAP.get(method_name, "unknown"),
+                    started_at=started_at,
+                    started_perf=started_perf,
                 )
-            response = _build_response(symbol=resolved_symbol, payload=payload)
+            response = _timed_response(
+                symbol=resolved_symbol,
+                payload=payload,
+                error=None,
+                source_api=method_name,
+                evidence_type=_TOOL_EVIDENCE_TYPE_MAP.get(method_name, "unknown"),
+                started_at=started_at,
+                started_perf=started_perf,
+            )
             if company_name:
                 response["company_name"] = company_name
             return response
     except TushareClientError as exc:
-        return _build_response(symbol=resolved_symbol, payload={}, error=str(exc))
+        return _timed_response(
+            symbol=resolved_symbol,
+            payload={},
+            error=str(exc),
+            source_api=method_name,
+            evidence_type=_TOOL_EVIDENCE_TYPE_MAP.get(method_name, "unknown"),
+            started_at=started_at,
+            started_perf=started_perf,
+        )
     except Exception as exc:  # pragma: no cover - defensive
-        return _build_response(symbol=resolved_symbol, payload={}, error=f"Unexpected error: {exc}")
+        return _timed_response(
+            symbol=resolved_symbol,
+            payload={},
+            error=f"Unexpected error: {exc}",
+            source_api=method_name,
+            evidence_type=_TOOL_EVIDENCE_TYPE_MAP.get(method_name, "unknown"),
+            started_at=started_at,
+            started_perf=started_perf,
+        )
 
 
 async def _run_market_tool(symbol: str = "", query: str = "", limit: int = 30) -> dict[str, Any]:
+    started_at = _now_text()
+    started_perf = time.perf_counter()
     company_name, resolved_symbol, resolve_error = await _resolve_symbol(query=query, symbol=symbol)
     if not resolved_symbol:
-        return _build_response(symbol=symbol or query, payload={}, error=resolve_error or "unable to resolve stock symbol")
+        return _timed_response(
+            symbol=symbol or query,
+            payload={},
+            error=resolve_error or "unable to resolve stock symbol",
+            source_api="pro_bar",
+            evidence_type="stock_market",
+            started_at=started_at,
+            started_perf=started_perf,
+        )
 
     client = get_tushare_client()
     try:
@@ -344,21 +569,63 @@ async def _run_market_tool(symbol: str = "", query: str = "", limit: int = 30) -
             if isinstance(payload, list) and limit > 0:
                 payload = payload[:limit]
             if payload in (None, [], {}):
-                return _build_response(symbol=resolved_symbol, payload=payload, error="empty result from Tushare")
-            response = _build_response(symbol=resolved_symbol, payload=payload)
+                return _timed_response(
+                    symbol=resolved_symbol,
+                    payload=payload,
+                    error="empty result from Tushare",
+                    source_api="pro_bar",
+                    evidence_type="stock_market",
+                    started_at=started_at,
+                    started_perf=started_perf,
+                )
+            response = _timed_response(
+                symbol=resolved_symbol,
+                payload=payload,
+                error=None,
+                source_api="pro_bar",
+                evidence_type="stock_market",
+                started_at=started_at,
+                started_perf=started_perf,
+            )
             if company_name:
                 response["company_name"] = company_name
             return response
     except TushareClientError as exc:
-        return _build_response(symbol=resolved_symbol, payload={}, error=str(exc))
+        return _timed_response(
+            symbol=resolved_symbol,
+            payload={},
+            error=str(exc),
+            source_api="pro_bar",
+            evidence_type="stock_market",
+            started_at=started_at,
+            started_perf=started_perf,
+        )
     except Exception as exc:  # pragma: no cover
-        return _build_response(symbol=resolved_symbol, payload={}, error=f"Unexpected error: {exc}")
+        return _timed_response(
+            symbol=resolved_symbol,
+            payload={},
+            error=f"Unexpected error: {exc}",
+            source_api="pro_bar",
+            evidence_type="stock_market",
+            started_at=started_at,
+            started_perf=started_perf,
+        )
 
 
 async def _run_index_tool(symbol: str = "", query: str = "", limit: int = 30) -> dict[str, Any]:
+    started_at = _now_text()
+    started_perf = time.perf_counter()
     index_code = _pick_index_code(query=query, symbol=symbol)
     if not index_code:
-        return _build_response(symbol=symbol or query, payload={}, error="unable to resolve index code")
+        return _timed_response(
+            symbol=symbol or query,
+            payload={},
+            error="unable to resolve index code",
+            source_api="index_pro_bar",
+            evidence_type="index_daily",
+            started_at=started_at,
+            started_perf=started_perf,
+        )
 
     client = get_tushare_client()
     try:
@@ -368,18 +635,60 @@ async def _run_index_tool(symbol: str = "", query: str = "", limit: int = 30) ->
             if isinstance(payload, list) and limit > 0:
                 payload = payload[:limit]
             if payload in (None, [], {}):
-                return _build_response(symbol=index_code, payload=payload, error="empty result from Tushare")
-            return _build_response(symbol=index_code, payload=payload)
+                return _timed_response(
+                    symbol=index_code,
+                    payload=payload,
+                    error="empty result from Tushare",
+                    source_api="index_pro_bar",
+                    evidence_type="index_daily",
+                    started_at=started_at,
+                    started_perf=started_perf,
+                )
+            return _timed_response(
+                symbol=index_code,
+                payload=payload,
+                error=None,
+                source_api="index_pro_bar",
+                evidence_type="index_daily",
+                started_at=started_at,
+                started_perf=started_perf,
+            )
     except TushareClientError as exc:
-        return _build_response(symbol=index_code, payload={}, error=str(exc))
+        return _timed_response(
+            symbol=index_code,
+            payload={},
+            error=str(exc),
+            source_api="index_pro_bar",
+            evidence_type="index_daily",
+            started_at=started_at,
+            started_perf=started_perf,
+        )
     except Exception as exc:  # pragma: no cover
-        return _build_response(symbol=index_code, payload={}, error=f"Unexpected error: {exc}")
+        return _timed_response(
+            symbol=index_code,
+            payload={},
+            error=f"Unexpected error: {exc}",
+            source_api="index_pro_bar",
+            evidence_type="index_daily",
+            started_at=started_at,
+            started_perf=started_perf,
+        )
 
 
 async def _run_sector_snapshot_tool(query: str = "", sector_name: str = "") -> dict[str, Any]:
+    started_at = _now_text()
+    started_perf = time.perf_counter()
     resolved_name, index_code = await _resolve_sector_code(query=query, sector_name=sector_name)
     if not index_code:
-        return _build_response(symbol=sector_name or query, payload={}, error="unable to resolve sector index")
+        return _timed_response(
+            symbol=sector_name or query,
+            payload={},
+            error="unable to resolve sector index",
+            source_api="sw_daily",
+            evidence_type="sector_snapshot",
+            started_at=started_at,
+            started_perf=started_perf,
+        )
 
     client = get_tushare_client()
     try:
@@ -389,20 +698,62 @@ async def _run_sector_snapshot_tool(query: str = "", sector_name: str = "") -> d
             if isinstance(payload, list):
                 payload = payload[:10]
             if payload in (None, [], {}):
-                return _build_response(symbol=index_code, payload=payload, error="empty result from Tushare")
-            response = _build_response(symbol=index_code, payload=payload)
+                return _timed_response(
+                    symbol=index_code,
+                    payload=payload,
+                    error="empty result from Tushare",
+                    source_api="sw_daily",
+                    evidence_type="sector_snapshot",
+                    started_at=started_at,
+                    started_perf=started_perf,
+                )
+            response = _timed_response(
+                symbol=index_code,
+                payload=payload,
+                error=None,
+                source_api="sw_daily",
+                evidence_type="sector_snapshot",
+                started_at=started_at,
+                started_perf=started_perf,
+            )
             response["sector_name"] = resolved_name
             return response
     except TushareClientError as exc:
-        return _build_response(symbol=index_code, payload={}, error=str(exc))
+        return _timed_response(
+            symbol=index_code,
+            payload={},
+            error=str(exc),
+            source_api="sw_daily",
+            evidence_type="sector_snapshot",
+            started_at=started_at,
+            started_perf=started_perf,
+        )
     except Exception as exc:  # pragma: no cover
-        return _build_response(symbol=index_code, payload={}, error=f"Unexpected error: {exc}")
+        return _timed_response(
+            symbol=index_code,
+            payload={},
+            error=f"Unexpected error: {exc}",
+            source_api="sw_daily",
+            evidence_type="sector_snapshot",
+            started_at=started_at,
+            started_perf=started_perf,
+        )
 
 
 async def _run_sector_constituents_tool(query: str = "", sector_name: str = "", limit: int = 20) -> dict[str, Any]:
+    started_at = _now_text()
+    started_perf = time.perf_counter()
     resolved_name, index_code = await _resolve_sector_code(query=query, sector_name=sector_name)
     if not index_code:
-        return _build_response(symbol=sector_name or query, payload={}, error="unable to resolve sector index")
+        return _timed_response(
+            symbol=sector_name or query,
+            payload={},
+            error="unable to resolve sector index",
+            source_api="index_member",
+            evidence_type="sector_constituents",
+            started_at=started_at,
+            started_perf=started_perf,
+        )
 
     client = get_tushare_client()
     try:
@@ -412,14 +763,46 @@ async def _run_sector_constituents_tool(query: str = "", sector_name: str = "", 
             if isinstance(payload, list):
                 payload = payload[:limit]
             if payload in (None, [], {}):
-                return _build_response(symbol=index_code, payload=payload, error="empty result from Tushare")
-            response = _build_response(symbol=index_code, payload=payload)
+                return _timed_response(
+                    symbol=index_code,
+                    payload=payload,
+                    error="empty result from Tushare",
+                    source_api="index_member",
+                    evidence_type="sector_constituents",
+                    started_at=started_at,
+                    started_perf=started_perf,
+                )
+            response = _timed_response(
+                symbol=index_code,
+                payload=payload,
+                error=None,
+                source_api="index_member",
+                evidence_type="sector_constituents",
+                started_at=started_at,
+                started_perf=started_perf,
+            )
             response["sector_name"] = resolved_name
             return response
     except TushareClientError as exc:
-        return _build_response(symbol=index_code, payload={}, error=str(exc))
+        return _timed_response(
+            symbol=index_code,
+            payload={},
+            error=str(exc),
+            source_api="index_member",
+            evidence_type="sector_constituents",
+            started_at=started_at,
+            started_perf=started_perf,
+        )
     except Exception as exc:  # pragma: no cover
-        return _build_response(symbol=index_code, payload={}, error=f"Unexpected error: {exc}")
+        return _timed_response(
+            symbol=index_code,
+            payload={},
+            error=f"Unexpected error: {exc}",
+            source_api="index_member",
+            evidence_type="sector_constituents",
+            started_at=started_at,
+            started_perf=started_perf,
+        )
 
 
 async def _run_fund_list_tool(
@@ -429,6 +812,8 @@ async def _run_fund_list_tool(
     limit: int = 10,
     prefer_etf: bool = False,
 ) -> dict[str, Any]:
+    started_at = _now_text()
+    started_perf = time.perf_counter()
     try:
         with log_tool_call("etf_basic" if prefer_etf else "fund_basic", symbol=symbol, query=query, limit=limit):
             rows, top_name, error = await _search_fund_candidates(
@@ -438,15 +823,47 @@ async def _run_fund_list_tool(
                 limit=limit,
             )
             if error:
-                return _build_response(symbol=symbol or query, payload={}, error=error)
+                return _timed_response(
+                    symbol=symbol or query,
+                    payload={},
+                    error=error,
+                    source_api="etf_basic" if prefer_etf else "fund_basic",
+                    evidence_type="fund_basic",
+                    started_at=started_at,
+                    started_perf=started_perf,
+                )
             if not rows:
-                return _build_response(symbol=symbol or query, payload=[], error="empty result from Tushare")
-            response = _build_response(symbol=str(rows[0].get("ts_code") or query), payload=rows)
+                return _timed_response(
+                    symbol=symbol or query,
+                    payload=[],
+                    error="empty result from Tushare",
+                    source_api="etf_basic" if prefer_etf else "fund_basic",
+                    evidence_type="fund_basic",
+                    started_at=started_at,
+                    started_perf=started_perf,
+                )
+            response = _timed_response(
+                symbol=str(rows[0].get("ts_code") or query),
+                payload=rows,
+                error=None,
+                source_api="etf_basic" if prefer_etf else "fund_basic",
+                evidence_type="fund_basic",
+                started_at=started_at,
+                started_perf=started_perf,
+            )
             if top_name:
                 response["fund_name"] = top_name
             return response
     except Exception as exc:  # pragma: no cover
-        return _build_response(symbol=symbol or query, payload={}, error=f"Unexpected error: {exc}")
+        return _timed_response(
+            symbol=symbol or query,
+            payload={},
+            error=f"Unexpected error: {exc}",
+            source_api="etf_basic" if prefer_etf else "fund_basic",
+            evidence_type="fund_basic",
+            started_at=started_at,
+            started_perf=started_perf,
+        )
 
 
 async def _run_fund_data_tool(
@@ -457,13 +874,23 @@ async def _run_fund_data_tool(
     limit: int = 10,
     prefer_etf: bool = False,
 ) -> dict[str, Any]:
+    started_at = _now_text()
+    started_perf = time.perf_counter()
     fund_name, resolved_symbol, resolve_error = await _resolve_fund_symbol(
         query=query,
         symbol=symbol,
         prefer_etf=prefer_etf,
     )
     if not resolved_symbol:
-        return _build_response(symbol=symbol or query, payload={}, error=resolve_error or "unable to resolve fund symbol")
+        return _timed_response(
+            symbol=symbol or query,
+            payload={},
+            error=resolve_error or "unable to resolve fund symbol",
+            source_api=method_name,
+            evidence_type=_TOOL_EVIDENCE_TYPE_MAP.get(method_name, "unknown"),
+            started_at=started_at,
+            started_perf=started_perf,
+        )
 
     client = get_tushare_client()
     try:
@@ -474,15 +901,47 @@ async def _run_fund_data_tool(
             if isinstance(payload, list) and limit > 0:
                 payload = payload[:limit]
             if payload in (None, [], {}):
-                return _build_response(symbol=resolved_symbol, payload=payload, error="empty result from Tushare")
-            response = _build_response(symbol=resolved_symbol, payload=payload)
+                return _timed_response(
+                    symbol=resolved_symbol,
+                    payload=payload,
+                    error="empty result from Tushare",
+                    source_api=method_name,
+                    evidence_type=_TOOL_EVIDENCE_TYPE_MAP.get(method_name, "unknown"),
+                    started_at=started_at,
+                    started_perf=started_perf,
+                )
+            response = _timed_response(
+                symbol=resolved_symbol,
+                payload=payload,
+                error=None,
+                source_api=method_name,
+                evidence_type=_TOOL_EVIDENCE_TYPE_MAP.get(method_name, "unknown"),
+                started_at=started_at,
+                started_perf=started_perf,
+            )
             if fund_name:
                 response["fund_name"] = fund_name
             return response
     except TushareClientError as exc:
-        return _build_response(symbol=resolved_symbol, payload={}, error=str(exc))
+        return _timed_response(
+            symbol=resolved_symbol,
+            payload={},
+            error=str(exc),
+            source_api=method_name,
+            evidence_type=_TOOL_EVIDENCE_TYPE_MAP.get(method_name, "unknown"),
+            started_at=started_at,
+            started_perf=started_perf,
+        )
     except Exception as exc:  # pragma: no cover
-        return _build_response(symbol=resolved_symbol, payload={}, error=f"Unexpected error: {exc}")
+        return _timed_response(
+            symbol=resolved_symbol,
+            payload={},
+            error=f"Unexpected error: {exc}",
+            source_api=method_name,
+            evidence_type=_TOOL_EVIDENCE_TYPE_MAP.get(method_name, "unknown"),
+            started_at=started_at,
+            started_perf=started_perf,
+        )
 
 
 @tool

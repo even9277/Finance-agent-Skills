@@ -66,6 +66,12 @@ async def _migrate_add_columns() -> None:
         ("sessions", "running_summary", "TEXT DEFAULT NULL"),
         ("sessions", "turn_count", "INTEGER DEFAULT 0"),
         ("sessions", "last_compress_at", "DATETIME DEFAULT NULL"),
+        ("sessions", "context_token_count", "INTEGER DEFAULT 0"),
+        ("sessions", "context_budget_tokens", "INTEGER DEFAULT 0"),
+        ("sessions", "summary_token_count", "INTEGER DEFAULT 0"),
+        ("sessions", "summary_version", "INTEGER DEFAULT 0"),
+        ("sessions", "compression_status", "VARCHAR(20) DEFAULT 'idle'"),
+        ("sessions", "context_updated_at", "DATETIME DEFAULT NULL"),
         ("sessions", "title", "VARCHAR(200) DEFAULT NULL"),
         ("sessions", "updated_at", "DATETIME DEFAULT NULL"),
         # Phase 3 字段

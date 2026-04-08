@@ -107,9 +107,13 @@ async function handleViewSummaryHistory() {
             || '新对话'
           }}
         </span>
-        <span class="text-[10px] text-slate-600 shrink-0 ml-2">
-          {{ chatStore.messages.length }} 条消息
-        </span>
+        <div class="text-[10px] text-slate-600 shrink-0 ml-2 text-right">
+          <div>{{ chatStore.messages.length }} 条消息</div>
+          <div v-if="chatStore.currentContextWindow">
+            Context {{ chatStore.currentContextWindow.usage_percent }}%
+            · {{ chatStore.currentContextWindow.compression_status }}
+          </div>
+        </div>
       </div>
 
       <!-- Phase 2：STM 压缩提示条（running_summary 存在时显示） -->
@@ -178,6 +182,7 @@ async function handleViewSummaryHistory() {
       <!-- 底部输入框 -->
       <ChatInput
         :disabled="chatStore.isSending || chatStore.isStreaming"
+        :context-window="chatStore.currentContextWindow"
         @send="handleSend"
       />
 

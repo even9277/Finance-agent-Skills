@@ -1,16 +1,52 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, watch } from 'vue'
+import type { ChatContextWindow } from '@/api'
+import ContextUsageRing from '@/components/chat/ContextUsageRing.vue'
+import { countDraftTokens } from '@/utils/tokenCounter'
 
-const props = defineProps<{ disabled?: boolean }>()
+const props = defineProps<{ disabled?: boolean; contextWindow?: ChatContextWindow | null }>()
 const emit = defineEmits<{
   (e: 'send', text: string): void
 }>()
 
 const text = ref('')
+const draftTokens = ref(0)
 const MAX_CHARS = 500
 
 const charCount = computed(() => text.value.length)
 const nearLimit = computed(() => charCount.value > MAX_CHARS * 0.8)
+const effectiveUsedTokens = computed(() => (props.contextWindow?.used_tokens || 0) + draftTokens.value)
+const effectiveBudgetTokens = computed(() => props.contextWindow?.budget_tokens || 0)
+const effectivePercent = computed(() => {
+  if (!effectiveBudgetTokens.value) return 0
+  return Math.max(0, Math.min(100, Math.round((effectiveUsedTokens.value / effectiveBudgetTokens.value) * 100)))
+})
+const ringTitle = computed(() => {
+  if (!props.contextWindow?.budget_tokens) return 'Context 使用量将在发送后更新'
+  const statusMap: Record<string, string> = {
+    idle: '空闲',
+    queued: '已排队压缩',
+    running: '后台压缩中',
+    failed: '压缩失败',
+  }
+  return [
+    `Context: ${effectiveUsedTokens.value}/${effectiveBudgetTokens.value} tokens`,
+    `计量: ${props.contextWindow.counting_mode || 'estimated'}`,
+    `状态: ${statusMap[props.contextWindow.compression_status] || props.contextWindow.compression_status}`,
+  ].join('\n')
+})
+
+let latestCountSeq = 0
+
+watch(
+  () => text.value,
+  async (value) => {
+    const seq = ++latestCountSeq
+    draftTokens.value = value ? Math.max(0, draftTokens.value) : 0
+    const count = await countDraftTokens(value)
+    if (seq === latestCountSeq) draftTokens.value = count
+  },
+)
 
 function handleKeydown(e: KeyboardEvent) {
   if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
@@ -24,6 +60,7 @@ function submit() {
   if (!trimmed || props.disabled) return
   emit('send', trimmed)
   text.value = ''
+  draftTokens.value = 0
 }
 
 function autoResize(e: Event) {
@@ -47,6 +84,12 @@ function autoResize(e: Event) {
       />
 
       <div class="flex items-center gap-2 shrink-0">
+        <ContextUsageRing
+          v-if="contextWindow"
+          :percent="effectivePercent"
+          :status="contextWindow.compression_status"
+          :title="ringTitle"
+        />
         <!-- 字数计数 -->
         <span
           v-if="nearLimit"

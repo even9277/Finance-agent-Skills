@@ -1,0 +1,95 @@
+skill_name: market-move-explain
+skill_family: financial-sop
+version: "1.0.0"
+execution_policy: deterministic
+allowed_tools:
+  - get_stock_basic_info
+  - get_market_bars
+  - get_index_bars
+  - get_sector_snapshot
+  - get_sector_constituents
+  - get_fund_basic_info
+  - get_etf_basic_info
+  - get_fund_market_bars
+tool_plan_steps:
+  - step: identify_stock_context
+    tool: get_stock_basic_info
+    required: false
+    arguments:
+      limit: 3
+  - step: inspect_stock_market_move
+    tool: get_market_bars
+    required: false
+    arguments:
+      limit: 20
+  - step: inspect_index_context
+    tool: get_index_bars
+    required: false
+    arguments:
+      limit: 10
+  - step: inspect_sector_snapshot
+    tool: get_sector_snapshot
+    required: false
+    arguments:
+      limit: 10
+  - step: inspect_sector_constituents
+    tool: get_sector_constituents
+    required: false
+    arguments:
+      limit: 10
+  - step: identify_fund_context
+    tool: get_fund_basic_info
+    required: false
+    arguments:
+      limit: 5
+  - step: identify_etf_context
+    tool: get_etf_basic_info
+    required: false
+    arguments:
+      limit: 5
+  - step: inspect_fund_market_move
+    tool: get_fund_market_bars
+    required: false
+    arguments:
+      limit: 10
+required_evidence:
+  must_have_any:
+    - stock_market
+    - fund_daily
+    - index_daily
+    - sector_snapshot
+output_template:
+  default_section_order:
+    - conclusion
+    - confirmed_facts
+    - possible_drivers
+    - risks
+    - sources
+  response_pref_overrides:
+    risk_first:
+      section_order:
+        - risks
+        - conclusion
+        - confirmed_facts
+        - possible_drivers
+        - sources
+      style_variant: risk_first
+    concise:
+      section_order:
+        - conclusion
+        - confirmed_facts
+        - risks
+        - sources
+      style_variant: concise
+degrade_policy:
+  stages:
+    - name: primary
+      next_stage: partial_explain
+    - name: partial_explain
+      next_stage: graceful_decline
+    - name: graceful_decline
+      next_stage: none
+  when_missing_evidence: graceful_decline
+concurrency:
+  enabled: true
+  batch_size: 6

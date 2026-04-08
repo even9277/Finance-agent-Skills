@@ -57,7 +57,26 @@ class Settings(BaseSettings):
     enable_stock_selection: bool = False
     enable_deterministic_skill_execution: bool = True
     enable_tool_prefetch_concurrency: bool = True
+    enable_trace: bool = True
+    enable_evidence_lineage: bool = True
+    enable_trace_artifact_refs: bool = False
+    enable_trace_prompt_capture: bool = False
+    enable_trace_reply_capture: bool = False
+    enable_langfuse: bool = False
     auth_enabled: bool = True
+    memory_context_timeout_sec: int = 8
+    # STM dynamic budget / async compaction
+    stm_compression_strategy: str = "dynamic_budget"
+    stm_context_budget_tokens: int = 32000
+    stm_context_target_ratio: float = 0.72
+    stm_context_hard_ratio: float = 0.85
+    stm_response_reserve_tokens: int = 1200
+    stm_memory_reserve_tokens: int = 600
+    stm_keep_recent: int = 4
+    stm_legacy_count_threshold: int = 10
+    stm_worker_interval_sec: int = 3
+    stm_worker_batch_size: int = 10
+    stm_worker_max_retries: int = 3
 
     # ── Mem0 / pgvector 配置（Phase 3）────────────────────
     # PostgreSQL 连接（Mem0 向量库使用，SQLite 环境下这些配置被忽略）
@@ -74,6 +93,18 @@ class Settings(BaseSettings):
     chat_router_model: str = "kimi-k2.5"
     chat_resolver_model: str = "kimi-k2.5"
     chat_skill_synthesis_model: str = ""
+    # Trace / Langfuse
+    trace_artifact_dir: str = str(_AGENT_DIR / "logs" / "chat_trace_artifacts")
+    langfuse_base_url: str = ""
+    langfuse_public_key: str = ""
+    langfuse_secret_key: str = ""
+    langfuse_host: str = "https://cloud.langfuse.com"
+    langfuse_project: str = ""
+    langfuse_env: str = "dev"
+    langfuse_release: str = ""
+    langfuse_sample_rate: float = 1.0
+    langfuse_flush_at: int = 20
+    langfuse_flush_interval_sec: int = 5
     # Tushare（Phase 1）
     tushare_token: str = ""
     # Auth/JWT

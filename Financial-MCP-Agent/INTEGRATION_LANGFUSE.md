@@ -1,5 +1,10 @@
 # Langfuse 集成指南
 
+> 说明：这份文件保留为历史集成草稿。当前仓库已经切到 `skill_trace.py -> trace_exporters/langfuse_exporter.py` 的主链路。
+>
+> 新的本机开发与联调步骤，请优先看：
+> [docs/部署指南-Langfuse-本机开发联调.md](/root/Finance/docs/部署指南-Langfuse-本机开发联调.md)
+
 ## 1. 部署Langfuse（二选一）
 
 ### 方案A：使用Langfuse Cloud（推荐快速开始）

@@ -2,22 +2,31 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from src.agents.agent_factory import build_analysis_agent
 from src.agents.response_normalizer import extract_final_text
 from src.agents.skill_evidence import validate_evidence
+from src.agents.skill_spec_planner import build_skill_tool_plan
 from src.agents.tushare_reference_planner import build_tushare_tool_plan
 from src.skills.skill_registry import get_skill_registry
 from src.tools.chat_tushare_tools import get_tushare_toolkit
 from src.tools.skill_trace import (
+    log_claim_lineage,
+    log_degrade_transition,
     log_model_stage,
+    log_policy_violation,
     log_reply_completed,
     log_skill_selected,
     log_tool_plan,
+    new_claim_id,
     skill_trace_context,
+    trace_span,
+    write_trace_artifact,
 )
 from src.utils.logging_config import setup_logger
 
@@ -320,6 +329,56 @@ def _toolkit_by_name() -> dict[str, Any]:
     }
 
 
+def _toolkit_for_names(tool_names: list[str]) -> list[Any]:
+    available = _toolkit_by_name()
+    return [available[name] for name in tool_names if name in available]
+
+
+def _percentile_ms(values: list[float | int], percentile: float = 0.95) -> float:
+    cleaned = sorted(float(value) for value in values if value is not None)
+    if not cleaned:
+        return 0.0
+    index = max(0, min(len(cleaned) - 1, math.ceil(len(cleaned) * percentile) - 1))
+    return round(cleaned[index], 2)
+
+
+def _policy_violation_names(planned_tool_names: list[str], allowed_tools: list[str]) -> list[str]:
+    allowed = {str(item) for item in allowed_tools if str(item)}
+    if not allowed:
+        return []
+    return [tool_name for tool_name in planned_tool_names if tool_name not in allowed]
+
+
+def _execution_observability_metrics(
+    *,
+    route_confidence: float | None,
+    planned_tool_names: list[str],
+    tool_results: list[tuple[str, dict[str, Any]]],
+    degrade_policy: dict[str, Any] | None,
+    policy_violation_names: list[str] | None = None,
+    evidence_ok: bool = False,
+) -> dict[str, Any]:
+    durations = [
+        float(result.get("duration_ms") or 0)
+        for _, result in tool_results
+        if isinstance(result, dict) and result.get("duration_ms") is not None
+    ]
+    success_count = sum(1 for _, result in tool_results if isinstance(result, dict) and bool(result.get("ok")))
+    failure_count = max(0, len(tool_results) - success_count)
+    tool_failure_rate = round((failure_count / len(tool_results)), 4) if tool_results else 0.0
+    return {
+        "route_confidence": round(float(route_confidence or 0.0), 4),
+        "tool_batch_size": len(planned_tool_names),
+        "tool_success_count": success_count,
+        "tool_failure_count": failure_count,
+        "tool_failure_rate": tool_failure_rate,
+        "p95_latency": _percentile_ms(durations),
+        "degrade_stage": str((degrade_policy or {}).get("current_stage") or "none"),
+        "policy_violation_count": len(policy_violation_names or []),
+        "evidence_ok": bool(evidence_ok),
+    }
+
+
 def _should_use_deterministic_path(
     *,
     analysis_mode: str,
@@ -348,6 +407,751 @@ def _serialize_tool_output(payload: Any) -> str:
         return value
 
     return json.dumps(_trim(payload), ensure_ascii=False, default=str)
+
+
+def _strip_frontmatter(markdown_text: str) -> str:
+    text = (markdown_text or "").strip()
+    if not text.startswith("---"):
+        return text
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return text
+    return parts[2].strip()
+
+
+def _response_pref(profile_summary: str) -> str:
+    for raw_line in (profile_summary or "").splitlines():
+        if ":" not in raw_line:
+            continue
+        label, value = raw_line.split(":", 1)
+        if label.strip() == "回答偏好":
+            return value.strip()
+    return "balanced"
+
+
+def _skill_output_template(skill_spec: dict[str, Any], profile_summary: str) -> dict[str, Any]:
+    template = dict(skill_spec.get("output_template") or {})
+    section_order = list(template.get("default_section_order") or [])
+    style_variant = "default"
+    response_pref = _response_pref(profile_summary)
+    overrides = template.get("response_pref_overrides") or {}
+    override = overrides.get(response_pref) or {}
+    if override.get("section_order"):
+        section_order = list(override.get("section_order") or [])
+    if override.get("style_variant"):
+        style_variant = str(override.get("style_variant") or "default")
+    return {
+        "response_pref": response_pref,
+        "section_order": section_order,
+        "style_variant": style_variant,
+    }
+
+
+def _skill_tool_policy(skill_spec: dict[str, Any]) -> dict[str, list[str]]:
+    allowed_tools = [str(item) for item in skill_spec.get("allowed_tools") or [] if str(item)]
+    required_tools: list[str] = []
+    optional_tools: list[str] = []
+    for step in skill_spec.get("tool_plan_steps") or []:
+        tool_name = str(step.get("tool") or "").strip()
+        if not tool_name:
+            continue
+        if bool(step.get("required", True)):
+            if tool_name not in required_tools:
+                required_tools.append(tool_name)
+        else:
+            if tool_name not in optional_tools:
+                optional_tools.append(tool_name)
+    forbidden_tools = sorted(
+        name for name in _toolkit_by_name().keys() if allowed_tools and name not in set(allowed_tools)
+    )
+    return {
+        "allowed_tools": allowed_tools,
+        "required_tools": required_tools,
+        "optional_tools": optional_tools,
+        "forbidden_tools": forbidden_tools,
+    }
+
+
+def _degrade_state(skill_spec: dict[str, Any], evidence_ok: bool) -> dict[str, str]:
+    degrade_policy = dict(skill_spec.get("degrade_policy") or {})
+    stages = {
+        str(item.get("name") or ""): str(item.get("next_stage") or "none")
+        for item in degrade_policy.get("stages") or []
+        if str(item.get("name") or "").strip()
+    }
+    current_stage = "primary" if evidence_ok else str(degrade_policy.get("when_missing_evidence") or "graceful_decline")
+    next_stage = stages.get(current_stage, "none")
+    return {
+        "current_stage": current_stage,
+        "next_stage": next_stage,
+    }
+
+
+def _degrade_history(
+    *,
+    degrade_policy: dict[str, Any] | None,
+    missing_reasons: list[str] | None,
+    reply_mode: str,
+) -> list[dict[str, Any]]:
+    current_stage = str((degrade_policy or {}).get("current_stage") or "")
+    if not current_stage or current_stage == "primary":
+        return []
+    return [
+        {
+            "stage": current_stage,
+            "reason": "；".join(str(item) for item in (missing_reasons or []) if str(item)) or "evidence_not_sufficient",
+            "entered_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="milliseconds"),
+            "outcome": reply_mode,
+        }
+    ]
+
+
+def _claim_type(analysis_mode: str, skill_name: str | None = None) -> str:
+    normalized = str(skill_name or analysis_mode or "").lower()
+    if "compare" in normalized:
+        return "comparison"
+    if "screen" in normalized or "selection" in normalized:
+        return "screening"
+    if "move" in normalized or "explain" in normalized:
+        return "explanation"
+    return "assessment"
+
+
+def _claim_text_candidates(reply_text: str) -> list[str]:
+    lines: list[str] = []
+    for raw_line in (reply_text or "").splitlines():
+        line = raw_line.strip().lstrip("-").lstrip("*").strip()
+        if not line:
+            continue
+        if line.startswith("数据来源") or line.startswith("来源："):
+            continue
+        if len(line) < 8:
+            continue
+        if line not in lines:
+            lines.append(line[:220])
+        if len(lines) >= 3:
+            break
+    if lines:
+        return lines
+
+    text = (reply_text or "").strip()
+    if not text:
+        return []
+    for sep in ("。", "\n", "；"):
+        if sep in text:
+            first = text.split(sep, 1)[0].strip()
+            return [first[:220]] if first else []
+    return [text[:220]]
+
+
+def _build_claims(
+    *,
+    reply_text: str,
+    analysis_mode: str,
+    accepted_evidences: list[dict[str, Any]],
+    evidence_ok: bool,
+    skill_name: str | None = None,
+) -> list[dict[str, Any]]:
+    evidence_ids = [
+        str(item.get("evidence_id") or "").strip()
+        for item in accepted_evidences
+        if str(item.get("evidence_id") or "").strip()
+    ]
+    tool_result_refs = [
+        str(item.get("tool_result_id") or "").strip()
+        for item in accepted_evidences
+        if str(item.get("tool_result_id") or "").strip()
+    ]
+    base_confidence = 0.85 if evidence_ok else 0.45
+    claims: list[dict[str, Any]] = []
+    for idx, text in enumerate(_claim_text_candidates(reply_text), start=1):
+        claims.append(
+            {
+                "claim_id": new_claim_id(),
+                "claim_type": _claim_type(analysis_mode, skill_name),
+                "claim_text": text,
+                "evidence_refs": evidence_ids[:6],
+                "tool_result_refs": tool_result_refs[:6],
+                "confidence": round(max(0.2, base_confidence - (idx - 1) * 0.08), 2),
+            }
+        )
+    return claims
+
+
+def _build_claim_refs(claims: list[dict[str, Any]]) -> list[str]:
+    refs: list[str] = []
+    for item in claims:
+        claim_id = str(item.get("claim_id") or "").strip()
+        if claim_id:
+            refs.append(claim_id)
+    return refs
+
+
+def _tool_payload_artifact_refs(tool_results: list[tuple[str, dict[str, Any]]]) -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
+    for tool_name, result in tool_results:
+        if not isinstance(result, dict):
+            continue
+        tool_result_id = str(result.get("tool_result_id") or "").strip()
+        if not tool_result_id:
+            continue
+        artifact = write_trace_artifact(
+            "payload",
+            result.get("payload"),
+            file_stem=tool_result_id,
+        )
+        if artifact:
+            refs.append(
+                {
+                    "tool_name": tool_name,
+                    "tool_result_id": tool_result_id,
+                    "payload_ref": artifact.get("path"),
+                }
+            )
+    return refs
+
+
+def _emit_policy_violation_events(
+    *,
+    skill_name: str | None,
+    policy_violation_names: list[str],
+    tool_policy: dict[str, list[str]],
+    planned_tools: list[str],
+) -> None:
+    for tool_name in policy_violation_names:
+        log_policy_violation(
+            skill_name=skill_name,
+            tool_name=tool_name,
+            violation_type="forbidden_tool_attempt",
+            resolution="blocked_before_execution",
+        )
+
+    required_tools = {str(item) for item in tool_policy.get("required_tools") or [] if str(item)}
+    actual_tools = {str(item) for item in planned_tools if str(item)}
+    missing_required = sorted(required_tools - actual_tools)
+    for tool_name in missing_required:
+        log_policy_violation(
+            skill_name=skill_name,
+            tool_name=tool_name,
+            violation_type="required_tool_missing",
+            resolution="missing_from_tool_plan",
+        )
+
+
+def _sop_missing_evidence_message(query: str, reasons: list[str]) -> str:
+    reason_text = f"缺失原因：{'；'.join(reasons)}。" if reasons else ""
+    return (
+        f"这次 skill 分析还没有拿到足够的可核对证据，所以我不能可靠地下结论。{reason_text}"
+        f"你可以补充更明确的基金名称，或稍后重试。原问题：{query}"
+    )
+
+
+def _sop_skill_prompt(
+    *,
+    skill_name: str,
+    skill_markdown: str,
+    skill_spec: dict[str, Any],
+) -> str:
+    return (
+        f"你是一位A股投研助手，正在执行 financial-sop `{skill_name}`。\n\n"
+        "执行原则：\n"
+        "1. 只基于已获取到的工具证据下结论，不要编造。\n"
+        "2. 严格遵守 allowed_tools 和 output_template。\n"
+        "3. 若证据不足，要明确说明并走降级回复。\n"
+        "4. 用中文回答，并标注数据来源为 Tushare。\n\n"
+        f"【Skill SOP】\n{_strip_frontmatter(skill_markdown)[:2400]}\n\n"
+        f"【Skill Spec 摘要】\n{json.dumps(skill_spec, ensure_ascii=False, default=str)[:2200]}"
+    )
+
+
+def _sop_reference_block(skill_name: str, user_message: str) -> str:
+    refs = get_skill_registry().load_reference_texts(skill_name, user_message, limit=3)
+    if not refs:
+        return ""
+    blocks = []
+    for item in refs:
+        blocks.append(
+            f"- [{item['category']}] {item['title']} ({item['path']})\n{item['content'][:500]}"
+        )
+    return "【Skill References】\n" + "\n\n".join(blocks)
+
+
+def _build_sop_synthesis_prompt(
+    *,
+    user_message: str,
+    memory_context: str,
+    running_summary: str,
+    profile_summary: str,
+    skill_name: str,
+    skill_spec: dict[str, Any],
+    skill_markdown: str,
+    tool_results: list[tuple[str, dict[str, Any]]],
+) -> str:
+    template = _skill_output_template(skill_spec, profile_summary)
+    sections = [
+        "请基于下面已经获取到的工具结果生成最终回答。",
+        "不要再假设未出现的数据；如果证据不足，请明确说明不能可靠判断。",
+        f"【输出模板】\nsection_order={template['section_order']}\nstyle_variant={template['style_variant']}\nresponse_pref={template['response_pref']}",
+        f"【Skill 名称】\n{skill_name}",
+        f"【Skill SOP 摘要】\n{_strip_frontmatter(skill_markdown)[:1800]}",
+    ]
+    reference_block = _sop_reference_block(skill_name, user_message)
+    if reference_block:
+        sections.append(reference_block)
+    if memory_context:
+        sections.append(f"【memory_context】\n{memory_context[:1600]}")
+    if running_summary:
+        sections.append(f"【running_summary】\n{running_summary[:600]}")
+    if profile_summary:
+        sections.append(f"【用户画像摘要】\n{profile_summary}")
+    tool_lines = []
+    for tool_name, result in tool_results:
+        tool_lines.append(f"- {tool_name}: {_serialize_tool_output(result)}")
+    sections.append("【已获取工具结果】\n" + ("\n".join(tool_lines) if tool_lines else "无"))
+    sections.append(f"【用户问题】\n{user_message}")
+    sections.append(
+        "请用中文回答，并根据 output_template 调整结构；如果回答偏好是 risk_first，先讲风险和不确定性；如果是 concise，压缩为少量关键点。"
+    )
+    return "\n\n".join(sections)
+
+
+async def _run_sop_deterministic_execution(
+    *,
+    skill_name: str,
+    skill_spec: dict[str, Any],
+    skill_markdown: str,
+    user_message: str,
+    memory_context: str,
+    running_summary: str,
+    profile_summary: str,
+    tool_plan: Any,
+    concurrent: bool,
+) -> tuple[str, list[tuple[str, dict[str, Any]]], dict[str, Any], dict[str, Any]]:
+    initial_calls, follow_up_calls, candidate_config = _split_sop_tool_calls(
+        skill_spec=skill_spec,
+        tool_plan=tool_plan,
+    )
+    tool_results = await _run_tool_batch(initial_calls, concurrent=concurrent)
+    if follow_up_calls:
+        trigger_tools = {
+            str(item)
+            for item in (candidate_config.get("trigger_tools") or [])
+            if str(item)
+        }
+        candidate_symbols = _sop_candidate_symbols(
+            tool_results=tool_results,
+            trigger_tools=trigger_tools,
+            top_n=int(candidate_config.get("top_n") or 3),
+        ) if trigger_tools else []
+        expanded_follow_up_calls = _expand_sop_follow_up_calls(
+            follow_up_calls=follow_up_calls,
+            candidate_symbols=candidate_symbols,
+        )
+        tool_results.extend(await _run_tool_batch(expanded_follow_up_calls, concurrent=concurrent))
+    evidence_response = _build_tool_messages(tool_results)
+    synthesis_prompt = _build_sop_synthesis_prompt(
+        user_message=user_message,
+        memory_context=memory_context,
+        running_summary=running_summary,
+        profile_summary=profile_summary,
+        skill_name=skill_name,
+        skill_spec=skill_spec,
+        skill_markdown=skill_markdown,
+        tool_results=tool_results,
+    )
+    prompt_artifact = write_trace_artifact(
+        "prompt",
+        synthesis_prompt,
+        extension="txt",
+        file_stem=f"{skill_name}_synthesis_prompt",
+    )
+    synthesis_model = _synthesis_model_name()
+    log_model_stage(stage="synthesis", model=synthesis_model, execution_path="deterministic")
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    with trace_span(
+        "synthesis",
+        stage="reply",
+        data={
+            "model_name": synthesis_model,
+            "memory_context_used": bool(memory_context),
+            "running_summary_used": bool(running_summary),
+            "profile_summary_used": bool(profile_summary),
+            "tool_result_refs": [
+                result.get("tool_result_id")
+                for _, result in tool_results
+                if isinstance(result, dict) and result.get("tool_result_id")
+            ],
+        },
+    ):
+        response = await _build_model(model_name=synthesis_model, temperature=0.2).ainvoke(
+            [
+                SystemMessage(
+                    content=_sop_skill_prompt(
+                        skill_name=skill_name,
+                        skill_markdown=skill_markdown,
+                        skill_spec=skill_spec,
+                    )
+                ),
+                HumanMessage(content=synthesis_prompt),
+            ]
+        )
+    reply_text = extract_final_text(response)
+    reply_artifact = write_trace_artifact(
+        "reply",
+        str(reply_text).strip(),
+        extension="txt",
+        file_stem=f"{skill_name}_reply",
+    )
+    payload_refs = _tool_payload_artifact_refs(tool_results)
+    return str(reply_text).strip(), tool_results, evidence_response, {
+        "prompt_ref": prompt_artifact.get("path") if prompt_artifact else None,
+        "reply_ref": reply_artifact.get("path") if reply_artifact else None,
+        "payload_refs": payload_refs,
+    }
+
+
+async def _execute_financial_sop_skill(
+    *,
+    selected_skill: str,
+    skill_name: str | None,
+    execution_policy: str,
+    user_message: str,
+    effective_query: str,
+    memory_context: str,
+    running_summary: str,
+    profile_summary: str,
+    route_arguments: dict[str, Any],
+    analysis_mode: str,
+    enable_tool_prefetch_concurrency: bool,
+    router_model: str,
+    resolver_model: str,
+    synthesis_model: str,
+    route_confidence: float | None = None,
+) -> SkillExecutionResult:
+    if not skill_name:
+        reply_text = "当前 financial-sop 路由没有命中具体 skill，所以这次不能可靠执行。"
+        log_reply_completed(mode="skill-disabled", used_tools=False, evidence_ok=False)
+        return SkillExecutionResult(
+            reply_text=reply_text,
+            selected_skill=selected_skill,
+            trace={"enabled": False, "reason": "missing skill_name"},
+        )
+
+    registry = get_skill_registry()
+    skill_spec = registry.load_skill_spec(skill_name) or {}
+    skill_markdown = registry.load_skill_markdown(skill_name)
+    if not skill_spec or not skill_markdown:
+        reply_text = f"当前 `{skill_name}` 的 skill 资产还不完整，所以这次不能可靠执行。"
+        log_reply_completed(mode="skill-disabled", used_tools=False, evidence_ok=False)
+        return SkillExecutionResult(
+            reply_text=reply_text,
+            selected_skill=selected_skill,
+            trace={"enabled": False, "reason": "missing skill assets", "skill_name": skill_name},
+        )
+
+    tool_policy = _skill_tool_policy(skill_spec)
+    resolved_entities = [str(item) for item in route_arguments.get("candidate_entities") or [] if str(item)]
+    with trace_span(
+        "planner",
+        stage="executor",
+        data={
+            "planner_type": "skill_planner",
+            "skill_name": skill_name,
+            "resolved_entities": resolved_entities,
+        },
+    ):
+        tool_plan = build_skill_tool_plan(
+            skill_name=skill_name,
+            skill_spec=skill_spec,
+            user_message=effective_query,
+            resolved_entities=resolved_entities,
+        )
+    original_planned_tools = [item.tool_name for item in tool_plan.tool_calls]
+    policy_violation_names = _policy_violation_names(original_planned_tools, tool_policy["allowed_tools"])
+    allowed_tools = set(tool_policy["allowed_tools"])
+    tool_plan.tool_calls = [
+        item for item in tool_plan.tool_calls if item.tool_name in allowed_tools
+    ]
+    planned_tools = [item.tool_name for item in tool_plan.tool_calls]
+    execution_path = "hybrid" if execution_policy == "hybrid" else "deterministic"
+    initial_degrade_policy = _degrade_state(skill_spec, True)
+    _emit_policy_violation_events(
+        skill_name=skill_name,
+        policy_violation_names=policy_violation_names,
+        tool_policy=tool_policy,
+        planned_tools=planned_tools,
+    )
+    log_tool_plan(
+        planner_type=tool_plan.planner_type,
+        analysis_mode=analysis_mode,
+        planned_tools=planned_tools,
+        references=[item["title"] for item in tool_plan.references],
+        execution_path=execution_path,
+        tool_batch_size=len(tool_plan.tool_calls),
+        tool_policy={
+            "required_tools": tool_policy["required_tools"],
+            "optional_tools": tool_policy["optional_tools"],
+            "forbidden_tools": tool_policy["forbidden_tools"],
+        },
+        degrade_policy=initial_degrade_policy,
+        policy_violation_count=len(policy_violation_names),
+        policy_violations=policy_violation_names,
+    )
+
+    if not tool_plan.tool_calls:
+        reasons = ["no tool calls generated from skill_spec"]
+        reply_text = _sop_missing_evidence_message(user_message, reasons)
+        degrade_policy = _degrade_state(skill_spec, False)
+        degrade_history = _degrade_history(
+            degrade_policy=degrade_policy,
+            missing_reasons=reasons,
+            reply_mode="evidence-missing",
+        )
+        if degrade_history:
+            for item in degrade_history:
+                log_degrade_transition(
+                    skill_name=skill_name,
+                    analysis_mode=analysis_mode,
+                    stage=item["stage"],
+                    reason=item["reason"],
+                    outcome=item["outcome"],
+                )
+        observability_metrics = _execution_observability_metrics(
+            route_confidence=route_confidence,
+            planned_tool_names=planned_tools,
+            tool_results=[],
+            degrade_policy=degrade_policy,
+            policy_violation_names=policy_violation_names,
+            evidence_ok=False,
+        )
+        log_reply_completed(
+            mode="evidence-missing",
+            used_tools=False,
+            evidence_ok=False,
+            missing_evidence_reasons=reasons,
+            degrade_policy=degrade_policy,
+        )
+        return SkillExecutionResult(
+            reply_text=reply_text,
+            selected_skill=selected_skill,
+            trace={
+                "selected_skill_family": "financial-sop",
+                "skill_name": skill_name,
+                "analysis_mode": analysis_mode,
+                "execution_policy": execution_policy,
+                "execution_path": execution_path,
+                "planner_type": tool_plan.planner_type,
+                "planned_tools": planned_tools,
+                "tool_policy": tool_policy,
+                "degrade_policy": degrade_policy,
+                "degrade_history": degrade_history,
+                "final_degrade_outcome": degrade_history[-1]["outcome"] if degrade_history else "not_triggered",
+                "evidence_ok": False,
+                "evidence_refs": [],
+                "reply_mode": "evidence-missing",
+                "policy_violations": policy_violation_names,
+                "available_tool_names": tool_policy["allowed_tools"],
+                "official_skill_source": f"workspace:{skill_name}",
+                **observability_metrics,
+            },
+        )
+
+    try:
+        reply_mode = "skill"
+        if execution_path == "hybrid":
+            reply_text, tool_results, evidence_response, artifact_refs = await _run_sop_deterministic_execution(
+                skill_name=skill_name,
+                skill_spec=skill_spec,
+                skill_markdown=skill_markdown,
+                user_message=effective_query,
+                memory_context=memory_context,
+                running_summary=running_summary,
+                profile_summary=profile_summary,
+                tool_plan=tool_plan,
+                concurrent=enable_tool_prefetch_concurrency,
+            )
+        else:
+            reply_text, tool_results, evidence_response, artifact_refs = await _run_sop_deterministic_execution(
+                skill_name=skill_name,
+                skill_spec=skill_spec,
+                skill_markdown=skill_markdown,
+                user_message=effective_query,
+                memory_context=memory_context,
+                running_summary=running_summary,
+                profile_summary=profile_summary,
+                tool_plan=tool_plan,
+                concurrent=enable_tool_prefetch_concurrency,
+            )
+        with trace_span(
+            "evidence",
+            stage="executor",
+            data={
+                "planner_type": tool_plan.planner_type,
+                "planned_tools": planned_tools,
+            },
+        ):
+            evidence = validate_evidence(
+                analysis_mode=analysis_mode,
+                resolved_symbol=None,
+                response=evidence_response,
+                skill_spec=skill_spec,
+            )
+        claims = _build_claims(
+            reply_text=reply_text,
+            analysis_mode=analysis_mode,
+            accepted_evidences=evidence.accepted_evidences,
+            evidence_ok=evidence.evidence_ok,
+            skill_name=skill_name,
+        )
+        claim_artifact = write_trace_artifact(
+            "claims",
+            claims,
+            file_stem=f"{skill_name}_claims",
+        )
+        if claims:
+            log_claim_lineage(
+                skill_name=skill_name,
+                analysis_mode=analysis_mode,
+                claim_count=len(claims),
+                claim_ids=_build_claim_refs(claims),
+            )
+        used_tools = evidence.used_tools
+        degrade_policy = _degrade_state(skill_spec, evidence.evidence_ok)
+        degrade_history = _degrade_history(
+            degrade_policy=degrade_policy,
+            missing_reasons=evidence.missing_evidence_reasons,
+            reply_mode=reply_mode,
+        )
+        if degrade_history:
+            for item in degrade_history:
+                log_degrade_transition(
+                    skill_name=skill_name,
+                    analysis_mode=analysis_mode,
+                    stage=item["stage"],
+                    reason=item["reason"],
+                    outcome=item["outcome"],
+                )
+        observability_metrics = _execution_observability_metrics(
+            route_confidence=route_confidence,
+            planned_tool_names=planned_tools,
+            tool_results=tool_results,
+            degrade_policy=degrade_policy,
+            policy_violation_names=policy_violation_names,
+            evidence_ok=evidence.evidence_ok,
+        )
+        if not evidence.evidence_ok:
+            reply_mode = "evidence-missing"
+            reply_text = _sop_missing_evidence_message(user_message, evidence.missing_evidence_reasons)
+            log_reply_completed(
+                mode="evidence-missing",
+                used_tools=used_tools,
+                successful_tools=evidence.successful_tools,
+                evidence_ok=evidence.evidence_ok,
+                missing_evidence_reasons=evidence.missing_evidence_reasons,
+                accepted_evidences=evidence.accepted_evidences,
+                rejected_evidences=evidence.rejected_evidences,
+                degrade_policy=degrade_policy,
+            )
+        else:
+            log_reply_completed(
+                mode="skill",
+                used_tools=used_tools,
+                successful_tools=evidence.successful_tools,
+                evidence_ok=evidence.evidence_ok,
+                accepted_evidences=evidence.accepted_evidences,
+                rejected_evidences=evidence.rejected_evidences,
+                degrade_policy=degrade_policy,
+            )
+    except Exception as exc:
+        logger.warning("[skill_executor] financial-sop invoke failed: %s", exc, exc_info=True)
+        reply_mode = "skill-error"
+        reply_text = _format_tool_failure_message(user_message, str(exc))
+        tool_results = []
+        artifact_refs = {"prompt_ref": None, "reply_ref": None, "payload_refs": []}
+        with trace_span(
+            "evidence",
+            stage="executor",
+            data={
+                "planner_type": tool_plan.planner_type,
+                "planned_tools": planned_tools,
+            },
+        ):
+            evidence = validate_evidence(
+                analysis_mode=analysis_mode,
+                resolved_symbol=None,
+                response={"messages": []},
+                skill_spec=skill_spec,
+            )
+        used_tools = False
+        degrade_policy = _degrade_state(skill_spec, False)
+        degrade_history = _degrade_history(
+            degrade_policy=degrade_policy,
+            missing_reasons=evidence.missing_evidence_reasons,
+            reply_mode=reply_mode,
+        )
+        claims = []
+        claim_artifact = None
+        if degrade_history:
+            for item in degrade_history:
+                log_degrade_transition(
+                    skill_name=skill_name,
+                    analysis_mode=analysis_mode,
+                    stage=item["stage"],
+                    reason=item["reason"],
+                    outcome=item["outcome"],
+                )
+        observability_metrics = _execution_observability_metrics(
+            route_confidence=route_confidence,
+            planned_tool_names=planned_tools,
+            tool_results=tool_results,
+            degrade_policy=degrade_policy,
+            policy_violation_names=policy_violation_names,
+            evidence_ok=False,
+        )
+        log_reply_completed(mode="skill-error", used_tools=False, error=str(exc), evidence_ok=False)
+
+    return SkillExecutionResult(
+        reply_text=reply_text.strip(),
+        selected_skill=selected_skill,
+        trace={
+            "selected_skill_family": "financial-sop",
+            "selected_skill": selected_skill,
+            "skill_name": skill_name,
+            "analysis_mode": analysis_mode,
+            "execution_policy": execution_policy,
+            "execution_path": execution_path,
+            "planner_type": tool_plan.planner_type,
+            "planned_tools": planned_tools,
+            "tool_batch_size": len(tool_plan.tool_calls),
+            "tool_policy": tool_policy,
+            "degrade_policy": degrade_policy,
+            "degrade_stage": degrade_policy.get("current_stage"),
+            "evidence_ok": evidence.evidence_ok,
+            "missing_evidence_reasons": evidence.missing_evidence_reasons,
+            "evidence_refs": evidence.accepted_evidences,
+            "accepted_evidences": evidence.accepted_evidences,
+            "rejected_evidences": evidence.rejected_evidences,
+            "claims": claims,
+            "claim_refs": _build_claim_refs(claims),
+            "degrade_history": degrade_history,
+            "final_degrade_outcome": degrade_history[-1]["outcome"] if degrade_history else "not_triggered",
+            "reply_mode": reply_mode,
+            "policy_violations": policy_violation_names,
+            "router_model": router_model,
+            "resolver_model": resolver_model,
+            "synthesis_model": synthesis_model,
+            "reference_titles": [item["title"] for item in tool_plan.references],
+            "available_tool_names": tool_policy["allowed_tools"],
+            "prefetched_tool_names": [tool_name for tool_name, _ in tool_results],
+            "official_skill_source": f"workspace:{skill_name}",
+            "prompt_ref": artifact_refs.get("prompt_ref"),
+            "reply_ref": artifact_refs.get("reply_ref"),
+            "payload_refs": artifact_refs.get("payload_refs") or [],
+            "claim_ref": claim_artifact.get("path") if claim_artifact else None,
+            **observability_metrics,
+        },
+    )
 
 
 async def _invoke_tool(tool_name: str, arguments: dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -448,6 +1252,96 @@ def _deterministic_candidate_symbols(
     return symbols
 
 
+def _sop_candidate_expansion_config(skill_spec: dict[str, Any]) -> dict[str, Any]:
+    config = skill_spec.get("candidate_expansion") or {}
+    return config if isinstance(config, dict) else {}
+
+
+def _split_sop_tool_calls(
+    *,
+    skill_spec: dict[str, Any],
+    tool_plan: Any,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    config = _sop_candidate_expansion_config(skill_spec)
+    trigger_tools = {
+        str(item)
+        for item in (config.get("trigger_tools") or [])
+        if str(item)
+    }
+    all_calls = [
+        {
+            "tool_name": item.tool_name,
+            "arguments": dict(item.arguments),
+            "required": item.required,
+        }
+        for item in tool_plan.tool_calls
+    ]
+    if not trigger_tools:
+        return all_calls, [], config
+
+    initial_calls = [item for item in all_calls if item["tool_name"] in trigger_tools]
+    follow_up_calls = [item for item in all_calls if item["tool_name"] not in trigger_tools]
+    if not initial_calls:
+        return all_calls, [], config
+    return initial_calls, follow_up_calls, config
+
+
+def _sop_candidate_symbols(
+    *,
+    tool_results: list[tuple[str, dict[str, Any]]],
+    trigger_tools: set[str],
+    top_n: int,
+) -> list[str]:
+    symbols: list[str] = []
+    for tool_name, result in tool_results:
+        if tool_name not in trigger_tools:
+            continue
+        for symbol in _deterministic_candidate_symbols(result, top_n=top_n):
+            if symbol and symbol not in symbols:
+                symbols.append(symbol)
+            if len(symbols) >= top_n:
+                return symbols
+    return symbols
+
+
+def _expand_sop_follow_up_calls(
+    *,
+    follow_up_calls: list[dict[str, Any]],
+    candidate_symbols: list[str],
+) -> list[dict[str, Any]]:
+    if not follow_up_calls:
+        return []
+    if not candidate_symbols:
+        return follow_up_calls
+
+    expanded: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in follow_up_calls:
+        base_args = dict(item["arguments"])
+        if base_args.get("symbol") or "query" not in base_args:
+            key = f"{item['tool_name']}|{sorted(base_args.items())}"
+            if key not in seen:
+                seen.add(key)
+                expanded.append(item)
+            continue
+        for symbol in candidate_symbols:
+            args = dict(base_args)
+            args.pop("query", None)
+            args["symbol"] = symbol
+            key = f"{item['tool_name']}|{sorted(args.items())}"
+            if key in seen:
+                continue
+            seen.add(key)
+            expanded.append(
+                {
+                    "tool_name": item["tool_name"],
+                    "arguments": args,
+                    "required": item["required"],
+                }
+            )
+    return expanded
+
+
 def _deterministic_follow_up_calls(
     *,
     analysis_mode: str,
@@ -534,7 +1428,7 @@ async def _run_deterministic_skill_execution(
     resolved_company: str | None,
     resolved_symbol: str | None,
     concurrent: bool,
-) -> tuple[str, list[tuple[str, dict[str, Any]]], Any]:
+) -> tuple[str, list[tuple[str, dict[str, Any]]], Any, dict[str, Any]]:
     initial_calls = _deterministic_initial_calls(tool_plan)
     tool_results = await _run_tool_batch(initial_calls, concurrent=concurrent)
 
@@ -559,18 +1453,50 @@ async def _run_deterministic_skill_execution(
         resolved_symbol=resolved_symbol,
         tool_results=tool_results,
     )
+    prompt_artifact = write_trace_artifact(
+        "prompt",
+        synthesis_prompt,
+        extension="txt",
+        file_stem=f"{selected_skill}_{analysis_mode}_prompt",
+    )
     synthesis_model = _synthesis_model_name()
     log_model_stage(stage="synthesis", model=synthesis_model, execution_path="deterministic")
     from langchain_core.messages import HumanMessage, SystemMessage
 
-    response = await _build_model(model_name=synthesis_model, temperature=0.2).ainvoke(
-        [
-            SystemMessage(content=_skill_prompt(selected_skill, get_skill_registry().get_skill(_source_skill_name(selected_skill)).skill_file if get_skill_registry().get_skill(_source_skill_name(selected_skill)) else None)),
-            HumanMessage(content=synthesis_prompt),
-        ]
-    )
+    with trace_span(
+        "synthesis",
+        stage="reply",
+        data={
+            "model_name": synthesis_model,
+            "memory_context_used": bool(memory_context),
+            "running_summary_used": bool(running_summary),
+            "profile_summary_used": bool(profile_summary),
+            "tool_result_refs": [
+                result.get("tool_result_id")
+                for _, result in tool_results
+                if isinstance(result, dict) and result.get("tool_result_id")
+            ],
+        },
+    ):
+        response = await _build_model(model_name=synthesis_model, temperature=0.2).ainvoke(
+            [
+                SystemMessage(content=_skill_prompt(selected_skill, get_skill_registry().get_skill(_source_skill_name(selected_skill)).skill_file if get_skill_registry().get_skill(_source_skill_name(selected_skill)) else None)),
+                HumanMessage(content=synthesis_prompt),
+            ]
+        )
     reply_text = extract_final_text(response)
-    return str(reply_text).strip(), tool_results, evidence_response
+    reply_artifact = write_trace_artifact(
+        "reply",
+        str(reply_text).strip(),
+        extension="txt",
+        file_stem=f"{selected_skill}_{analysis_mode}_reply",
+    )
+    payload_refs = _tool_payload_artifact_refs(tool_results)
+    return str(reply_text).strip(), tool_results, evidence_response, {
+        "prompt_ref": prompt_artifact.get("path") if prompt_artifact else None,
+        "reply_ref": reply_artifact.get("path") if reply_artifact else None,
+        "payload_refs": payload_refs,
+    }
 
 
 async def execute_skill(
@@ -597,8 +1523,13 @@ async def execute_skill(
     enabled_map = {
         "fallback": True,
         "tushare-data": enable_tushare_skills,
+        "financial-sop": True,
     }
     analysis_mode = str((route_trace or {}).get("analysis_mode") or "general_chat")
+    selected_skill_family = str((route_trace or {}).get("selected_skill_family") or selected_skill)
+    skill_name = (route_trace or {}).get("skill_name")
+    execution_policy = str((route_trace or {}).get("execution_policy") or "")
+    route_confidence = float((route_trace or {}).get("confidence") or 0.0)
     route_arguments = (route_trace or {}).get("arguments") or {}
     effective_query = str(route_arguments.get("effective_query") or user_message).strip() or user_message
     is_fund_query = _contains_any(effective_query, ("基金", "etf", "lof", "qdii", "联接"))
@@ -608,6 +1539,8 @@ async def execute_skill(
         enable_deterministic_skill_execution=enable_deterministic_skill_execution,
         enable_tushare_planner=enable_tushare_planner,
     ) else "agentic"
+    if selected_skill_family == "financial-sop":
+        execution_path = "hybrid" if execution_policy == "hybrid" else "deterministic"
     router_model = str(route_arguments.get("router_model") or _router_model_name())
     resolver_model = _resolver_model_name()
     synthesis_model = _synthesis_model_name()
@@ -615,8 +1548,11 @@ async def execute_skill(
     with skill_trace_context(
         session_id=session_id,
         user_id=user_id,
+        selected_skill_family=selected_skill_family,
         selected_skill=selected_skill,
+        skill_name=skill_name,
         analysis_mode=analysis_mode,
+        execution_policy=execution_policy,
         needs_realtime_data=(route_trace or {}).get("needs_realtime_data"),
         execution_path=execution_path,
         router_model=router_model,
@@ -635,6 +1571,25 @@ async def execute_skill(
                 selected_skill="fallback",
                 trace={"reason": "fallback route"},
                 used_fallback=True,
+            )
+
+        if selected_skill_family == "financial-sop":
+            return await _execute_financial_sop_skill(
+                selected_skill=selected_skill,
+                skill_name=skill_name,
+                execution_policy=execution_policy or "deterministic",
+                user_message=user_message,
+                effective_query=effective_query,
+                memory_context=memory_context,
+                running_summary=running_summary,
+                profile_summary=profile_summary,
+                route_arguments=route_arguments,
+                analysis_mode=analysis_mode,
+                enable_tool_prefetch_concurrency=enable_tool_prefetch_concurrency,
+                router_model=router_model,
+                resolver_model=resolver_model,
+                synthesis_model=synthesis_model,
+                route_confidence=route_confidence,
             )
 
         if not enabled_map.get(selected_skill, False) or not _mode_enabled(
@@ -665,17 +1620,27 @@ async def execute_skill(
             except Exception as exc:
                 logger.warning("[skill_executor] pre-resolve hint failed: %s", exc)
 
-        tool_plan = build_tushare_tool_plan(
-            user_message=effective_query,
-            analysis_mode=analysis_mode,
-            resolved_symbol=stock_code,
-            enable_market_tools=enable_tushare_market_tools,
-            enable_index_tools=enable_tushare_index_tools,
-            enable_sector_tools=enable_tushare_sector_tools,
-        )
+        with trace_span(
+            "planner",
+            stage="executor",
+            data={
+                "planner_type": "fallback_planner",
+                "analysis_mode": analysis_mode,
+                "selected_skill": selected_skill,
+            },
+        ):
+            tool_plan = build_tushare_tool_plan(
+                user_message=effective_query,
+                analysis_mode=analysis_mode,
+                resolved_symbol=stock_code,
+                enable_market_tools=enable_tushare_market_tools,
+                enable_index_tools=enable_tushare_index_tools,
+                enable_sector_tools=enable_tushare_sector_tools,
+            )
         if not enable_tushare_planner:
             tool_plan.tool_calls = []
         log_tool_plan(
+            planner_type=tool_plan.planner_type,
             analysis_mode=analysis_mode,
             planned_tools=[item.tool_name for item in tool_plan.tool_calls],
             references=[item["title"] for item in tool_plan.references],
@@ -697,8 +1662,9 @@ async def execute_skill(
         )
 
         try:
+            reply_mode = "skill"
             if execution_path == "deterministic":
-                reply_text, tool_results, evidence_response = await _run_deterministic_skill_execution(
+                reply_text, tool_results, evidence_response, artifact_refs = await _run_deterministic_skill_execution(
                     user_message=effective_query,
                     memory_context=memory_context,
                     running_summary=running_summary,
@@ -724,22 +1690,104 @@ async def execute_skill(
                         else None,
                     ),
                 )
-                response = await agent.ainvoke({"messages": [{"role": "user", "content": prompt}]})
+                with trace_span(
+                    "synthesis",
+                    stage="reply",
+                    data={
+                        "model_name": synthesis_model,
+                        "memory_context_used": bool(memory_context),
+                        "running_summary_used": bool(running_summary),
+                        "profile_summary_used": bool(profile_summary),
+                    },
+                ):
+                    response = await agent.ainvoke({"messages": [{"role": "user", "content": prompt}]})
                 reply_text = extract_final_text(response)
                 tool_results = []
-            evidence = validate_evidence(
+                prompt_artifact = write_trace_artifact(
+                    "prompt",
+                    prompt,
+                    extension="txt",
+                    file_stem=f"{selected_skill}_{analysis_mode}_agent_prompt",
+                )
+                reply_artifact = write_trace_artifact(
+                    "reply",
+                    str(reply_text).strip(),
+                    extension="txt",
+                    file_stem=f"{selected_skill}_{analysis_mode}_agent_reply",
+                )
+                artifact_refs = {
+                    "prompt_ref": prompt_artifact.get("path") if prompt_artifact else None,
+                    "reply_ref": reply_artifact.get("path") if reply_artifact else None,
+                    "payload_refs": [],
+                }
+            with trace_span(
+                "evidence",
+                stage="executor",
+                data={
+                    "planner_type": tool_plan.planner_type,
+                    "planned_tools": [item.tool_name for item in tool_plan.tool_calls],
+                },
+            ):
+                evidence = validate_evidence(
+                    analysis_mode=analysis_mode,
+                    resolved_symbol=stock_code,
+                    response=response,
+                )
+            claims = _build_claims(
+                reply_text=reply_text,
                 analysis_mode=analysis_mode,
-                resolved_symbol=stock_code,
-                response=response,
+                accepted_evidences=evidence.accepted_evidences,
+                evidence_ok=evidence.evidence_ok,
+                skill_name=selected_skill,
             )
+            claim_artifact = write_trace_artifact(
+                "claims",
+                claims,
+                file_stem=f"{selected_skill}_{analysis_mode}_claims",
+            )
+            if claims:
+                log_claim_lineage(
+                    skill_name=selected_skill,
+                    analysis_mode=analysis_mode,
+                    claim_count=len(claims),
+                    claim_ids=_build_claim_refs(claims),
+                )
             used_tools = evidence.used_tools or _response_used_tools(response)
+            degrade_policy = {
+                "current_stage": "primary" if evidence.evidence_ok else "graceful_decline",
+                "next_stage": "none",
+            }
+            degrade_history = _degrade_history(
+                degrade_policy=degrade_policy,
+                missing_reasons=evidence.missing_evidence_reasons,
+                reply_mode=reply_mode,
+            )
+            if degrade_history:
+                for item in degrade_history:
+                    log_degrade_transition(
+                        skill_name=selected_skill,
+                        analysis_mode=analysis_mode,
+                        stage=item["stage"],
+                        reason=item["reason"],
+                        outcome=item["outcome"],
+                    )
+            observability_metrics = _execution_observability_metrics(
+                route_confidence=route_confidence,
+                planned_tool_names=[item.tool_name for item in tool_plan.tool_calls],
+                tool_results=tool_results,
+                degrade_policy=degrade_policy,
+                policy_violation_names=[],
+                evidence_ok=evidence.evidence_ok,
+            )
             if _needs_verifiable_data(effective_query) and not evidence.evidence_ok:
+                reply_mode = "evidence-missing"
                 reply_text = _missing_evidence_message(user_message)
                 log_reply_completed(
                     mode="evidence-missing",
                     used_tools=used_tools,
                     successful_tools=evidence.successful_tools,
                     evidence_ok=evidence.evidence_ok,
+                    missing_evidence_reasons=evidence.missing_evidence_reasons,
                 )
             else:
                 log_reply_completed(
@@ -750,15 +1798,52 @@ async def execute_skill(
                 )
         except Exception as exc:
             logger.warning("[skill_executor] agent invoke failed: %s", exc, exc_info=True)
+            reply_mode = "skill-error"
             reply_text = _format_tool_failure_message(user_message, str(exc))
             used_tools = False
             tool_results = []
+            artifact_refs = {"prompt_ref": None, "reply_ref": None, "payload_refs": []}
+            evidence = validate_evidence(
+                analysis_mode=analysis_mode,
+                resolved_symbol=stock_code,
+                response={"messages": []},
+            )
+            degrade_policy = {
+                "current_stage": "graceful_decline",
+                "next_stage": "none",
+            }
+            degrade_history = _degrade_history(
+                degrade_policy=degrade_policy,
+                missing_reasons=evidence.missing_evidence_reasons,
+                reply_mode=reply_mode,
+            )
+            claims = []
+            claim_artifact = None
+            if degrade_history:
+                for item in degrade_history:
+                    log_degrade_transition(
+                        skill_name=selected_skill,
+                        analysis_mode=analysis_mode,
+                        stage=item["stage"],
+                        reason=item["reason"],
+                        outcome=item["outcome"],
+                    )
+            observability_metrics = _execution_observability_metrics(
+                route_confidence=route_confidence,
+                planned_tool_names=[item.tool_name for item in tool_plan.tool_calls],
+                tool_results=tool_results,
+                degrade_policy=degrade_policy,
+                policy_violation_names=[],
+                evidence_ok=False,
+            )
             log_reply_completed(mode="skill-error", used_tools=False, error=str(exc), evidence_ok=False)
 
         return SkillExecutionResult(
             reply_text=reply_text.strip(),
             selected_skill=selected_skill,
             trace={
+                "selected_skill_family": selected_skill_family,
+                "skill_name": skill_name,
                 "resolved_company": company_name,
                 "resolved_symbol": stock_code,
                 "used_tools": used_tools,
@@ -766,10 +1851,23 @@ async def execute_skill(
                 if get_skill_registry().get_skill(_source_skill_name(selected_skill))
                 else [],
                 "analysis_mode": analysis_mode,
+                "execution_policy": execution_policy,
                 "execution_path": execution_path,
+                "planner_type": tool_plan.planner_type,
                 "planned_tools": [item.tool_name for item in tool_plan.tool_calls],
                 "tool_batch_size": len(tool_plan.tool_calls),
                 "evidence_ok": bool(locals().get("evidence").evidence_ok) if "evidence" in locals() else False,
+                "missing_evidence_reasons": getattr(locals().get("evidence"), "missing_evidence_reasons", []),
+                "accepted_evidences": getattr(locals().get("evidence"), "accepted_evidences", []),
+                "rejected_evidences": getattr(locals().get("evidence"), "rejected_evidences", []),
+                "evidence_refs": getattr(locals().get("evidence"), "accepted_evidences", []),
+                "claims": locals().get("claims", []),
+                "claim_refs": _build_claim_refs(locals().get("claims", [])),
+                "degrade_policy": locals().get("degrade_policy", {}),
+                "degrade_stage": (locals().get("degrade_policy") or {}).get("current_stage"),
+                "degrade_history": locals().get("degrade_history", []),
+                "final_degrade_outcome": (locals().get("degrade_history") or [{}])[-1].get("outcome") if locals().get("degrade_history") else "not_triggered",
+                "reply_mode": locals().get("reply_mode", "skill"),
                 "router_model": router_model,
                 "resolver_model": resolver_model,
                 "synthesis_model": synthesis_model,
@@ -784,5 +1882,10 @@ async def execute_skill(
                 "available_tool_names": [getattr(tool, "name", getattr(tool, "__name__", "unknown")) for tool in planned_tools],
                 "prefetched_tool_names": [tool_name for tool_name, _ in tool_results],
                 "official_skill_source": "vendor/tushare-skills/tushare",
+                "prompt_ref": artifact_refs.get("prompt_ref"),
+                "reply_ref": artifact_refs.get("reply_ref"),
+                "payload_refs": artifact_refs.get("payload_refs") or [],
+                "claim_ref": claim_artifact.get("path") if locals().get("claim_artifact") else None,
+                **observability_metrics,
             },
         )

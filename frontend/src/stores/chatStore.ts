@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
-import type { ChatMessage, ChatSession } from '@/api'
+import type { ChatContextWindow, ChatMessage, ChatSession } from '@/api'
 
 export const useChatStore = defineStore('chat', () => {
   const sessions = ref<ChatSession[]>([])
@@ -13,6 +13,7 @@ export const useChatStore = defineStore('chat', () => {
   const isStreaming = ref(false)
   // Phase 2：当前会话的 running_summary（存在时前端显示压缩提示条）
   const currentRunningSummary = ref<string | null>(null)
+  const currentContextWindow = ref<ChatContextWindow | null>(null)
   // Phase 2：流式输出时正在追加的 AI 消息临时 ID
   const streamingMessageId = ref<number | null>(null)
 
@@ -27,6 +28,7 @@ export const useChatStore = defineStore('chat', () => {
     if (!sessionId) {
       messages.value = []
       currentRunningSummary.value = null
+      currentContextWindow.value = null
     }
   }
 
@@ -98,6 +100,9 @@ export const useChatStore = defineStore('chat', () => {
     } else {
       sessions.value.unshift(session)
     }
+    if (currentSessionId.value === session.session_id) {
+      currentContextWindow.value = session.context_window || null
+    }
   }
 
   function removeSession(sessionId: string) {
@@ -106,6 +111,7 @@ export const useChatStore = defineStore('chat', () => {
       currentSessionId.value = null
       messages.value = []
       currentRunningSummary.value = null
+      currentContextWindow.value = null
     }
   }
 
@@ -119,6 +125,18 @@ export const useChatStore = defineStore('chat', () => {
     currentRunningSummary.value = summary || null
   }
 
+  function setContextWindow(contextWindow: ChatContextWindow | null | undefined) {
+    currentContextWindow.value = contextWindow || null
+  }
+
+  function updateSessionContext(sessionId: string, contextWindow: ChatContextWindow | null | undefined) {
+    const target = sessions.value.find((s) => s.session_id === sessionId)
+    if (target) target.context_window = contextWindow || null
+    if (currentSessionId.value === sessionId) {
+      currentContextWindow.value = contextWindow || null
+    }
+  }
+
   function reset() {
     sessions.value = []
     currentSessionId.value = null
@@ -127,6 +145,7 @@ export const useChatStore = defineStore('chat', () => {
     isSending.value = false
     isStreaming.value = false
     currentRunningSummary.value = null
+    currentContextWindow.value = null
     streamingMessageId.value = null
     isCompressing.value = false
     compressProgress.value = 0
@@ -142,6 +161,7 @@ export const useChatStore = defineStore('chat', () => {
     isSending,
     isStreaming,
     currentRunningSummary,
+    currentContextWindow,
     streamingMessageId,
     isCompressing,
     compressProgress,
@@ -161,6 +181,8 @@ export const useChatStore = defineStore('chat', () => {
     removeSession,
     renameSession,
     setRunningSummary,
+    setContextWindow,
+    updateSessionContext,
     reset,
   }
 })

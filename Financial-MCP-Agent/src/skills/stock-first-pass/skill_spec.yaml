@@ -1,0 +1,88 @@
+skill_name: stock-first-pass
+skill_family: financial-sop
+version: "1.0.0"
+execution_policy: deterministic
+allowed_tools:
+  - get_stock_basic_info
+  - get_market_bars
+  - get_fina_indicator
+  - get_income
+  - get_balance_sheet
+  - get_cashflow
+tool_plan_steps:
+  - step: identify_stock
+    tool: get_stock_basic_info
+    required: true
+    arguments:
+      limit: 3
+  - step: inspect_recent_market
+    tool: get_market_bars
+    required: true
+    arguments:
+      limit: 20
+  - step: inspect_key_financial_indicators
+    tool: get_fina_indicator
+    required: true
+    arguments:
+      limit: 6
+  - step: inspect_income_quality
+    tool: get_income
+    required: false
+    arguments:
+      limit: 4
+  - step: inspect_balance_sheet
+    tool: get_balance_sheet
+    required: false
+    arguments:
+      limit: 4
+  - step: inspect_cashflow_quality
+    tool: get_cashflow
+    required: false
+    arguments:
+      limit: 4
+required_evidence:
+  must_have_all:
+    - stock_basic
+    - stock_market
+    - financial_indicator
+  must_have_any:
+    - income_statement
+    - balance_sheet
+    - cashflow_statement
+output_template:
+  default_section_order:
+    - conclusion
+    - evidence
+    - risks
+    - fit
+    - next_steps
+    - sources
+  response_pref_overrides:
+    risk_first:
+      section_order:
+        - risks
+        - conclusion
+        - evidence
+        - fit
+        - next_steps
+        - sources
+      style_variant: risk_first
+    concise:
+      section_order:
+        - conclusion
+        - evidence
+        - risks
+        - sources
+      style_variant: concise
+degrade_policy:
+  stages:
+    - name: primary
+      next_stage: partial_assessment
+    - name: partial_assessment
+      next_stage: graceful_decline
+    - name: graceful_decline
+      next_stage: none
+  when_missing_evidence: graceful_decline
+concurrency:
+  enabled: true
+  batch_size: 6

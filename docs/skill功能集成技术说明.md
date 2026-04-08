@@ -1,29 +1,32 @@
 # Skill 功能集成技术说明
 
-> 面向对象：第一次接触本项目、不了解 Skill / Tushare / 记忆系统的新同学  
-> 目标：讲清楚当前这套 Skill 是怎么接入对话 Agent 的、每个关键文件负责什么、一次真实提问是怎么跑起来的、怎么排查问题
+> 面向对象：第一次接触本项目、不了解 Skill / Tushare / Trace / Langfuse 的新同学  
+> 目标：用尽量直白的方式讲清楚当前 Skill 是怎么接入对话 Agent 的、现在已经做到哪一步、一次真实问题是怎么跑起来的、出了问题去哪里查
 
 ---
 
 ## 1. 这份文档讲什么
 
-这份文档专门讲本项目里“**对话模式 + Skill + Tushare + 用户画像/记忆**”这一整条链路。
+这份文档专门讲本项目里“**聊天对话 + 金融 Skill + Tushare 工具 + 记忆系统 + Trace 观测**”这一整条链路。
 
-现在的设计不是：
+全局架构与能力边界建议对照阅读：[股票Agent项目技术总览.md](./股票Agent项目技术总览.md)；仓库目录级说明见 [项目代码架构说明.md](./项目代码架构说明.md)。
 
-- 用户提问
-- LLM 凭记忆直接回答
-
-而是：
+现在系统的工作方式已经不是：
 
 - 用户提问
-- 系统先判断要不要走 Skill
-- 如果要，就先拿真实数据
-- 再把“用户画像 + 长短期记忆 + Tushare 数据”一起交给 LLM 生成最终回答
+- 大模型直接凭上下文回答
+
+而是更像一个“有分工的投研助手”：
+
+- 用户提问
+- 系统先判断这是不是某个金融场景
+- 如果是，就先选择合适的 Skill
+- Skill 再去调真实工具拿证据
+- 最后由模型把“用户问题 + 记忆 + 画像 + 工具结果”组织成自然语言回答
 
 一句话理解：
 
-> 现在的 Agent 遇到金融数据类问题，会优先查证据，再回答；遇到普通聊天问题，才直接走普通 LLM。
+> 现在的 Agent 遇到金融问题，优先先查证据再回答；只有普通闲聊才直接走普通聊天路径。
 
 ---
 
@@ -31,23 +34,59 @@
 
 ### 2.1 什么是 Skill
 
-这里的 Skill 可以理解成“能力入口”。
+这里的 Skill 可以理解成“系统已经约定好的专业处理方式”。
 
-当前真实会进入运行时的 Skill 只有两个：
+当前运行时真正会进入的能力入口有三类：
 
 - `fallback`
 - `tushare-data`
+- `financial-sop`
 
-它们的含义很简单：
+它们的含义可以先这样记：
 
-- `fallback`：普通聊天，不查 Tushare
-- `tushare-data`：进入金融数据能力链路
+- `fallback`：普通聊天，不查金融数据
+- `tushare-data`：旧的通用金融数据链路，适合“先判断问题类型，再临时规划工具”的场景
+- `financial-sop`：新的标准化业务 Skill 链路，适合“场景明确、操作步骤比较固定”的高频投研问题
 
-### 2.2 什么是 analysis_mode
+所以现在不是“只有一个金融 Skill”，而是：
 
-`analysis_mode` 不是 Skill，而是“这次要用这套能力做什么事”。
+- 一条旧的通用数据链路
+- 一条新的 SOP 化链路
 
-当前主要模式有：
+两条同时存在。
+
+### 2.2 什么是 `selected_skill`、`selected_skill_family`、`skill_name`
+
+这三个字段最容易混。
+
+可以这样理解：
+
+- `selected_skill`：这次最终走哪条入口
+- `selected_skill_family`：这次属于哪一类能力家族
+- `skill_name`：如果走的是 `financial-sop`，具体命中的那个业务 Skill 是谁
+
+比如：
+
+```json
+{
+  "selected_skill": "financial-sop",
+  "selected_skill_family": "financial-sop",
+  "skill_name": "etf-screen"
+}
+```
+
+它表示：
+
+- 这次不是普通聊天
+- 也不是旧的 `tushare-data`
+- 而是进入了新的 SOP Skill 家族
+- 且具体命中了 `etf-screen`
+
+### 2.3 什么是 `analysis_mode`
+
+`analysis_mode` 可以理解成“这次分析任务的类型标签”。
+
+在旧的 `tushare-data` 链路里，它主要表示：
 
 - `general_chat`
 - `single_stock_data`
@@ -55,74 +94,58 @@
 - `sector_market`
 - `stock_selection`
 
-所以现在的设计是：
+在新的 `financial-sop` 链路里，它通常就是 `skill_name` 的下划线版本，比如：
 
-- `selected_skill` 解决“走哪套能力”
-- `analysis_mode` 解决“拿这套能力做什么”
+- `fund-compare` -> `fund_compare`
+- `etf-screen` -> `etf_screen`
+- `stock-first-pass` -> `stock_first_pass`
 
-这样比以前把所有业务模式都伪装成 skill 清楚很多。
+所以今天的系统已经不是“只靠 `analysis_mode` 识别全部业务”，而是：
 
-### 2.3 什么是官方 Tushare Skill
-
-官方 Tushare Skill 的 vendor 内容放在：
-
-- [SKILL.md](/root/Finance/vendor/tushare-skills/tushare/SKILL.md)
-- [_meta.json](/root/Finance/vendor/tushare-skills/tushare/_meta.json)
-- [references](/root/Finance/vendor/tushare-skills/tushare/references)
-
-这里要特别注意：
-
-> 本项目没有接 OpenClaw runtime。  
-> 我们接入的是官方 Skill 的“定义、文档、知识和 references”，执行引擎还是本项目自己写的。
-
-也就是说：
-
-- 官方 Skill 负责“能力定义”
-- 本项目负责“路由、规划、调工具、证据校验、回答生成”
+- 老链路主要靠 `analysis_mode`
+- 新链路主要靠 `skill_name`
 
 ### 2.4 什么是 Tool
 
-Tool 就是真正去调用 Tushare 的函数。
+Tool 就是真正查数据的函数。
 
 比如：
 
 - 查股票行情
 - 查财务指标
-- 查基金列表
+- 查基金净值
+- 查 ETF 份额
 - 查板块快照
-- 查指数行情
+- 查板块成分股
 
-Skill 负责决定“要不要用 Tushare”，Tool 负责决定“具体调哪个接口”。
+Skill 决定“这类问题该怎么做”，Tool 决定“具体调哪个数据接口”。
 
 ### 2.5 什么是 Planner
 
 Planner 是“工具计划器”。
 
-它不直接回答问题，而是先判断：
+它不直接回答问题，而是先决定：
 
-- 当前问题是什么模式
-- 哪些工具应该调
+- 这个问题需要哪些工具
 - 哪些工具是必须的
-- 哪些工具是补充的
+- 哪些工具只是补充
+- 如果是 SOP Skill，要不要按 spec 固定步骤执行
 
-举个例子：
-
-用户问：
+例如用户问：
 
 ```text
-请你根据我的用户画像，分析比亚迪今天值不值得买入
+宁德时代这份财报怎么看，值不值得继续跟踪？
 ```
 
-Planner 会倾向生成这样的计划：
+系统通常会倾向先拿：
 
-- `get_market_bars`
-- `get_fina_indicator`
-- `get_income`
-- `get_balance_sheet`
-- `get_cashflow`
-- `get_stock_basic_info`
+- 市场数据
+- 财务指标
+- 利润表
+- 资产负债表
+- 现金流量表
 
-因为这个问题既要市场证据，也要财务证据。
+然后再生成解释。
 
 ---
 
@@ -131,79 +154,90 @@ Planner 会倾向生成这样的计划：
 ### 3.1 总流程
 
 ```text
-前端问题
+前端输入问题
   ->
 backend/routers/chat.py
   ->
 backend/services/chat_service.py
   ->
-读取 STM / LTM / 用户画像 / recent messages
+读取 STM / LTM / 用户画像 / 最近几轮消息
   ->
 route_chat_skill()
   ->
-selected_skill + analysis_mode
+决定走 fallback / tushare-data / financial-sop
   ->
 execute_skill()
   ->
 planner 生成工具计划
   ->
-两条执行路径二选一
-  - deterministic：高频结构化问题，直接并发取数
-  - agentic：复杂问题，交给 agent 自主调工具
+执行工具调用
   ->
 skill_evidence 做证据校验
   ->
-LLM 基于 记忆 + 画像 + 工具结果 生成最终回答
+模型基于 记忆 + 画像 + 工具结果 生成最终回答
   ->
 保存 assistant 消息
   ->
-触发画像更新 / LTM 入队 / STM 压缩
+触发 LTM 入队 / STM 压缩 / trace 写入
 ```
 
-### 3.2 现在采用的是“混合式执行”
+### 3.2 现在是“两层金融能力并存”
 
-这是本轮改造里最关键的变化。
+这是当前最关键的认知点。
 
-当前不是所有 Skill 问题都交给 agent 自己慢慢想，而是分两类：
+#### 第一层：旧通用链路 `tushare-data`
 
-#### 1. 确定性快路径 `deterministic`
+适合这些问题：
 
-适用于：
+- 查单只股票近期走势
+- 查单只股票财务指标
+- 查板块行情
+- 做一类宽泛的金融数据检索
 
-- `single_stock_data`
-- `single_stock_fundamental`
-- `sector_market`
-- `stock_selection` 中的基金 / ETF 推荐
+它的特点是：
 
-这条路径会：
+- 更像一个“通用金融数据助手”
+- 先根据 `analysis_mode` 做工具规划
+- 再走确定性执行或 agent 执行
 
-- planner 先生成可执行工具计划
-- 系统直接并发调用工具
-- 再把已经拿到的工具结果交给 synthesis 模型组织最终回答
+#### 第二层：新 SOP 链路 `financial-sop`
 
-特点：
+适合这些“问题模式比较稳定”的高频场景：
 
-- 更快
-- 更稳定
-- 更像工业链路
+- 两只基金/ETF 对比
+- ETF 推荐与筛选
+- 单股首轮研判
+- 板块热点简报
+- 涨跌/异动原因解释
 
-#### 2. Agent 路径 `agentic`
+它的特点是：
 
-适用于：
+- 每个 Skill 都有自己的 `SKILL.md + skill_spec.yaml`
+- 工具白名单更严格
+- 降级策略更明确
+- 更适合做工业化、可观测、可治理的业务场景
 
-- 模糊问题
-- planner 覆盖不稳定的问题
-- 明显需要更自由多步推理的问题
+### 3.3 现在有哪些 Skill 已经落地
 
-这条路径会：
+当前仓库里已经存在并能被发现的 `financial-sop` skills 有：
 
-- 把 skill prompt、上下文和工具集交给 agent
-- 由 agent 自主决定调不调工具、调哪些工具
+- `fund-compare`
+- `stock-first-pass`
+- `sector-hotspot-brief`
+- `etf-screen`
+- `market-move-explain`
 
-特点：
+对应目录在：
 
-- 灵活
-- 但延迟和行为波动更大
+- [fund-compare](../Financial-MCP-Agent/src/skills/fund-compare)
+- [stock-first-pass](../Financial-MCP-Agent/src/skills/stock-first-pass)
+- [sector-hotspot-brief](../Financial-MCP-Agent/src/skills/sector-hotspot-brief)
+- [etf-screen](../Financial-MCP-Agent/src/skills/etf-screen)
+- [market-move-explain](../Financial-MCP-Agent/src/skills/market-move-explain)
+
+如果用一句话概括当前进度：
+
+> 旧的 `tushare-data` 已经能覆盖通用金融数据问答；新的 `financial-sop` 已经开始承接高频业务场景，并且已经落地了 5 个可发现的专业 Skill。
 
 ---
 
@@ -211,250 +245,296 @@ LLM 基于 记忆 + 画像 + 工具结果 生成最终回答
 
 ### 4.1 对话总调度层
 
-#### [chat_service.py](/root/Finance/backend/services/chat_service.py)
+#### [chat_service.py](../backend/services/chat_service.py)
 
-这是整个对话模式的总入口。
+这是整个聊天模式的总入口。
 
 它负责：
 
 - 保存用户消息
-- 读取画像和记忆
-- 组装 skill 路由上下文
+- 读取用户画像和长短期记忆
+- 构造路由上下文
 - 调 `route_chat_skill()`
 - 调 `execute_skill()`
-- 处理画像 action
 - 保存 assistant 消息
-- 触发 LTM / STM 后处理
+- 触发 LTM 入队和 STM 压缩
+- 记录 root trace 和最终指标
 
-这次改造里，`chat_service.py` 主要新增了这些能力：
+对小白来说，可以把它理解成“总导演”。
 
-- `_load_memory_context_for_chat()`
-  把用户画像和语义记忆读出来
+### 4.2 Skill 注册层
 
-- `_build_skill_route_context()`
-  把 `running_summary + 最近几轮对话` 拼成路由上下文，解决“是，请查询”这种跟进语句只看当前一句的问题
+#### [skill_registry.py](../Financial-MCP-Agent/src/skills/skill_registry.py)
 
-- `_run_skill_chat_if_enabled()`
-  对话模式的 skill 主入口
+它负责统一管理 Skill 元数据。
 
-- `_prepare_reply_for_user()`
-  统一处理回复里的画像动作
+现在它做的不只是读取 vendor 内容，还包括：
 
-### 4.2 Skill 元数据层
+- 扫描工作区里的 Skill
+- 读取 `SKILL.md`
+- 读取 `skill_spec.yaml`
+- 返回 discoverable 的 `financial-sop` skills
+- 提供 reference 检索
 
-#### [skill_registry.py](/root/Finance/Financial-MCP-Agent/src/skills/skill_registry.py)
-
-负责：
-
-- 扫描官方 vendor skill
-- 读取 `SKILL.md`、`_meta.json`、`references`
-- 对外提供：
-  - `list_skills()`
-  - `get_skill()`
-  - `find_references()`
-  - `matchable_descriptions()`
-
-可以把它理解成“技能目录管理器”。
+你可以把它理解成“技能目录 + 技能资产加载器”。
 
 ### 4.3 Skill 路由层
 
-#### [skill_router_node.py](/root/Finance/Financial-MCP-Agent/src/agents/skill_router_node.py)
+#### [skill_router_node.py](../Financial-MCP-Agent/src/agents/skill_router_node.py)
 
-负责判断：
+它负责判断：
 
-- 要不要进 Skill
-- 进哪个真实 Skill
-- 属于什么 `analysis_mode`
-- 是否需要实时数据
-- 是否属于专业分析
+- 要不要走 Skill
+- 走 `fallback`、`tushare-data`，还是 `financial-sop`
+- 如果走 `financial-sop`，具体命中哪个 `skill_name`
+- 这次是否需要实时数据
+- 这次是否属于专业分析
 
-它的输出是一个结构化结果：
+它的输出现在比以前更完整，典型结构大致像这样：
 
 ```json
 {
-  "selected_skill": "fallback|tushare-data",
-  "analysis_mode": "general_chat|single_stock_data|single_stock_fundamental|sector_market|stock_selection",
+  "selected_skill": "financial-sop",
+  "selected_skill_family": "financial-sop",
+  "skill_name": "etf-screen",
+  "analysis_mode": "etf_screen",
+  "execution_policy": "deterministic",
   "needs_realtime_data": true,
-  "needs_professional_analysis": false,
-  "confidence": 0.92,
-  "why": "..."
+  "needs_professional_analysis": true,
+  "confidence": 0.9,
+  "why": "matched financial-sop query for etf-screen"
 }
 ```
 
+对小白最重要的是记住：
+
+- `selected_skill` 决定入口
+- `skill_name` 决定具体业务场景
+- `analysis_mode` 决定后续分析风格和证据规则
+
 ### 4.4 Skill 执行层
 
-#### [skill_executor_node.py](/root/Finance/Financial-MCP-Agent/src/agents/skill_executor_node.py)
+#### [skill_executor_node.py](../Financial-MCP-Agent/src/agents/skill_executor_node.py)
 
-这是整个 Skill 运行时的核心执行器。
+这是整个 Skill 运行时最核心的执行器。
 
 它负责：
 
-- 根据 route 结果决定执行路径
+- 根据路由结果决定执行路径
+- 执行旧的 `tushare-data`
+- 执行新的 `financial-sop`
 - 调 planner
-- 选择 deterministic / agentic
-- 调用工具
+- 调工具
 - 校验证据
-- 交给 synthesis 模型生成最终回答
+- 构建 claims 和降级记录
+- 交给 synthesis 模型组织最终回答
 
-这一层本轮最重要的变化有 4 个：
+目前这里已经明确支持三个入口：
 
-1. **真正把 `memory_context` 正文传给 Skill**
-以前这里只传“长度=xxx”，现在是把截断后的正文真正送进 prompt。
-
-2. **加入模型分层**
-
-- router：`CHAT_ROUTER_MODEL`
-- resolver：`CHAT_RESOLVER_MODEL`
-- synthesis：`CHAT_SKILL_SYNTHESIS_MODEL`，留空时回退主模型
-
-当前默认：
-
-- router = `kimi-k2.5`
-- resolver = `kimi-k2.5`
-- synthesis = 当前主模型
-
-3. **加入确定性快路径**
-
-对高频结构化问题，不再只把工具计划写进 prompt，而是直接执行工具。
-
-4. **trace 更完整**
-
-现在会把这些信息带进 trace：
-
-- `execution_path`
-- `router_model`
-- `resolver_model`
-- `synthesis_model`
-- `tool_batch_size`
-- `evidence_ok`
+- `fallback`
+- `tushare-data`
+- `financial-sop`
 
 ### 4.5 规划层
 
-#### [tushare_reference_planner.py](/root/Finance/Financial-MCP-Agent/src/agents/tushare_reference_planner.py)
+#### [tushare_reference_planner.py](../Financial-MCP-Agent/src/agents/tushare_reference_planner.py)
 
-负责根据：
+这是旧通用链路 `tushare-data` 的 planner。
+
+它负责根据：
 
 - 用户问题
 - `analysis_mode`
-- 官方 references
-- 当前可用能力开关
+- 当前可用工具开关
 
 输出“建议调用哪些工具”的计划。
 
-它本身不调工具，只做规划。
+它今天依然重要，但已经不是唯一 planner 了。
+
+#### [skill_spec_planner.py](../Financial-MCP-Agent/src/agents/skill_spec_planner.py)
+
+这是新 SOP 链路用的 planner。
+
+它会根据：
+
+- `skill_name`
+- `skill_spec.yaml`
+- 用户问题里解析出的实体
+
+生成更固定、更可控的工具计划。
+
+这也是 `financial-sop` 和旧 `tushare-data` 的最大区别之一：
+
+- 旧链路更通用、更动态
+- 新链路更标准化、更像 SOP
 
 ### 4.6 证据校验层
 
-#### [skill_evidence.py](/root/Finance/Financial-MCP-Agent/src/agents/skill_evidence.py)
+#### [skill_evidence.py](../Financial-MCP-Agent/src/agents/skill_evidence.py)
 
 负责判断：
 
-- 工具有没有真的成功返回
-- 返回是不是空数据
+- 工具是否真的成功返回
+- 返回是否为空
 - 标的是不是对的
-- 当前问题所需的证据是不是够了
+- 当前问题要求的证据是不是够了
 
-这是防止“模型装懂”的关键闸门。
+这是防止“模型看起来回答得很像，但其实没证据”的关键闸门。
 
-现在的核心规则包括：
+### 4.7 Tool 层
 
-- `single_stock_fundamental`
-  必须同时具备市场证据和财务证据
+#### [chat_tushare_tools.py](../Financial-MCP-Agent/src/tools/chat_tushare_tools.py)
 
-- `sector_market`
-  必须具备板块 / 行业 / 指数类证据
+这是给 agent 和 executor 真正调用的工具层。
 
-- `stock_selection`
-  基金推荐至少要求：
-  - 候选池证据：`fund_basic`
-  - 再加一类支撑证据：`fund_nav` / `fund_share` / `fund_daily`
+它负责：
 
-### 4.7 Tushare SDK 封装层
-
-#### [tushare_client.py](/root/Finance/Financial-MCP-Agent/src/tools/tushare_client.py)
-
-这是最底层真正调 Tushare SDK 的地方。
-
-负责：
-
-- `ts.set_token()`
-- `ts.pro_api()`
-- 市场 / 财务 / 基金 / 板块 / 指数接口封装
-
-### 4.8 Tool 层
-
-#### [chat_tushare_tools.py](/root/Finance/Financial-MCP-Agent/src/tools/chat_tushare_tools.py)
-
-这是给 agent / executor 直接调用的工具层。
-
-负责：
-
-- 暴露工具函数
+- 暴露股票、基金、ETF、板块、指数等工具
 - 参数规范化
-- 股票代码标准化
-- 基金 / ETF 自然语言解析
-- 在工具调用开始和结束时记录 trace
+- 股票代码 / 基金名称解析
+- 工具调用 trace 记录
+- 给证据链补充 `evidence_id`、耗时、来源等信息
 
-现在的主要工具大致分为 5 类：
+### 4.8 Trace 与导出层
 
-- 个股基础信息
-- 行情数据
-- 财务报表 / 财务指标
-- 板块 / 行业 / 指数
-- 基金 / ETF
+#### [skill_trace.py](../Financial-MCP-Agent/src/tools/skill_trace.py)
 
-### 4.9 Trace 层
+这是本地 trace 主入口。
 
-#### [skill_trace.py](/root/Finance/Financial-MCP-Agent/src/tools/skill_trace.py)
+它负责：
 
-负责输出 Skill 运行日志。
+- 统一生成 `trace / span / event`
+- 写入本地 JSONL
+- 维护 trace 上下文
+- 注册 exporter
+- 按开关决定是否把数据导出到 Langfuse
 
-当前主要事件有：
+#### [langfuse_exporter.py](../Financial-MCP-Agent/src/tools/trace_exporters/langfuse_exporter.py)
 
-- `chat.router.decision`
-- `chat.skill.selected`
-- `chat.tool.plan`
-- `chat.model.stage`
-- `chat.tool.start`
-- `chat.tool.end`
-- `chat.tool.error`
-- `chat.reply.completed`
+这是 Langfuse 适配层。
+
+它负责把本地 trace 契约映射成 Langfuse 能展示的 trace / span / event 结构。
 
 ---
 
-## 5. 模型分层是怎么工作的
+## 5. 当前有哪些 Skill 场景已经能测
 
-这次为了降低延迟，我们把模型职责拆开了。
+面向新同学，可以先把现在的业务能力记成两类。
 
-### 5.1 Router 模型
+### 5.1 旧通用链路 `tushare-data`
+
+现在仍然能覆盖：
+
+- 单股行情问答
+- 单股财务/基本面问答
+- 板块市场概览
+- 一般性的基金/选股类检索
+
+这条链路更像“万能金融数据助手”。
+
+### 5.2 新 SOP 链路 `financial-sop`
+
+当前已落地的高频场景有：
+
+#### `fund-compare`
+
+适合：
+
+- 比较两只基金/ETF/LOF
+- 问“哪个更适合我”
+
+示例：
+
+```text
+对比华安黄金ETF和博时黄金ETF，哪个更适合稳健投资者？
+```
+
+#### `stock-first-pass`
+
+适合：
+
+- 单股首轮研判
+- 财报快读
+- 值不值得继续跟踪
+
+示例：
+
+```text
+宁德时代这份财报怎么看，值不值得继续跟踪？
+```
+
+#### `sector-hotspot-brief`
+
+适合：
+
+- 板块热度简报
+- 板块龙头梳理
+- 某个主题最近热不热
+
+示例：
+
+```text
+近期半导体板块热度怎么样？还有哪些龙头值得关注？
+```
+
+#### `etf-screen`
+
+适合：
+
+- ETF 推荐
+- ETF shortlist
+- 主题型 ETF 筛选
+
+它已经是通用 ETF Skill，不再只局限黄金。
+
+示例：
+
+```text
+我想配置宽基ETF，帮我筛几个适合长期持有的。
+```
+
+#### `market-move-explain`
+
+适合：
+
+- 为什么涨
+- 为什么跌
+- 为什么异动
+
+示例：
+
+```text
+比亚迪今天为什么跌？
+```
+
+---
+
+## 6. 模型分层现在是怎么工作的
+
+这套系统现在已经做了“按角色分模型”。
+
+### 6.1 Router 模型
 
 配置项：
 
 - `CHAT_ROUTER_MODEL`
 
-默认值：
-
-- `kimi-k2.5`
-
 职责：
 
-- 只做“要不要走 Skill、属于什么 mode”的结构化判断
+- 判断走哪条入口
+- 在 `financial-sop` 里选哪个 `skill_name`
 
-### 5.2 Resolver 模型
+### 6.2 Resolver 模型
 
 配置项：
 
 - `CHAT_RESOLVER_MODEL`
 
-默认值：
-
-- `kimi-k2.5`
-
 职责：
 
-- 只做股票 / 基金标的解析
+- 做股票、基金、ETF 等实体解析
 
-### 5.3 Synthesis 模型
+### 6.3 Synthesis 模型
 
 配置项：
 
@@ -462,61 +542,47 @@ LLM 基于 记忆 + 画像 + 工具结果 生成最终回答
 
 默认行为：
 
-- 为空时回退主模型 `OPENAI_COMPATIBLE_MODEL`
+- 留空时回退主模型 `OPENAI_COMPATIBLE_MODEL`
 
 职责：
 
-- 基于真实工具结果、用户画像、记忆上下文生成最终中文回答
+- 把“真实工具结果 + 用户画像 + 记忆上下文”组织成最终中文回答
 
 这样拆分的好处是：
 
-- 低复杂度步骤交给小模型
-- 只有最后真正需要语言组织和综合分析时，才用主模型
+- 低复杂度步骤可以交给更轻的模型
+- 只有最后真正要写回答时，才用更强的模型
 
 ---
 
-## 6. 记忆、画像、STM/LTM 现在是怎么跟 Skill 打通的
+## 7. 记忆、画像、STM/LTM 现在怎么和 Skill 打通
 
-这是这轮修复的重点之一。
+这是当前系统很重要的一点。
 
-### 6.1 之前的问题
+现在 Skill 分支已经不是一个“只查完数据就回答”的孤岛，而是和普通聊天共用一套记忆体系。
 
-之前 Skill 分支虽然链路上“看起来有记忆”，但实际上：
-
-- prompt 里没真正注入 `memory_context` 正文
-- 画像 action 的处理顺序也不对
-
-所以会出现：
-
-- Skill 回答看起来没吃到记忆
-- 回复里即使有画像动作，也可能没真正写回
-
-### 6.2 现在的正确流程
-
-现在的 Skill 分支会这样走：
+当前正确流程是：
 
 1. 读取用户画像和语义记忆
 2. 生成 `memory_context`
 3. 读取 `running_summary`
-4. 读取最近几轮消息，构造 route context
-5. 路由完成后，把这些内容真正交给 `execute_skill()`
-6. Skill 回复生成后：
-   - 先执行 `_handle_profile_action_in_reply()`
-   - 再执行 `_strip_profile_actions_from_reply()`
+4. 读取最近几轮消息，构造 `conversation_context`
+5. 路由完成后，把这些上下文真正传给 `execute_skill()`
+6. Skill 回复生成后，先处理画像动作，再清理展示文本
 7. 保存 assistant 消息
-8. 正常触发：
-   - `maybe_update_ltm_from_chat`
-   - `compress_if_needed`
+8. 触发 LTM 入队和 STM 压缩
 
-这意味着：
+所以现在可以这样理解：
 
-> Skill 对话现在和普通对话一样，也会参与画像更新、LTM 入队和 STM 压缩。
+> Skill 对话和普通对话一样，也会参与画像更新、长记忆写入和短记忆压缩。
 
 ---
 
-## 7. 一条真实问题是怎么跑起来的
+## 8. 一条真实问题是怎么跑起来的
 
-### 7.1 例子一：普通闲聊
+下面用几个例子讲现在的真实链路。
+
+### 8.1 例子一：普通闲聊
 
 用户输入：
 
@@ -528,11 +594,11 @@ LLM 基于 记忆 + 画像 + 工具结果 生成最终回答
 
 1. router 判断这是普通聊天
 2. `selected_skill = fallback`
-3. 走普通 LLM
+3. 走普通聊天回答
 4. 保存消息
 5. 继续 STM/LTM 后处理
 
-### 7.2 例子二：贵州茅台最新财务指标
+### 8.2 例子二：贵州茅台最新财务指标
 
 用户输入：
 
@@ -545,103 +611,95 @@ LLM 基于 记忆 + 画像 + 工具结果 生成最终回答
 1. router 判断：
    - `selected_skill = tushare-data`
    - `analysis_mode = single_stock_fundamental`
-
 2. resolver 尝试把“贵州茅台”解析成股票标的
+3. `tushare_reference_planner` 生成工具计划
+4. executor 直接并发取数
+5. `skill_evidence` 检查市场证据和财务证据
+6. 证据通过后，synthesis 模型生成最终回答
 
-3. planner 给出工具计划，通常包括：
-   - `get_market_bars`
-   - `get_fina_indicator`
-   - `get_income`
-   - `get_balance_sheet`
-   - `get_cashflow`
-   - `get_stock_basic_info`
-
-4. 因为这是高频结构化问题，所以优先走 deterministic 路径
-
-5. executor 直接并发取数
-
-6. `skill_evidence` 检查：
-   - 市场数据有没有
-   - 财务数据有没有
-   - 标的是不是对的
-
-7. 证据通过后，把以下内容一起交给 synthesis 模型：
-   - 用户问题
-   - 用户画像摘要
-   - `memory_context`
-   - `running_summary`
-   - 工具结果
-
-8. 生成最终回答
-
-### 7.3 例子三：比亚迪今天值不值得买
+### 8.3 例子三：单股首轮研判
 
 用户输入：
 
 ```text
-请你根据我的用户画像和回答要求，专业分析下比亚迪的今天值不值得买入
+宁德时代这份财报怎么看，值不值得继续跟踪？
 ```
 
-这是最典型的“专业分析”链路。
+流程：
 
-系统会判断：
+1. router 判断这是 `financial-sop`
+2. `skill_name = stock-first-pass`
+3. `skill_spec_planner` 按 spec 规划工具
+4. executor 走确定性 SOP 执行
+5. 证据通过后，生成“首轮研判”回答
 
-- 需要 Skill
-- 需要实时数据
-- 需要专业分析
-- mode = `single_stock_fundamental`
+这类回答通常会同时关注：
 
-这类问题比“只查财务指标”要求更高，因为回答“今天值不值得买”至少要有：
+- 近期表现
+- 财务情况
+- 主要风险
+- 是否值得继续跟踪
 
-- 市场证据
-- 财务证据
-
-如果只拿到了财务数据，没有行情数据，就不会放行。
-
-### 7.4 例子四：半导体板块今天行情
+### 8.4 例子四：板块热点简报
 
 用户输入：
 
 ```text
-分析半导体板块今天行情
+近期半导体板块热度怎么样？还有哪些龙头值得关注？
 ```
 
-系统会判断：
+系统通常会判断：
 
-- `selected_skill = tushare-data`
-- `analysis_mode = sector_market`
+- `selected_skill = financial-sop`
+- `skill_name = sector-hotspot-brief`
 
-planner 会优先考虑：
+然后会优先拿：
 
-- `get_sector_snapshot`
-- `get_sector_constituents`
+- 板块快照
+- 板块成分股
+- 必要时补充指数/行情数据
 
-然后走板块证据校验。
-
-### 7.5 例子五：黄金 ETF 基金推荐
+### 8.5 例子五：ETF 筛选
 
 用户输入：
 
 ```text
-能推荐下黄金ETF的基金吗？
+我想配置宽基ETF，帮我筛几个适合长期持有的。
 ```
 
-现在已经不是误用股票/板块工具了，而是基金链路：
+现在这类问题优先走：
 
-1. router 判断为 `stock_selection`
-2. planner 规划：
-   - `get_fund_basic_info`
-   - `get_fund_nav`
-   - `get_fund_share`
-   - `get_fund_market_bars`
+- `selected_skill = financial-sop`
+- `skill_name = etf-screen`
 
-3. deterministic 路径先拿候选基金
-4. 再对 Top N 候选并发拉基金净值 / 份额 / 行情
-5. evidence 要求：
-   - 至少有 fund candidate
-   - 再加一类支撑 fund 证据
+而不是再全部塞回旧的 `stock_selection`。
 
-### 7.6 例子六：跟进式消息“是，请查询”
+当前 `etf-screen` 的典型执行方式是：
+
+1. 先发现候选 ETF
+2. 再补基金净值、场内行情、份额规模等支撑数据
+3. 再输出 shortlist 和差异说明
+
+### 8.6 例子六：涨跌原因解释
+
+用户输入：
+
+```text
+比亚迪今天为什么跌？
+```
+
+这类问题优先走：
+
+- `selected_skill = financial-sop`
+- `skill_name = market-move-explain`
+
+系统重点不是做长篇投资建议，而是解释：
+
+- 为什么跌
+- 可能的驱动因素是什么
+- 当前证据是否足够支撑这个解释
+
+### 8.7 例子七：跟进式消息“是，请查询”
 
 用户输入：
 
@@ -649,33 +707,38 @@ planner 会优先考虑：
 是，请查询
 ```
 
-这个问题如果只看当前一句，完全不够。
+如果只看这一句，信息是不够的。
 
-所以现在 router 会结合：
+所以 router 会结合：
 
 - `running_summary`
 - 最近几轮对话
 
-构造 `conversation_context`。
+一起构造 `effective_query`。
 
-如果上一轮已经在讨论“黄金 ETF 推荐”这类明确金融问题，那么“是，请查询”会继承上文继续走 Skill，而不是误回退到普通聊天。
+这意味着：
+
+- 在老会话里继续追问时，系统会继承前文
+- 但这也会让路由更受上下文影响
+
+所以如果你的目标是“测试某个 Skill 是否命中正确”，**最好新建一个会话再测**。
 
 ---
 
-## 8. 当前主要配置项
+## 9. 当前主要配置项
 
-配置在：
+配置主要在：
 
-- [backend/.env.example](/root/Finance/backend/.env.example)
-- [config.py](/root/Finance/backend/config.py)
+- [backend/.env.example](../backend/.env.example)（仓库模板；本机覆盖复制为 `backend/.env`）
+- [config.py](../backend/config.py)
 
-### 8.1 Skill 总开关
+### 9.1 Skill 总开关
 
 - `ENABLE_CHAT_SKILLS`
 - `ENABLE_TUSHARE_SKILLS`
 - `ENABLE_TUSHARE_PLANNER`
 
-### 8.2 子能力开关
+### 9.2 子能力开关
 
 - `ENABLE_TUSHARE_MARKET_TOOLS`
 - `ENABLE_TUSHARE_INDEX_TOOLS`
@@ -684,7 +747,7 @@ planner 会优先考虑：
 - `ENABLE_SECTOR_ANALYSIS`
 - `ENABLE_STOCK_SELECTION`
 
-### 8.3 新增的低延迟配置
+### 9.3 执行与模型配置
 
 - `ENABLE_DETERMINISTIC_SKILL_EXECUTION`
 - `ENABLE_TOOL_PREFETCH_CONCURRENCY`
@@ -692,224 +755,292 @@ planner 会优先考虑：
 - `CHAT_RESOLVER_MODEL`
 - `CHAT_SKILL_SYNTHESIS_MODEL`
 
-### 8.4 当前建议值
+### 9.4 Trace 与 Langfuse 配置
 
-```env
-ENABLE_CHAT_SKILLS=true
-ENABLE_TUSHARE_SKILLS=true
-ENABLE_TUSHARE_PLANNER=true
+- `ENABLE_TRACE`
+- `ENABLE_EVIDENCE_LINEAGE`
+- `ENABLE_TRACE_ARTIFACT_REFS` / `ENABLE_TRACE_PROMPT_CAPTURE` / `ENABLE_TRACE_REPLY_CAPTURE`（按需打开，注意隐私与体积）
+- `ENABLE_LANGFUSE`
+- `TRACE_ARTIFACT_DIR`（本地产物目录，默认指向 `Financial-MCP-Agent/logs/chat_trace_artifacts`）
+- `LANGFUSE_BASE_URL` / `LANGFUSE_HOST`（二者兼容，任填或都填）
+- `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY`
+- `LANGFUSE_PROJECT` / `LANGFUSE_ENV` / `LANGFUSE_RELEASE`
+- `LANGFUSE_SAMPLE_RATE` / `LANGFUSE_FLUSH_AT` / `LANGFUSE_FLUSH_INTERVAL_SEC`
 
-ENABLE_TUSHARE_MARKET_TOOLS=true
-ENABLE_TUSHARE_INDEX_TOOLS=true
-ENABLE_TUSHARE_SECTOR_TOOLS=true
+对新同学来说，最重要的是先记住：
 
-ENABLE_FUNDAMENTAL_ANALYSIS=true
-ENABLE_SECTOR_ANALYSIS=true
-ENABLE_STOCK_SELECTION=true
-
-ENABLE_DETERMINISTIC_SKILL_EXECUTION=true
-ENABLE_TOOL_PREFETCH_CONCURRENCY=true
-
-CHAT_ROUTER_MODEL=kimi-k2.5
-CHAT_RESOLVER_MODEL=kimi-k2.5
-CHAT_SKILL_SYNTHESIS_MODEL=
-```
-
-说明：
-
-- `CHAT_SKILL_SYNTHESIS_MODEL` 留空时，会自动回退到主模型
-- 本轮没有做新的缓存工程化配置
+- Skill 功能开不开，看前几组 `ENABLE_*`
+- Langfuse 上不上报，看 `ENABLE_LANGFUSE`（建议先验证本地 `chat_traces.jsonl` 再打开）
+- **分步联调**：见 [部署指南-Langfuse-本机开发联调.md](./部署指南-Langfuse-本机开发联调.md)
 
 ---
 
-## 9. 日志写到哪里，能看到什么
+## 10. Trace 现在做到什么程度了
 
-日志继续写入现有目录，不新建新的日志根目录。
+这部分是当前系统和“只靠日志打印”最大的区别。
 
-当前最关键的日志目录是：
+### 10.1 本地 trace 已经不只是简单日志
 
-- [logs](/root/Finance/Financial-MCP-Agent/logs)
+现在本地 trace 已经有统一结构，核心在：
 
-对话 Skill 相关的关键日志包括：
+- `trace`
+- `span`
+- `event`
+
+而且会写入本地 JSONL，便于后续审计和回放。
+
+### 10.2 当前已经记录的关键信息
+
+现在 trace 里已经不只记录“有没有调工具”，还会记录：
+
+- 命中了哪个 `selected_skill_family`
+- 具体是哪个 `skill_name`
+- `analysis_mode`
+- `execution_policy`
+- 规划了哪些工具
+- 哪些证据被接受、哪些被拒绝
+- `claims`
+- `degrade_history`
+- `policy_violation`
+- `memory_read`
+- `memory_write_enqueue`
+- `compaction_enqueue`
+
+可以把它理解成：
+
+> 不只是知道“系统答了什么”，还能知道“系统是怎么一步一步做出这个回答的”。
+
+### 10.3 Langfuse 现在处于什么状态
+
+当前已经有：
+
+- 本地 trace 主契约
+- Langfuse exporter
+- 环境配置项
+- 本机联调文档
+
+也就是说：
+
+- 本地 trace 已经是主记录源
+- Langfuse 是额外的可视化观测面
+
+更直白一点：
+
+- 本地 JSONL 适合做精确审计
+- Langfuse 适合看一条 trace 的完整链路、看聚合、看趋势
+
+---
+
+## 11. 日志和 Trace 写到哪里
+
+当前最关键的目录是：
+
+- [logs](../Financial-MCP-Agent/logs)
+
+常见内容包括：
+
+- `chat_traces.jsonl`
+- `skill_trace.log`
+- 其他工具/运行日志
+
+### 11.1 常见的 trace 事件
+
+当前比较常看的事件包括：
 
 - `chat.router.decision`
 - `chat.skill.selected`
 - `chat.tool.plan`
-- `chat.model.stage`
 - `chat.tool.start`
 - `chat.tool.end`
 - `chat.tool.error`
+- `chat.claim_lineage`
+- `chat.policy_violation`
 - `chat.reply.completed`
-- `LTM-chat`
-- `STM-chat`
-- `LTM-stream`
-- `STM-stream`
+- `chat.memory_write_enqueue`
 
-### 9.1 现在日志里新补充的关键字段
+### 11.2 现在日志里最值得看的字段
 
-- `execution_path=deterministic|agentic`
-- `router_model`
-- `resolver_model`
-- `synthesis_model`
+- `selected_skill_family`
+- `skill_name`
+- `analysis_mode`
+- `execution_path`
+- `planned_tools`
 - `tool_batch_size`
+- `route_confidence`
 - `evidence_ok`
+- `policy_violation_count`
+- `claim_count`
 
-所以现在的日志不仅能看到“走没走 Skill”，还能看到：
+这些字段已经足够帮助我们回答很多问题：
 
-- 是不是走了确定性快路径
-- 路由和解析用的是哪个模型
-- 一次规划了多少个工具
-- 最终证据是否通过
-
----
-
-## 10. 当前已经解决了哪些问题
-
-### 已解决
-
-1. Skill 分支真正吃到了 `memory_context` 正文，而不是只拿长度
-2. Skill 分支的画像动作处理顺序已经修正
-3. Skill 对话会正常参与：
-   - 画像更新
-   - LTM 入队
-   - STM 压缩
-4. 高频结构化问题已经支持 deterministic 快路径
-5. router / resolver 已支持小模型分层，默认是 `kimi-k2.5`
-6. 股票、基金、板块三类主要工具链已经打通
-7. 跟进式消息能继承上文继续走 Skill
-
-### 还可以继续优化，但本轮没有做
-
-1. 更复杂的全自动接口发现
-2. 更完整的选股评分体系
-3. 更激进的缓存工程化
-4. 更细粒度的权限能力探测
+- 为什么没命中预期 Skill
+- 为什么工具调了但答案还是保守
+- 为什么系统开始降级
+- 为什么这一轮没有写入记忆
 
 ---
 
-## 11. 如何排查问题
+## 12. 当前已经做到的能力和还没做完的地方
 
-如果你发现“为什么没按预期调用 Skill”，按下面顺序看最稳。
+### 12.1 已经做到的
 
-### 第一步：看是否命中 Skill
+1. Skill 对话已经真正吃到了 `memory_context` 和 `running_summary`
+2. Skill 对话会正常参与画像更新、LTM 入队、STM 压缩
+3. 旧的 `tushare-data` 通用链路已经稳定可用
+4. 新的 `financial-sop` 已经落地 5 个可发现 Skill
+5. 高结构化问题已经优先走确定性执行
+6. trace 已经覆盖 router、planner、tool、evidence、reply、memory 等阶段
+7. Langfuse 已经具备接入和开发联调条件
 
-查：
+### 12.2 还需要继续打磨的
 
-```text
-chat.router.decision
-```
+1. 多轮追问场景下的路由边界还要继续优化
+2. 个别板块解释类问题仍可能回落到旧的 `tushare-data`
+3. Langfuse 页面展示还需要持续做字段和父子关系优化
+4. 更多高频 Skill 还可以继续补充
+
+---
+
+## 13. 如何排查问题
+
+如果你发现“为什么没按预期调用 Skill”“为什么回复不对劲”，按下面顺序看最稳。
+
+### 第一步：先看命中了什么
+
+优先查：
+
+- `chat.router.decision`
 
 重点看：
 
 - `selected_skill`
+- `selected_skill_family`
+- `skill_name`
 - `analysis_mode`
 - `router_model`
 
-### 第二步：看走的是哪条执行路径
+### 第二步：看规划是不是合理
 
 查：
 
-```text
-chat.skill.selected
-chat.tool.plan
-```
+- `chat.tool.plan`
 
 重点看：
 
-- `execution_path`
+- `planner_type`
 - `planned_tools`
 - `tool_batch_size`
 
-### 第三步：看工具有没有真正调用
+如果一开始规划错了，后面回答通常也会偏。
+
+### 第三步：看工具有没有真正成功
 
 查：
 
-```text
-chat.tool.start
-chat.tool.end
-chat.tool.error
-```
+- `chat.tool.start`
+- `chat.tool.end`
+- `chat.tool.error`
+
+重点看：
+
+- 有没有超时
+- 有没有空结果
+- 标的是不是解析错了
 
 ### 第四步：看证据有没有通过
 
 查：
 
-```text
-chat.reply.completed
-```
+- `chat.reply.completed`
+- `chat.claim_lineage`
 
 重点看：
 
-- `used_tools`
-- `successful_tools`
 - `evidence_ok`
+- `claim_count`
+- `accepted_evidences`
+- `rejected_evidences`
 
 如果 `evidence_ok=false`，常见原因有：
 
 - 工具没拿到数据
 - 拿到的是空数据
 - 标的不匹配
-- 当前问题要求的是双证据，但只拿到了一类
+- 当前问题要求多类证据，但只拿到了一类
 
-### 第五步：看记忆和画像有没有真的参与
+### 第五步：看有没有发生降级
 
-看：
+查：
 
-- `LTM-chat`
-- `LTM-stream`
-- `STM-chat`
-- `STM-stream`
+- `degrade_history`
+- `chat.policy_violation`
 
-如果是 Skill 分支，还可以结合：
+重点看：
 
-- `memory_context`
-- `running_summary`
-- 最近多轮消息
+- 为什么进入降级
+- 是工具失败，还是证据不足
+- 有没有工具越权或不在白名单里
 
-一起排查是不是上下文没带进去。
+### 第六步：看记忆有没有真正参与
 
----
+查：
 
-## 12. 当前测试覆盖了什么
+- `memory_read`
+- `chat.memory_write_enqueue`
+- `compaction_enqueue`
 
-这轮新增或补强的测试包括：
+如果是多轮追问，还要特别看：
 
-- [test_skill_executor.py](/root/Finance/Financial-MCP-Agent/test_skill_executor.py)
-  验证 skill prompt 确实包含真实 `memory_context`
+- `conversation_context`
+- `effective_query`
 
-- [test_skill_evidence.py](/root/Finance/Financial-MCP-Agent/test_skill_evidence.py)
-  验证基金推荐和专业分析的 evidence 规则
-
-- [test_chat_service_skill_processing.py](/root/Finance/backend/test_chat_service_skill_processing.py)
-  验证 Skill 回复里的画像 action 处理顺序
-
-原有相关测试仍在：
-
-- [test_skill_router.py](/root/Finance/Financial-MCP-Agent/test_skill_router.py)
-- [test_tushare_reference_planner.py](/root/Finance/Financial-MCP-Agent/test_tushare_reference_planner.py)
-- [test_chat_tushare_tools.py](/root/Finance/Financial-MCP-Agent/test_chat_tushare_tools.py)
+因为有时候问题不是 Skill 本身不行，而是多轮上下文把这轮意图“带偏了”。
 
 ---
 
-## 13. 新同学建议从哪开始读
+## 14. 当前测试覆盖了什么
+
+当前和这条链路最相关的测试包括：
+
+- [test_skill_router.py](../Financial-MCP-Agent/test_skill_router.py)
+- [test_skill_executor.py](../Financial-MCP-Agent/test_skill_executor.py)
+- [test_skill_evidence.py](../Financial-MCP-Agent/test_skill_evidence.py)
+- [test_skill_trace.py](../Financial-MCP-Agent/test_skill_trace.py)
+- [test_langfuse_exporter.py](../Financial-MCP-Agent/test_langfuse_exporter.py)
+- [test_skill_registry.py](../Financial-MCP-Agent/test_skill_registry.py)
+- [test_tushare_reference_planner.py](../Financial-MCP-Agent/test_tushare_reference_planner.py)
+- [test_chat_tushare_tools.py](../Financial-MCP-Agent/test_chat_tushare_tools.py)
+- [test_fund_compare_p1.py](../Financial-MCP-Agent/src/skills/fund-compare/tests/test_fund_compare_p1.py)
+
+对新同学来说，可以这样理解这些测试：
+
+- router 测试：看问题会不会命中正确 Skill
+- executor 测试：看执行链路会不会跑偏
+- evidence 测试：看有没有真的拿到足够证据
+- trace / exporter 测试：看观测链路是不是完整
+
+---
+
+## 15. 新同学建议从哪开始读
 
 如果你后面要继续开发这一块，建议顺序是：
 
-1. 先看 [chat_service.py](/root/Finance/backend/services/chat_service.py)
-2. 再看 [skill_router_node.py](/root/Finance/Financial-MCP-Agent/src/agents/skill_router_node.py)
-3. 再看 [skill_executor_node.py](/root/Finance/Financial-MCP-Agent/src/agents/skill_executor_node.py)
-4. 再看 [tushare_reference_planner.py](/root/Finance/Financial-MCP-Agent/src/agents/tushare_reference_planner.py)
-5. 再看 [chat_tushare_tools.py](/root/Finance/Financial-MCP-Agent/src/tools/chat_tushare_tools.py)
-6. 最后看 [skill_evidence.py](/root/Finance/Financial-MCP-Agent/src/agents/skill_evidence.py)
+1. 先看 [chat_service.py](../backend/services/chat_service.py)
+2. 再看 [skill_router_node.py](../Financial-MCP-Agent/src/agents/skill_router_node.py)
+3. 再看 [skill_executor_node.py](../Financial-MCP-Agent/src/agents/skill_executor_node.py)
+4. 再看 [skill_registry.py](../Financial-MCP-Agent/src/skills/skill_registry.py)
+5. 再看 [skill_spec_planner.py](../Financial-MCP-Agent/src/agents/skill_spec_planner.py)
+6. 再看 [chat_tushare_tools.py](../Financial-MCP-Agent/src/tools/chat_tushare_tools.py)
+7. 最后看 [skill_trace.py](../Financial-MCP-Agent/src/tools/skill_trace.py)
 
-最重要的开发原则是：
+最重要的开发原则可以先记住一句话：
 
-> 先保证“路由清楚、日志可见、证据可靠”，再继续扩功能。
+> 先保证“路由清楚、证据可靠、trace 可见”，再继续扩功能。
 
 ---
 
-## 14. 一句话总结
+## 16. 一句话总结
 
 如果要把整套设计讲给完全不懂的人听，可以用这句话：
 
-> 现在的对话 Agent 在回答金融问题前，会先判断“要不要查真实数据”；如果要，就通过 `tushare-data` 这条 Skill 路径读取用户画像和长短期记忆，规划并调用 Tushare 工具，校验证据，再让 LLM 基于这些真实信息生成最终回答，而不是凭记忆直接猜。
+> 现在的对话 Agent 遇到金融问题时，会先判断是走旧的通用数据链路，还是走新的标准化 SOP Skill；然后系统会结合用户画像和长短期记忆，去查真实市场数据、做证据校验、记录完整 trace，最后再由模型把这些真实信息整理成用户能看懂的回答，而不是直接凭模型猜。

@@ -76,6 +76,17 @@ export interface ChatMessageResponse {
   session_id: string
   // Phase 3：本次对话参考的用户画像（null 表示 ENABLE_MEMORY=false 或未设置）
   memory_profile?: MemoryProfile | null
+  context_window?: ChatContextWindow | null
+}
+
+export interface ChatContextWindow {
+  used_tokens: number
+  budget_tokens: number
+  usage_percent: number
+  counting_mode: 'exact' | 'estimated' | string
+  compression_status: 'idle' | 'queued' | 'running' | 'failed' | string
+  strategy: 'dynamic_budget' | 'legacy_count' | string
+  updated_at?: string | null
 }
 
 export interface ChatSession {
@@ -83,6 +94,7 @@ export interface ChatSession {
   mode: string
   title?: string
   running_summary?: string
+  context_window?: ChatContextWindow | null
   created_at: string
   updated_at: string
 }
@@ -121,6 +133,12 @@ export interface ChatSummaryItem {
 export interface ChatSessionSummaries {
   session_id: string
   items: ChatSummaryItem[]
+}
+
+export interface ChatSessionMessagesResponse {
+  session_id: string
+  messages: ChatMessage[]
+  context_window?: ChatContextWindow | null
 }
 
 export interface UserProfile {
@@ -236,7 +254,7 @@ export const chatApi = {
     http.delete(`/chat/sessions/${sessionId}`, { params: { user_id: userId } }),
 
   getMessages: (sessionId: string, userId: string) =>
-    http.get<{ session_id: string; messages: ChatMessage[] }>(
+    http.get<ChatSessionMessagesResponse>(
       `/chat/sessions/${sessionId}/messages`,
       { params: { user_id: userId } }
     ),
@@ -354,6 +372,11 @@ export interface WsStreamPayload {
 
 export type WsControlFrame =
   | { type: 'session_id'; session_id: string }
+  | { type: 'context_update'; session_id: string; context_window: ChatContextWindow }
+  | { type: 'compaction_queued'; session_id: string; context_window: ChatContextWindow }
+  | { type: 'compaction_running'; session_id: string; context_window: ChatContextWindow }
+  | { type: 'compaction_done'; session_id: string; context_window: ChatContextWindow }
+  | { type: 'compaction_failed'; session_id: string; context_window: ChatContextWindow; message?: string }
   | { type: 'done'; session_id: string }
   | { type: 'compress_start'; session_id: string; progress: number; eta_seconds: number }
   | { type: 'compress_done'; session_id: string; progress: number; eta_seconds: number; elapsed_seconds: number; snapshot_id?: number; compressed_message_count?: number; total_message_count?: number; percent?: number }

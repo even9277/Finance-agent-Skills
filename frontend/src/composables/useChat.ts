@@ -10,6 +10,30 @@ export function useChat() {
   const { loadProfile } = useMemory()
   const templates = ref<ChatTemplate[]>([])
   let compressTimer: number | null = null
+  let contextRefreshTimer: number | null = null
+
+  function stopContextRefreshPolling() {
+    if (contextRefreshTimer) {
+      window.clearInterval(contextRefreshTimer)
+      contextRefreshTimer = null
+    }
+  }
+
+  function maybeStartContextRefreshPolling() {
+    const status = chatStore.currentContextWindow?.compression_status
+    if (!chatStore.currentSessionId || !status || !['queued', 'running'].includes(status)) {
+      stopContextRefreshPolling()
+      return
+    }
+    if (contextRefreshTimer) return
+    contextRefreshTimer = window.setInterval(async () => {
+      await loadSessions().catch(console.error)
+      const nextStatus = chatStore.currentContextWindow?.compression_status
+      if (!nextStatus || !['queued', 'running'].includes(nextStatus)) {
+        stopContextRefreshPolling()
+      }
+    }, 3000)
+  }
 
   async function loadSessions(q?: string) {
     const { data } = await chatApi.listSessions(userStore.userId, q)
@@ -18,6 +42,8 @@ export function useChat() {
     if (chatStore.currentSessionId) {
       const cur = data.find((s) => s.session_id === chatStore.currentSessionId)
       chatStore.setRunningSummary(cur?.running_summary || null)
+      chatStore.setContextWindow(cur?.context_window || null)
+      maybeStartContextRefreshPolling()
     }
   }
 
@@ -28,6 +54,8 @@ export function useChat() {
     // 同步 running_summary
     const session = chatStore.sessions.find((s) => s.session_id === sessionId)
     chatStore.setRunningSummary(session?.running_summary || null)
+    chatStore.setContextWindow(data.context_window || session?.context_window || null)
+    maybeStartContextRefreshPolling()
   }
 
   // ─────────────────────────────────────────────────────────────
@@ -59,6 +87,9 @@ export function useChat() {
       if (!chatStore.currentSessionId) {
         chatStore.setCurrentSession(data.session_id)
       }
+      chatStore.setContextWindow(data.context_window || null)
+      chatStore.updateSessionContext(data.session_id, data.context_window || null)
+      maybeStartContextRefreshPolling()
 
       const aiMsg: ChatMessage = {
         id: Date.now() + 1,
@@ -148,6 +179,14 @@ export function useChat() {
             if (!chatStore.currentSessionId) {
               chatStore.setCurrentSession(frame.session_id)
             }
+          } else if (frame.type === 'context_update') {
+            chatStore.setContextWindow(frame.context_window)
+            chatStore.updateSessionContext(frame.session_id, frame.context_window)
+            maybeStartContextRefreshPolling()
+          } else if (frame.type === 'compaction_queued' || frame.type === 'compaction_running' || frame.type === 'compaction_done' || frame.type === 'compaction_failed') {
+            chatStore.setContextWindow(frame.context_window)
+            chatStore.updateSessionContext(frame.session_id, frame.context_window)
+            maybeStartContextRefreshPolling()
           } else if (frame.type === 'compress_start') {
             chatStore.startCompress(frame.eta_seconds)
             // 用 ETA 模拟平滑进度（0% → 95%），收到 compress_done 再置 100%
@@ -194,6 +233,7 @@ export function useChat() {
             loadProfile().catch(e => console.warn('[useChat] 刷新画像失败:', e))
             // 刷新会话列表（获取最新 running_summary）
             loadSessions().catch(console.error)
+            maybeStartContextRefreshPolling()
             resolve()
           } else if (frame.type === 'error') {
             console.error('[WS] 服务端错误:', frame.message)
@@ -242,6 +282,7 @@ export function useChat() {
   async function newSession() {
     chatStore.setCurrentSession(null)
     chatStore.setMessages([])
+    stopContextRefreshPolling()
   }
 
   async function deleteSession(sessionId: string) {

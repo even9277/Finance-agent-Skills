@@ -6,7 +6,7 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.agents.skill_executor_node import _build_prompt
+from src.agents.skill_executor_node import _build_prompt, _execution_observability_metrics
 
 
 class SkillExecutorPromptTests(unittest.TestCase):
@@ -25,6 +25,26 @@ class SkillExecutorPromptTests(unittest.TestCase):
         self.assertIn("【memory_context】", prompt)
         self.assertIn("风险偏好：balanced", prompt)
         self.assertIn("关注板块：新能源", prompt)
+
+    def test_execution_observability_metrics_include_failure_rate_latency_and_policy(self):
+        metrics = _execution_observability_metrics(
+            route_confidence=0.91,
+            planned_tool_names=["get_fund_basic_info", "get_fund_nav", "forbidden_tool"],
+            tool_results=[
+                ("get_fund_basic_info", {"ok": True, "duration_ms": 120}),
+                ("get_fund_nav", {"ok": False, "duration_ms": 450}),
+            ],
+            degrade_policy={"current_stage": "graceful_decline"},
+            policy_violation_names=["forbidden_tool"],
+            evidence_ok=False,
+        )
+        self.assertEqual(metrics["tool_batch_size"], 3)
+        self.assertEqual(metrics["tool_failure_count"], 1)
+        self.assertAlmostEqual(metrics["tool_failure_rate"], 0.5)
+        self.assertEqual(metrics["policy_violation_count"], 1)
+        self.assertEqual(metrics["degrade_stage"], "graceful_decline")
+        self.assertEqual(metrics["p95_latency"], 450.0)
+        self.assertFalse(metrics["evidence_ok"])
 
 
 if __name__ == "__main__":
