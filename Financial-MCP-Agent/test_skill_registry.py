@@ -47,6 +47,16 @@ class SkillRegistryTests(unittest.TestCase):
         titles = {item["title"] for item in refs}
         self.assertTrue("通达信板块行情" in titles or "东财概念和行业指数行情" in titles)
 
+    def test_market_move_explain_exposes_web_search_and_references(self):
+        registry = SkillRegistry()
+        skill = registry.get_skill("market-move-explain")
+        self.assertIsNotNone(skill)
+        self.assertIn("search_web_news", skill.allowed_tools)
+        refs = registry.find_references("market-move-explain", "为什么今天涨了，有没有新闻消息", limit=5)
+        self.assertTrue(refs)
+        titles = {item["title"] for item in refs}
+        self.assertIn("新闻线索判读", titles)
+
 
 if __name__ == "__main__":
     unittest.main()

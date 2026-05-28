@@ -210,6 +210,8 @@ class MemoryService:
         sources: Optional[list[str]] = None,
         top_k: int = 5,
         threshold: float = 0.60,
+        dedupe_mode: bool = False,
+        category_threshold_map: Optional[dict[str, float]] = None,
     ) -> list[dict]:
         """
         Mem0 语义搜索（补充增强层）。
@@ -239,15 +241,27 @@ class MemoryService:
                         type(item).__name__,
                     )
                     continue
-                score = item.get("score", 1.0)
-                if score < threshold:
-                    continue
                 meta = item.get("metadata", {})
+                if not isinstance(meta, dict):
+                    meta = {}
+                category = str(meta.get("category") or "")
+                score = item.get("score", 1.0)
+                effective_threshold = threshold
+                if dedupe_mode and category_threshold_map:
+                    try:
+                        effective_threshold = float(
+                            category_threshold_map.get(category, threshold)
+                        )
+                    except Exception:
+                        effective_threshold = threshold
+                if score < effective_threshold:
+                    continue
 
                 # categories/sources 侧过滤
-                if categories and meta.get("category") not in categories:
+                if categories and category not in categories:
                     continue
-                if sources and meta.get("source") not in sources:
+                source = str(meta.get("source") or "")
+                if sources and source not in sources:
                     continue
                 if not meta.get("active", True):
                     continue
@@ -256,6 +270,15 @@ class MemoryService:
                     "id": item.get("id", ""),
                     "text": item.get("memory", ""),
                     "score": score,
+                    "source": source,
+                    "confidence": _coerce_confidence(meta.get("confidence", 1.0)),
+                    "category": category,
+                    "updated_at": _normalize_memory_timestamp(
+                        item.get("updated_at")
+                        or meta.get("updated_at")
+                        or item.get("created_at")
+                        or meta.get("created_at")
+                    ),
                     "metadata": meta,
                 })
 
@@ -779,6 +802,288 @@ class MemoryService:
             logger.debug(f"[MemoryService] get_memory_stats 失败: {exc}")
             return {"from_conversations": 0, "from_reports": 0, "from_manual": 0, "total_tasks": 0}
 
+    @staticmethod
+    async def list_candidates(
+        user_id: str,
+        page: int = 1,
+        page_size: int = 20,
+        status: Optional[str] = None,
+        db_session=None,
+    ) -> dict:
+        """分页查询候选池（状态真源=业务库 memory_candidates）。"""
+        page = max(1, int(page or 1))
+        page_size = max(1, min(int(page_size or 20), 100))
+        offset = (page - 1) * page_size
+
+        where_clause = "WHERE user_id = :uid"
+        count_where_clause = "WHERE user_id = :uid"
+        params: dict[str, Any] = {"uid": user_id, "limit": page_size, "offset": offset}
+
+        if status:
+            where_clause += " AND status = :status"
+            count_where_clause += " AND status = :status"
+            params["status"] = status
+        else:
+            where_clause += " AND status <> 'deleted'"
+            count_where_clause += " AND status <> 'deleted'"
+
+        if db_session is not None:
+            from sqlalchemy import text
+
+            try:
+                result = await db_session.execute(
+                    text(
+                        f"""
+                        SELECT
+                            id, mem0_id, text, category, source, confidence, evidence_ref,
+                            status, reviewed_at, reviewed_by, rejected_reason, conflict_group_id,
+                            candidate_metadata, created_at, updated_at
+                        FROM memory_candidates
+                        {where_clause}
+                        ORDER BY created_at DESC
+                        LIMIT :limit OFFSET :offset
+                        """
+                    ),
+                    params,
+                )
+                rows = [dict(row._mapping) for row in result.fetchall()]
+
+                count_result = await db_session.execute(
+                    text(f"SELECT COUNT(*) AS cnt FROM memory_candidates {count_where_clause}"),
+                    params,
+                )
+                total = int(count_result.scalar() or 0)
+                return {
+                    "items": [_candidate_row_to_memory_item(r) for r in rows],
+                    "total": total,
+                    "page": page,
+                    "page_size": page_size,
+                }
+            except Exception as exc:
+                logger.warning(f"[MemoryService] list_candidates SQLAlchemy 失败: {exc}")
+                return {"items": [], "total": 0, "page": page, "page_size": page_size}
+
+        if status:
+            rows = await _db_fetchall(
+                """
+                SELECT
+                    id, mem0_id, text, category, source, confidence, evidence_ref,
+                    status, reviewed_at, reviewed_by, rejected_reason, conflict_group_id,
+                    candidate_metadata, created_at, updated_at
+                FROM memory_candidates
+                WHERE user_id = ? AND status = ?
+                ORDER BY created_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                (user_id, status, page_size, offset),
+            )
+            cnt_rows = await _db_fetchall(
+                "SELECT COUNT(*) AS cnt FROM memory_candidates WHERE user_id = ? AND status = ?",
+                (user_id, status),
+            )
+        else:
+            rows = await _db_fetchall(
+                """
+                SELECT
+                    id, mem0_id, text, category, source, confidence, evidence_ref,
+                    status, reviewed_at, reviewed_by, rejected_reason, conflict_group_id,
+                    candidate_metadata, created_at, updated_at
+                FROM memory_candidates
+                WHERE user_id = ? AND status <> 'deleted'
+                ORDER BY created_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                (user_id, page_size, offset),
+            )
+            cnt_rows = await _db_fetchall(
+                "SELECT COUNT(*) AS cnt FROM memory_candidates WHERE user_id = ? AND status <> 'deleted'",
+                (user_id,),
+            )
+        total = int((cnt_rows[0] or {}).get("cnt", 0)) if cnt_rows else 0
+        return {
+            "items": [_candidate_row_to_memory_item(r) for r in rows],
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+        }
+
+    @staticmethod
+    async def review_memory_item(
+        user_id: str,
+        candidate_id: str,
+        action: str,
+        reason: Optional[str] = None,
+        actor: str = "system",
+        db_session=None,
+    ) -> Optional[dict]:
+        """候选状态流转：accept/reject/delete。"""
+        action = (action or "").strip().lower()
+        if action not in {"accept", "reject", "delete"}:
+            return None
+
+        row = await _fetch_candidate_row(user_id=user_id, candidate_id=candidate_id, db_session=db_session)
+        if not row:
+            return None
+
+        before = dict(row)
+        now_dt = datetime.utcnow()
+        current_status = str(row.get("status") or "pending")
+
+        transitions = {
+            "pending": {"accept", "reject", "delete"},
+            "accepted": {"delete"},
+            "rejected": {"delete"},
+            "promoted": {"delete"},
+            "deleted": set(),
+        }
+        allowed = transitions.get(current_status, {"delete"})
+        if action not in allowed:
+            # 幂等语义：重复 accept/reject 时返回当前状态，避免前端误判失败
+            if action in {"accept", "reject"} and current_status in {"accepted", "rejected", "promoted"}:
+                return _candidate_row_to_memory_item(row)
+            return None
+
+        target_status = "accepted" if action == "accept" else ("rejected" if action == "reject" else "deleted")
+        rejected_reason = str(reason or "") if action == "reject" else ""
+        active = False if action == "delete" else bool(row.get("active", True))
+
+        ok = await _update_candidate_status(
+            user_id=user_id,
+            candidate_id=candidate_id,
+            status=target_status,
+            reviewed_at=now_dt,
+            reviewed_by=actor,
+            rejected_reason=rejected_reason,
+            active=active,
+            db_session=db_session,
+        )
+        if not ok:
+            return None
+
+        enqueue_error = ""
+        final_status = target_status
+        if action == "accept":
+            try:
+                metadata = _ensure_json_dict(row.get("candidate_metadata"))
+                metadata.update(
+                    {
+                        "category": row.get("category") or metadata.get("category") or "",
+                        "source": row.get("source") or metadata.get("source") or "chat_inferred",
+                        "confidence": _coerce_confidence(row.get("confidence", metadata.get("confidence", 0.7))),
+                        "evidence_ref": row.get("evidence_ref") or metadata.get("evidence_ref") or "",
+                        "candidate_id": candidate_id,
+                        "from_candidate_review": True,
+                        "mem0_infer": False,
+                        "active": True,
+                    }
+                )
+                payload = json.dumps(
+                    {
+                        "messages": [{"role": "user", "content": str(row.get("text") or "")}],
+                        "metadata": metadata,
+                    },
+                    ensure_ascii=False,
+                )
+                enqueue_ok = await _enqueue_task(
+                    user_id=user_id,
+                    task_type="add_conversation",
+                    payload=payload,
+                    db_session=db_session,
+                )
+                if enqueue_ok:
+                    final_status = "promoted"
+                    await _update_candidate_status(
+                        user_id=user_id,
+                        candidate_id=candidate_id,
+                        status=final_status,
+                        reviewed_at=now_dt,
+                        reviewed_by=actor,
+                        rejected_reason="",
+                        active=True,
+                        db_session=db_session,
+                    )
+                else:
+                    enqueue_error = "enqueue_failed"
+            except Exception as exc:
+                enqueue_error = str(exc)[:240]
+                logger.warning(
+                    "[MemoryService] review_memory_item accept enqueue 失败: candidate=%s err=%s",
+                    candidate_id,
+                    enqueue_error,
+                )
+
+        after_row = await _fetch_candidate_row(user_id=user_id, candidate_id=candidate_id, db_session=db_session)
+        if after_row:
+            await _insert_memory_audit_log(
+                user_id=user_id,
+                candidate_id=candidate_id,
+                actor=actor,
+                action=action,
+                before_json=before,
+                after_json=after_row,
+                reason=(reason or "") if not enqueue_error else f"{reason or ''} | enqueue_error={enqueue_error}",
+                db_session=db_session,
+            )
+            return _candidate_row_to_memory_item(after_row)
+        return None
+
+    @staticmethod
+    async def patch_memory_item(
+        user_id: str,
+        candidate_id: str,
+        content: Optional[str] = None,
+        category: Optional[str] = None,
+        metadata: Optional[dict[str, Any]] = None,
+        actor: str = "system",
+        reason: Optional[str] = None,
+        db_session=None,
+    ) -> Optional[dict]:
+        """候选条目局部更新（content/category/metadata）。"""
+        row = await _fetch_candidate_row(user_id=user_id, candidate_id=candidate_id, db_session=db_session)
+        if not row:
+            return None
+        if str(row.get("status") or "") == "deleted":
+            return None
+
+        patch: dict[str, Any] = {}
+        if content is not None:
+            text_val = str(content).strip()
+            if text_val:
+                patch["text"] = text_val[:1200]
+        if category is not None:
+            patch["category"] = str(category).strip()[:64]
+        if metadata is not None:
+            merged_meta = _ensure_json_dict(row.get("candidate_metadata"))
+            merged_meta.update(dict(metadata))
+            patch["candidate_metadata"] = merged_meta
+
+        if not patch:
+            return _candidate_row_to_memory_item(row)
+
+        ok = await _patch_candidate_row(
+            user_id=user_id,
+            candidate_id=candidate_id,
+            patch=patch,
+            db_session=db_session,
+        )
+        if not ok:
+            return None
+
+        after_row = await _fetch_candidate_row(user_id=user_id, candidate_id=candidate_id, db_session=db_session)
+        if after_row:
+            await _insert_memory_audit_log(
+                user_id=user_id,
+                candidate_id=candidate_id,
+                actor=actor,
+                action="patch",
+                before_json=row,
+                after_json=after_row,
+                reason=reason or "",
+                db_session=db_session,
+            )
+            return _candidate_row_to_memory_item(after_row)
+        return None
+
 
 # ─────────────────────────────────────────────────────────────
 # 私有辅助函数
@@ -818,6 +1123,298 @@ def _row_to_profile_dict(row: dict) -> dict:
     return profile
 
 
+def _is_postgres_db_session(db_session) -> bool:
+    try:
+        bind = getattr(db_session, "bind", None)
+        if bind is None:
+            return False
+        dialect_name = str(getattr(bind.dialect, "name", "")).lower()
+        return dialect_name == "postgresql"
+    except Exception:
+        return False
+
+
+def _ensure_json_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return {}
+        try:
+            obj = json.loads(raw)
+            return dict(obj) if isinstance(obj, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _candidate_row_to_memory_item(row: dict) -> dict[str, Any]:
+    meta = _ensure_json_dict(row.get("candidate_metadata"))
+    return {
+        "id": str(row.get("id") or ""),
+        "mem0_id": str(row.get("mem0_id") or ""),
+        "content": str(row.get("text") or ""),
+        "category": str(row.get("category") or ""),
+        "source": str(row.get("source") or ""),
+        "confidence": _coerce_confidence(row.get("confidence", 1.0)),
+        "evidence_ref": str(row.get("evidence_ref") or ""),
+        "created_at": _normalize_memory_timestamp(row.get("created_at")),
+        "status": str(row.get("status") or "pending"),
+        "reviewed_at": _normalize_memory_timestamp(row.get("reviewed_at")),
+        "reviewed_by": str(row.get("reviewed_by") or ""),
+        "rejected_reason": str(row.get("rejected_reason") or ""),
+        "conflict_group_id": str(row.get("conflict_group_id") or ""),
+        "metadata": meta,
+    }
+
+
+async def _fetch_candidate_row(
+    user_id: str,
+    candidate_id: str,
+    db_session=None,
+) -> Optional[dict]:
+    if db_session is not None:
+        from sqlalchemy import text
+
+        try:
+            result = await db_session.execute(
+                text(
+                    """
+                    SELECT
+                        id, user_id, mem0_id, text, category, source, confidence, evidence_ref,
+                        status, reviewed_at, reviewed_by, rejected_reason, conflict_group_id,
+                        fingerprint, idempotency_key, candidate_metadata, active, created_at, updated_at
+                    FROM memory_candidates
+                    WHERE id = :cid AND user_id = :uid
+                    LIMIT 1
+                    """
+                ),
+                {"cid": candidate_id, "uid": user_id},
+            )
+            row = result.fetchone()
+            return dict(row._mapping) if row else None
+        except Exception as exc:
+            logger.warning("[MemoryService] _fetch_candidate_row(SQLAlchemy) 失败: %s", exc)
+            return None
+
+    row = await _db_fetchone(
+        """
+        SELECT
+            id, user_id, mem0_id, text, category, source, confidence, evidence_ref,
+            status, reviewed_at, reviewed_by, rejected_reason, conflict_group_id,
+            fingerprint, idempotency_key, candidate_metadata, active, created_at, updated_at
+        FROM memory_candidates
+        WHERE id = ? AND user_id = ?
+        LIMIT 1
+        """,
+        (candidate_id, user_id),
+    )
+    return row
+
+
+async def _update_candidate_status(
+    user_id: str,
+    candidate_id: str,
+    status: str,
+    reviewed_at: datetime,
+    reviewed_by: str,
+    rejected_reason: str,
+    active: bool,
+    db_session=None,
+) -> bool:
+    now_dt = datetime.utcnow()
+    if db_session is not None:
+        from sqlalchemy import text
+
+        try:
+            await db_session.execute(
+                text(
+                    """
+                    UPDATE memory_candidates
+                    SET
+                        status = :status,
+                        reviewed_at = :reviewed_at,
+                        reviewed_by = :reviewed_by,
+                        rejected_reason = :rejected_reason,
+                        active = :active,
+                        updated_at = :updated_at
+                    WHERE id = :cid AND user_id = :uid
+                    """
+                ),
+                {
+                    "status": status,
+                    "reviewed_at": reviewed_at,
+                    "reviewed_by": reviewed_by,
+                    "rejected_reason": rejected_reason,
+                    "active": active,
+                    "updated_at": now_dt,
+                    "cid": candidate_id,
+                    "uid": user_id,
+                },
+            )
+            await db_session.commit()
+            return True
+        except Exception as exc:
+            logger.warning("[MemoryService] _update_candidate_status(SQLAlchemy) 失败: %s", exc)
+            return False
+
+    return await _db_execute(
+        """
+        UPDATE memory_candidates
+        SET
+            status = ?,
+            reviewed_at = ?,
+            reviewed_by = ?,
+            rejected_reason = ?,
+            active = ?,
+            updated_at = ?
+        WHERE id = ? AND user_id = ?
+        """,
+        (
+            status,
+            reviewed_at.isoformat(),
+            reviewed_by,
+            rejected_reason,
+            1 if active else 0,
+            now_dt.isoformat(),
+            candidate_id,
+            user_id,
+        ),
+    )
+
+
+async def _patch_candidate_row(
+    user_id: str,
+    candidate_id: str,
+    patch: dict[str, Any],
+    db_session=None,
+) -> bool:
+    now_dt = datetime.utcnow()
+    if db_session is not None:
+        from sqlalchemy import text
+
+        is_pg = _is_postgres_db_session(db_session)
+        setters: list[str] = ["updated_at = :updated_at"]
+        params: dict[str, Any] = {"updated_at": now_dt, "cid": candidate_id, "uid": user_id}
+        if "text" in patch:
+            setters.append("text = :text")
+            params["text"] = str(patch["text"])
+        if "category" in patch:
+            setters.append("category = :category")
+            params["category"] = str(patch["category"])
+        if "candidate_metadata" in patch:
+            setters.append(
+                "candidate_metadata = CAST(:candidate_metadata AS JSONB)"
+                if is_pg
+                else "candidate_metadata = :candidate_metadata"
+            )
+            params["candidate_metadata"] = (
+                json.dumps(patch["candidate_metadata"], ensure_ascii=False)
+                if not is_pg
+                else json.dumps(patch["candidate_metadata"], ensure_ascii=False)
+            )
+
+        try:
+            await db_session.execute(
+                text(
+                    f"""
+                    UPDATE memory_candidates
+                    SET {", ".join(setters)}
+                    WHERE id = :cid AND user_id = :uid
+                    """
+                ),
+                params,
+            )
+            await db_session.commit()
+            return True
+        except Exception as exc:
+            logger.warning("[MemoryService] _patch_candidate_row(SQLAlchemy) 失败: %s", exc)
+            return False
+
+    setters: list[str] = ["updated_at = ?"]
+    values: list[Any] = [now_dt.isoformat()]
+    if "text" in patch:
+        setters.append("text = ?")
+        values.append(str(patch["text"]))
+    if "category" in patch:
+        setters.append("category = ?")
+        values.append(str(patch["category"]))
+    if "candidate_metadata" in patch:
+        setters.append("candidate_metadata = ?")
+        values.append(json.dumps(patch["candidate_metadata"], ensure_ascii=False))
+    values.extend([candidate_id, user_id])
+    return await _db_execute(
+        f"UPDATE memory_candidates SET {', '.join(setters)} WHERE id = ? AND user_id = ?",
+        tuple(values),
+    )
+
+
+async def _insert_memory_audit_log(
+    user_id: str,
+    candidate_id: str,
+    actor: str,
+    action: str,
+    before_json: Optional[dict],
+    after_json: Optional[dict],
+    reason: str,
+    db_session=None,
+) -> None:
+    now_dt = datetime.utcnow()
+    before_payload = before_json or {}
+    after_payload = after_json or {}
+    if db_session is not None:
+        from sqlalchemy import text
+
+        is_pg = _is_postgres_db_session(db_session)
+        before_expr = "CAST(:before_json AS JSONB)" if is_pg else ":before_json"
+        after_expr = "CAST(:after_json AS JSONB)" if is_pg else ":after_json"
+        try:
+            await db_session.execute(
+                text(
+                    f"""
+                    INSERT INTO memory_audit_logs
+                    (candidate_id, user_id, actor, action, before_json, after_json, reason, created_at)
+                    VALUES
+                    (:candidate_id, :user_id, :actor, :action, {before_expr}, {after_expr}, :reason, :created_at)
+                    """
+                ),
+                {
+                    "candidate_id": candidate_id,
+                    "user_id": user_id,
+                    "actor": actor,
+                    "action": action,
+                    "before_json": json.dumps(before_payload, ensure_ascii=False, default=str),
+                    "after_json": json.dumps(after_payload, ensure_ascii=False, default=str),
+                    "reason": reason,
+                    "created_at": now_dt,
+                },
+            )
+            await db_session.commit()
+            return
+        except Exception as exc:
+            logger.warning("[MemoryService] _insert_memory_audit_log(SQLAlchemy) 失败: %s", exc)
+            return
+
+    await _db_execute(
+        """
+        INSERT INTO memory_audit_logs
+        (candidate_id, user_id, actor, action, before_json, after_json, reason, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            candidate_id,
+            user_id,
+            actor,
+            action,
+            json.dumps(before_payload, ensure_ascii=False, default=str),
+            json.dumps(after_payload, ensure_ascii=False, default=str),
+            reason,
+            now_dt.isoformat(),
+        ),
+    )
+
+
 async def _upsert_profile_field(
     user_id: str,
     field: str,
@@ -833,6 +1430,9 @@ async def _upsert_profile_field(
         value_db = json.dumps(value if isinstance(value, (list, dict)) else [], ensure_ascii=False)
     else:
         value_db = json.dumps(value, ensure_ascii=False) if isinstance(value, (list, dict)) else value
+    if field == "response_pref" and (value_db is None or str(value_db).strip() == ""):
+        # response_pref 在表结构中通常为 NOT NULL，空值时回退默认值，避免首写失败。
+        value_db = "balanced"
 
     # 注意：SQLAlchemy + PostgreSQL 需要真正的 datetime 对象，
     # SQLite 直连分支仍然使用 ISO 字符串。
@@ -862,25 +1462,43 @@ async def _upsert_profile_field(
                 )
             else:
                 import uuid as _uuid
-                await db_session.execute(
-                    text(
-                        # 首次插入时，确保 response_pref 有默认值 'balanced'，避免 NOT NULL 约束报错
-                        (
-                            f"INSERT INTO user_invest_profiles (id, user_id, {field}, updated_by, updated_at, created_at, response_pref) "
-                            + "VALUES (:id, :uid, "
-                            + ("CAST(:val AS JSONB)" if is_json_field else ":val")
-                            + ", :upd, :now, :now, :resp)"
-                        )
-                    ),
-                    {
-                        "id": str(_uuid.uuid4()),
-                        "uid": user_id,
-                        "val": value_db,
-                        "upd": updated_by,
-                        "now": now_dt,
-                        "resp": "balanced",
-                    },
-                )
+                if field == "response_pref":
+                    await db_session.execute(
+                        text(
+                            (
+                                "INSERT INTO user_invest_profiles "
+                                "(id, user_id, response_pref, updated_by, updated_at, created_at) "
+                                "VALUES (:id, :uid, :val, :upd, :now, :now)"
+                            )
+                        ),
+                        {
+                            "id": str(_uuid.uuid4()),
+                            "uid": user_id,
+                            "val": value_db,
+                            "upd": updated_by,
+                            "now": now_dt,
+                        },
+                    )
+                else:
+                    await db_session.execute(
+                        text(
+                            # 首次插入时，确保 response_pref 有默认值 'balanced'，避免 NOT NULL 约束报错
+                            (
+                                f"INSERT INTO user_invest_profiles (id, user_id, {field}, updated_by, updated_at, created_at, response_pref) "
+                                + "VALUES (:id, :uid, "
+                                + ("CAST(:val AS JSONB)" if is_json_field else ":val")
+                                + ", :upd, :now, :now, :resp)"
+                            )
+                        ),
+                        {
+                            "id": str(_uuid.uuid4()),
+                            "uid": user_id,
+                            "val": value_db,
+                            "upd": updated_by,
+                            "now": now_dt,
+                            "resp": "balanced",
+                        },
+                    )
             await db_session.commit()
         except Exception as exc:
             logger.error(f"[MemoryService] _upsert_profile_field SQLAlchemy 失败: {exc}", exc_info=True)
@@ -902,12 +1520,19 @@ async def _upsert_profile_field(
                     (value_db, updated_by, now_str, user_id),
                 )
             else:
-                await db.execute(
-                    # SQLite 分支也补齐 response_pref，保证与 PG NOT NULL 约束一致
-                    f"INSERT INTO user_invest_profiles (id, user_id, {field}, updated_by, updated_at, created_at, response_pref) "
-                    f"VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (str(_uuid.uuid4()), user_id, value_db, updated_by, now_str, now_str, "balanced"),
-                )
+                if field == "response_pref":
+                    await db.execute(
+                        "INSERT INTO user_invest_profiles (id, user_id, response_pref, updated_by, updated_at, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (str(_uuid.uuid4()), user_id, value_db, updated_by, now_str, now_str),
+                    )
+                else:
+                    await db.execute(
+                        # SQLite 分支也补齐 response_pref，保证与 PG NOT NULL 约束一致
+                        f"INSERT INTO user_invest_profiles (id, user_id, {field}, updated_by, updated_at, created_at, response_pref) "
+                        f"VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (str(_uuid.uuid4()), user_id, value_db, updated_by, now_str, now_str, "balanced"),
+                    )
             await db.commit()
     except ImportError:
         import sqlite3, uuid as _uuid
@@ -922,12 +1547,19 @@ async def _upsert_profile_field(
                 (value_db, updated_by, now_str, user_id),
             )
         else:
-            conn.execute(
-                # SQLite 分支也补齐 response_pref，保证与 PG NOT NULL 约束一致
-                f"INSERT INTO user_invest_profiles (id, user_id, {field}, updated_by, updated_at, created_at, response_pref) "
-                f"VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (str(_uuid.uuid4()), user_id, value_db, updated_by, now_str, now_str, "balanced"),
-            )
+            if field == "response_pref":
+                conn.execute(
+                    "INSERT INTO user_invest_profiles (id, user_id, response_pref, updated_by, updated_at, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (str(_uuid.uuid4()), user_id, value_db, updated_by, now_str, now_str),
+                )
+            else:
+                conn.execute(
+                    # SQLite 分支也补齐 response_pref，保证与 PG NOT NULL 约束一致
+                    f"INSERT INTO user_invest_profiles (id, user_id, {field}, updated_by, updated_at, created_at, response_pref) "
+                    f"VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (str(_uuid.uuid4()), user_id, value_db, updated_by, now_str, now_str, "balanced"),
+                )
         conn.commit()
         conn.close()
     except Exception as exc:
@@ -939,7 +1571,7 @@ async def _enqueue_task(
     task_type: str,
     payload: str,
     db_session=None,
-) -> None:
+) -> bool:
     """向 ltm_write_tasks 队列插入待处理任务。"""
     now_dt = datetime.utcnow()
     now_str = now_dt.isoformat()
@@ -955,12 +1587,13 @@ async def _enqueue_task(
                 {"uid": user_id, "tt": task_type, "pl": payload, "now": now_dt},
             )
             await db_session.commit()
+            return True
         except Exception as exc:
             logger.error(f"[MemoryService] _enqueue_task SQLAlchemy 失败: {exc}", exc_info=True)
-        return
+            return False
 
     # 直连模式
-    await _db_execute(
+    return await _db_execute(
         "INSERT INTO ltm_write_tasks (user_id, task_type, payload, status, retry_count, created_at) "
         "VALUES (?, ?, ?, 'pending', 0, ?)",
         (user_id, task_type, payload, now_str),

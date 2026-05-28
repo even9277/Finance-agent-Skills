@@ -4,7 +4,6 @@ description: 对比两只或多只基金/ETF，基于基金基础信息、净值
 execution_mode: deterministic
 allowed_tools:
   - get_fund_basic_info
-  - get_etf_basic_info
   - get_fund_nav
   - get_fund_market_bars
   - get_fund_share
@@ -12,19 +11,30 @@ allowed_tools:
 
 # Fund Compare
 
+## Purpose
+
+对两只或多只基金、ETF、LOF、联接基金或 QDII 做可核对横向比较。这个 skill 的核心不是“直接推荐一只”，而是先确认候选是否可比，再用基础信息、净值/行情、份额规模等证据解释差异，最后结合用户约束给出更适配的排序或保守结论。
+
 ## When to Use
 
 - 用户明确要“对比/比较/PK/选一个”两只或多只基金、ETF、LOF、联接基金。
 - 用户希望基于可核对的数据比较近期表现、净值、份额规模、产品类型或跟踪特征。
 - 用户希望结合自身风险偏好、投资周期、回答偏好，得到更适合自己的排序或结论。
 
-## Inputs
+## When Not to Use
+
+- 用户只给出一个基金且没有比较对象，应先追问或转到单基金 first pass。
+- 用户是在筛选某类 ETF 候选，而不是比较已知对象，应交给 `etf-screen`。
+- 用户问的是基金或 ETF 为什么异动，应交给 `market-move-explain`。
+- 候选跨品类差异过大且用户没有明确“可以跨类比较”时，不要输出强排序。
+
+## Required Inputs
 
 - 用户原始问题。
 - 最少两个待比较基金实体；若实体不清晰，需要先说明无法稳定比较。
 - 用户画像摘要：仅用于调整输出结构和结论表达，不可代替证据。
 
-## Decision Rules
+## Workflow
 
 1. 先识别候选基金名称，目标是得到 2 到 4 个比较对象。
 2. 每个对象先查基础信息，再补净值、份额或场内行情，避免只看单一指标下结论。
@@ -32,13 +42,28 @@ allowed_tools:
 4. 比较时优先讲清楚“可比口径”，不要把场内 ETF、场外联接基金、QDII、黄金主题基金混为一类。
 5. 结论必须引用已获取证据；证据不足时只给出保守建议或明确降级。
 
-## Fallbacks
+## Tool Use Guide
+
+- `get_fund_basic_info` 对每个候选都要执行，用于确认基金类型、管理人、主题、跟踪标的或产品口径。
+- `get_fund_nav` 用于场外净值、累计净值和阶段表现证据。
+- `get_fund_market_bars` 用于 ETF/LOF 等场内交易表现和波动证据。
+- `get_fund_share` 用于份额、规模和流动性侧辅助判断。
+- 不直接调用网页/新闻搜索；若问题需要解释异动原因，应转给 `market-move-explain`。
+
+## Evidence Rules
+
+- 至少需要两个不同基金主体，且每个主体都要有 `fund_basic`。
+- 每个主体还需要至少命中 `fund_nav`、`fund_daily`、`fund_share` 中的一类支持证据。
+- 横向比较必须先说明可比性：同类基金可以排序，跨类基金只能做配置属性差异说明。
+- 缺少某个候选的数据时，要把该候选标为证据不足，不允许用另一个候选的数据推断。
+
+## Degrade Policy
 
 - 找不到至少两个可比对象：说明缺少明确基金名称，提示用户补充。
 - 基础信息拿到了，但表现类数据不足：只说明产品差异与已知风险，不做强排序。
 - 工具结果为空或冲突：保留已确认事实，拒绝编造比较结论。
 
-## Output Template
+## Output Contract
 
 - 默认结构：
   - 先给结论，再给对比维度、主要风险、适配建议、数据来源。
@@ -47,3 +72,9 @@ allowed_tools:
 - `response_pref=concise`：
   - 保留结论、2 到 3 个核心对比点、1 段风险提示。
 - 始终显式标注：数据来源为 Tushare，并尽量给出数据日期或财报期。
+
+## References
+
+- `references/可比性规则.md`：基金可比口径和跨类比较边界。
+- `references/基金品类差异.md`：ETF、联接基金、LOF、QDII 等产品差异。
+- `references/输出口径.md`：比较结论和风险提示的表达模板。

@@ -45,6 +45,12 @@ class TushareClient:
     async def stock_basic(self, **kwargs):
         return await self._call_api("stock_basic", **kwargs)
 
+    async def namechange(self, **kwargs):
+        return await self._call_api("namechange", **kwargs)
+
+    async def stock_company(self, **kwargs):
+        return await self._call_api("stock_company", **kwargs)
+
     async def daily(self, **kwargs):
         return await self._call_api("daily", **kwargs)
 
@@ -72,11 +78,11 @@ class TushareClient:
     async def fund_share(self, **kwargs):
         return await self._call_api("fund_share", **kwargs)
 
-    async def etf_basic(self, **kwargs):
-        return await self._call_api("etf_basic", **kwargs)
-
     async def index_classify(self, **kwargs):
         return await self._call_api("index_classify", **kwargs)
+
+    async def index_member_all(self, **kwargs):
+        return await self._call_api("index_member_all", **kwargs)
 
     async def sw_daily(self, **kwargs):
         return await self._call_api("sw_daily", **kwargs)

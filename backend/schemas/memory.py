@@ -55,6 +55,7 @@ class MemoryItem(BaseModel):
     evidence_ref: str = ""                    # 指向 messages.id 或 reports.id
     # 必有字段：ISO8601 字符串；Mem0/降级路径无法解析时为空串
     created_at: str = Field(default="", description="创建时间 ISO8601，未知时为空串")
+    mem0_id: str = ""
     metadata: dict[str, Any] = {}
 
     @field_validator("created_at", mode="before")
@@ -70,7 +71,6 @@ class MemoryItem(BaseModel):
             except Exception:
                 return str(v)
         return str(v)
-
 
 class MemoryItemsResponse(BaseModel):
     items: list[MemoryItem] = []

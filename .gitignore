@@ -40,6 +40,7 @@ dist/
 logs/
 Financial-MCP-Agent/logs/
 Financial-MCP-Agent/reports/
+tests/_realcall/_runs/
 
 # Local SQLite / 开发库（勿提交）
 backend/finance.db

@@ -1,6 +1,15 @@
 import { defineStore } from 'pinia'
-import { ref } from 'vue'
-import type { ChatContextWindow, ChatMessage, ChatSession } from '@/api'
+import { computed, ref } from 'vue'
+import type {
+  ChatContextWindow,
+  ChatMessage,
+  PlanPreviewItem,
+  ChatRouteSummary,
+  ChatSession,
+  SkillConfirmPayload,
+  StepStatusItem,
+  VerificationSummary,
+} from '@/api'
 
 export const useChatStore = defineStore('chat', () => {
   const sessions = ref<ChatSession[]>([])
@@ -9,26 +18,35 @@ export const useChatStore = defineStore('chat', () => {
   const isLoading = ref(false)
   const isSending = ref(false)
 
-  // Phase 2 新增：流式输出状态
   const isStreaming = ref(false)
-  // Phase 2：当前会话的 running_summary（存在时前端显示压缩提示条）
   const currentRunningSummary = ref<string | null>(null)
+  const currentRunningSummaryMode = ref<string | null>(null)
   const currentContextWindow = ref<ChatContextWindow | null>(null)
-  // Phase 2：流式输出时正在追加的 AI 消息临时 ID
   const streamingMessageId = ref<number | null>(null)
 
-  // Phase 2：压缩进度 UI（百分比 + ETA）
-  const isCompressing = ref(false)
-  const compressProgress = ref(0) // 0-100
-  const compressEtaSeconds = ref<number | null>(null)
-  const lastCompressPercent = ref<number | null>(null) // 本次压缩覆盖比例（用于摘要历史页展示）
+  const taskStatus = ref<'idle' | 'queued' | 'running' | 'done' | 'failed'>('idle')
+  const taskKind = ref<string>('')
+  const isPreCompacting = ref(false)
+  const preCompactionMessage = ref('')
+  const preCompactionShownCount = ref(0)
+  const preCompactionTotalDurationMs = ref(0)
+  const preCompactionLastDurationMs = ref<number | null>(null)
+  const preCompactionStartedAt = ref<number | null>(null)
+  const preCompactionAverageDurationMs = computed(() => {
+    if (preCompactionShownCount.value <= 0) return 0
+    return Math.round(preCompactionTotalDurationMs.value / preCompactionShownCount.value)
+  })
+
+  const pendingSkillConfirm = ref<SkillConfirmPayload | null>(null)
 
   function setCurrentSession(sessionId: string | null) {
     currentSessionId.value = sessionId
     if (!sessionId) {
       messages.value = []
       currentRunningSummary.value = null
+      currentRunningSummaryMode.value = null
       currentContextWindow.value = null
+      pendingSkillConfirm.value = null
     }
   }
 
@@ -44,7 +62,49 @@ export const useChatStore = defineStore('chat', () => {
     messages.value.push(msg)
   }
 
-  // Phase 2：追加 token 到最后一条 assistant 消息（流式输出）
+  function removeMessageById(messageId: number) {
+    messages.value = messages.value.filter((msg) => msg.id !== messageId)
+  }
+
+  function updateMessageRouteSummary(messageId: number, routeSummary: ChatRouteSummary | null | undefined) {
+    const target = messages.value.find((msg) => msg.id === messageId)
+    if (target) {
+      target.route_summary = routeSummary || null
+    }
+  }
+
+  function updateMessagePlanPreview(messageId: number, items: PlanPreviewItem[] | null | undefined) {
+    const target = messages.value.find((msg) => msg.id === messageId)
+    if (target) {
+      target.plan_preview = items || []
+    }
+  }
+
+  function upsertMessageStepStatus(messageId: number, item: StepStatusItem) {
+    const target = messages.value.find((msg) => msg.id === messageId)
+    if (!target) return
+    const list = target.step_statuses || []
+    const idx = list.findIndex((existing) => existing.step_id === item.step_id)
+    if (idx >= 0) {
+      list[idx] = { ...list[idx], ...item }
+    } else {
+      list.push(item)
+    }
+    target.step_statuses = [...list]
+    if (target.plan_preview?.length) {
+      target.plan_preview = target.plan_preview.map((preview) =>
+        preview.step_id === item.step_id ? { ...preview, status: item.status } : preview,
+      )
+    }
+  }
+
+  function updateMessageVerificationSummary(messageId: number, summary: VerificationSummary | null | undefined) {
+    const target = messages.value.find((msg) => msg.id === messageId)
+    if (target) {
+      target.verification_summary = summary || null
+    }
+  }
+
   function appendStreamToken(token: string) {
     const last = messages.value[messages.value.length - 1]
     if (last && last.role === 'assistant' && last.id === streamingMessageId.value) {
@@ -52,7 +112,6 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
-  // Phase 2：开始流式输出，先占位一条空白 assistant 消息
   function startStreamingMessage(sessionId: string): number {
     const tempId = -(Date.now())
     streamingMessageId.value = tempId
@@ -69,28 +128,26 @@ export const useChatStore = defineStore('chat', () => {
     return tempId
   }
 
-  // Phase 2：流式输出完成
   function finishStreamingMessage() {
     isStreaming.value = false
     streamingMessageId.value = null
   }
 
-  function startCompress(etaSeconds?: number) {
-    isCompressing.value = true
-    compressProgress.value = 0
-    compressEtaSeconds.value = typeof etaSeconds === 'number' ? etaSeconds : null
+  function removeStreamingPlaceholderIfEmpty() {
+    const sid = streamingMessageId.value
+    const last = messages.value[messages.value.length - 1]
+    if (last && last.role === 'assistant' && last.id === sid && !String(last.content || '').trim()) {
+      messages.value.pop()
+    }
+    finishStreamingMessage()
   }
 
-  function updateCompressProgress(progress: number, etaSeconds?: number) {
-    compressProgress.value = Math.max(0, Math.min(100, progress))
-    if (typeof etaSeconds === 'number') compressEtaSeconds.value = etaSeconds
+  function setPendingSkillConfirm(payload: SkillConfirmPayload | null) {
+    pendingSkillConfirm.value = payload
   }
 
-  function finishCompress(percent?: number) {
-    isCompressing.value = false
-    compressProgress.value = 100
-    compressEtaSeconds.value = 0
-    if (typeof percent === 'number') lastCompressPercent.value = percent
+  function clearPendingSkillConfirm() {
+    pendingSkillConfirm.value = null
   }
 
   function addOrUpdateSession(session: ChatSession) {
@@ -111,6 +168,7 @@ export const useChatStore = defineStore('chat', () => {
       currentSessionId.value = null
       messages.value = []
       currentRunningSummary.value = null
+      currentRunningSummaryMode.value = null
       currentContextWindow.value = null
     }
   }
@@ -120,9 +178,12 @@ export const useChatStore = defineStore('chat', () => {
     if (s) s.title = title
   }
 
-  // Phase 2：更新当前会话的 running_summary
   function setRunningSummary(summary: string | null) {
     currentRunningSummary.value = summary || null
+  }
+
+  function setRunningSummaryMode(mode: string | null | undefined) {
+    currentRunningSummaryMode.value = mode || null
   }
 
   function setContextWindow(contextWindow: ChatContextWindow | null | undefined) {
@@ -137,6 +198,37 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
+  function setTaskStatus(status: 'idle' | 'queued' | 'running' | 'done' | 'failed', kind: string = '') {
+    taskStatus.value = status
+    taskKind.value = kind
+  }
+
+  function startPreCompaction(message = '正在压缩历史对话，以保留关键上下文…') {
+    if (!isPreCompacting.value) {
+      preCompactionShownCount.value += 1
+      preCompactionStartedAt.value = Date.now()
+    }
+    isPreCompacting.value = true
+    preCompactionMessage.value = message
+    taskStatus.value = 'running'
+    taskKind.value = 'pre_compaction'
+  }
+
+  function finishPreCompaction() {
+    if (isPreCompacting.value && typeof preCompactionStartedAt.value === 'number') {
+      const elapsedMs = Math.max(0, Date.now() - preCompactionStartedAt.value)
+      preCompactionLastDurationMs.value = elapsedMs
+      preCompactionTotalDurationMs.value += elapsedMs
+    }
+    isPreCompacting.value = false
+    preCompactionMessage.value = ''
+    preCompactionStartedAt.value = null
+    if (taskKind.value === 'pre_compaction') {
+      taskStatus.value = 'idle'
+      taskKind.value = ''
+    }
+  }
+
   function reset() {
     sessions.value = []
     currentSessionId.value = null
@@ -145,12 +237,18 @@ export const useChatStore = defineStore('chat', () => {
     isSending.value = false
     isStreaming.value = false
     currentRunningSummary.value = null
+    currentRunningSummaryMode.value = null
     currentContextWindow.value = null
     streamingMessageId.value = null
-    isCompressing.value = false
-    compressProgress.value = 0
-    compressEtaSeconds.value = null
-    lastCompressPercent.value = null
+    taskStatus.value = 'idle'
+    taskKind.value = ''
+    isPreCompacting.value = false
+    preCompactionMessage.value = ''
+    preCompactionShownCount.value = 0
+    preCompactionTotalDurationMs.value = 0
+    preCompactionLastDurationMs.value = null
+    preCompactionStartedAt.value = null
+    pendingSkillConfirm.value = null
   }
 
   return {
@@ -161,28 +259,43 @@ export const useChatStore = defineStore('chat', () => {
     isSending,
     isStreaming,
     currentRunningSummary,
+    currentRunningSummaryMode,
     currentContextWindow,
     streamingMessageId,
-    isCompressing,
-    compressProgress,
-    compressEtaSeconds,
-    lastCompressPercent,
+    taskStatus,
+    taskKind,
+    isPreCompacting,
+    preCompactionMessage,
+    preCompactionShownCount,
+    preCompactionTotalDurationMs,
+    preCompactionLastDurationMs,
+    preCompactionAverageDurationMs,
+    pendingSkillConfirm,
     setCurrentSession,
     setSessions,
     setMessages,
     appendMessage,
+    removeMessageById,
+    updateMessageRouteSummary,
+    updateMessagePlanPreview,
+    upsertMessageStepStatus,
+    updateMessageVerificationSummary,
     appendStreamToken,
     startStreamingMessage,
     finishStreamingMessage,
-    startCompress,
-    updateCompressProgress,
-    finishCompress,
+    removeStreamingPlaceholderIfEmpty,
+    setPendingSkillConfirm,
+    clearPendingSkillConfirm,
     addOrUpdateSession,
     removeSession,
     renameSession,
     setRunningSummary,
+    setRunningSummaryMode,
     setContextWindow,
     updateSessionContext,
+    setTaskStatus,
+    startPreCompaction,
+    finishPreCompaction,
     reset,
   }
 })

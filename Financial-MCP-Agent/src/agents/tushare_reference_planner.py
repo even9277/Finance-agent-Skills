@@ -190,14 +190,6 @@ def build_tushare_tool_plan(
                     reason="fund/ETF recommendation should start from the fund universe",
                 )
             )
-            tool_calls.append(
-                PlannedToolCall(
-                    tool_name="get_etf_basic_info",
-                    arguments={"query": query, "limit": 12},
-                    reason="ETF-specific recommendation benefits from ETF metadata",
-                    required=False,
-                )
-            )
             if enable_market_tools:
                 tool_calls.append(
                     PlannedToolCall(

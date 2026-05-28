@@ -7,6 +7,11 @@ from typing import Any
 
 import yaml
 
+from src.skills_v2.lifecycle import SkillStatus
+from src.skills_v2.loader import SkillLoader
+from src.skills_v2.schema_gate import validate_skill
+from src.skills_v2.snapshot import SkillSnapshotEntry, SkillSnapshotManager, build_registry_snapshot
+from src.skills_v2.version import SkillVersion, stable_hash_text
 from src.utils.logging_config import setup_logger
 
 _SRC_ROOT = Path(__file__).resolve().parent.parent
@@ -35,6 +40,7 @@ class SkillMetadata:
     spec_file: Path | None = None
     has_skill_file: bool = True
     has_skill_spec: bool = False
+    route_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 def _parse_scalar(value: str) -> Any:
@@ -211,6 +217,7 @@ class SkillRegistry:
         self.skills_dir = skills_dir or _DEFAULT_SKILLS_DIR
         self.vendor_skills_dir = vendor_skills_dir or _DEFAULT_VENDOR_SKILLS_DIR
         self._skills: dict[str, SkillMetadata] = {}
+        self._snapshot_manager = SkillSnapshotManager()
         self.refresh()
 
     def refresh(self) -> None:
@@ -259,6 +266,7 @@ class SkillRegistry:
                 skills[meta.name] = meta
 
         self._skills = skills
+        self._snapshot_manager = SkillSnapshotManager(self._build_snapshot())
         logger.info("[skill_registry] loaded %s skills", len(self._skills))
 
     @staticmethod
@@ -300,7 +308,6 @@ class SkillRegistry:
                 "get_sector_snapshot",
                 "get_sector_constituents",
                 "get_fund_basic_info",
-                "get_etf_basic_info",
                 "get_fund_nav",
                 "get_fund_market_bars",
                 "get_fund_share",
@@ -332,6 +339,11 @@ class SkillRegistry:
         scripts_dir = skill_file.parent / "scripts" if (skill_file.parent / "scripts").exists() else None
         spec_file = skill_file.parent / "skill_spec.yaml"
 
+        spec_payload = _load_yaml_file(spec_file) if spec_file.exists() else None
+        route_metadata = {}
+        if isinstance(spec_payload, dict) and isinstance(spec_payload.get("route_metadata"), dict):
+            route_metadata = dict(spec_payload.get("route_metadata") or {})
+
         return SkillMetadata(
             name=canonical_name,
             description=description,
@@ -351,6 +363,7 @@ class SkillRegistry:
             spec_file=spec_file if spec_file.exists() else None,
             has_skill_file=skill_file.exists(),
             has_skill_spec=spec_file.exists(),
+            route_metadata=route_metadata,
         )
 
     def list_skills(self) -> list[SkillMetadata]:
@@ -381,6 +394,7 @@ class SkillRegistry:
         ]
 
     def discoverable_sop_skills(self) -> list[SkillMetadata]:
+        """含 skill_spec.yaml 的 SOP：可被确定性执行器可靠执行。"""
         return [
             skill
             for skill in self.list_skills()
@@ -389,6 +403,23 @@ class SkillRegistry:
             and skill.has_skill_file
             and skill.has_skill_spec
         ]
+
+    def workspace_sop_skills_for_router(self) -> list[SkillMetadata]:
+        """进入路由提示词的工作区 SOP（仅需 SKILL.md）；无 spec 时仍可被 LLM 选中，执行前会降级。"""
+        return [
+            skill
+            for skill in self.list_skills()
+            if skill.source == "workspace"
+            and skill.name != "tushare-data"
+            and skill.has_skill_file
+        ]
+
+    def discoverable_sop_skills_for_router(self) -> list[dict[str, Any]]:
+        """Lightweight metadata for stage1 routing; never exposes full SKILL.md."""
+        from src.skills.route_metadata import RouteMetadataIndex
+
+        index = RouteMetadataIndex.build_from_registry(self)
+        return [item.prompt_summary() for item in index.items]
 
     def load_skill_spec(self, name: str) -> dict[str, Any] | None:
         skill = self.get_skill(name)
@@ -437,6 +468,72 @@ class SkillRegistry:
                 }
             )
         return results
+
+    def _skill_hashes(self, skill: SkillMetadata) -> tuple[str, str]:
+        spec_text = ""
+        if skill.spec_file and skill.spec_file.exists():
+            spec_text = skill.spec_file.read_text(encoding="utf-8")
+        skill_text = ""
+        if skill.skill_file and skill.skill_file.exists():
+            skill_text = skill.skill_file.read_text(encoding="utf-8")
+        reference_texts: list[str] = []
+        if skill.skill_dir is not None:
+            for ref in sorted((skill.skill_dir / "references").rglob("*.md")) if (skill.skill_dir / "references").exists() else []:
+                reference_texts.append(ref.read_text(encoding="utf-8"))
+        return stable_hash_text(spec_text or skill_text), stable_hash_text("\n".join(reference_texts))
+
+    def _build_snapshot(self):
+        try:
+            from src.agents.tool_discovery.executable_registry import default_tool_specs
+        except Exception:
+            tool_specs = {}
+        else:
+            tool_specs = default_tool_specs()
+        evidence_types = {spec.evidence_type for spec in tool_specs.values()}
+        allowed_tool_names = set(tool_specs)
+        entries: list[SkillSnapshotEntry] = []
+        for skill in self._skills.values():
+            spec = self.load_skill_spec(skill.name) or {}
+            spec_hash, reference_hash = self._skill_hashes(skill)
+            report = validate_skill(
+                spec,
+                allowed_tool_names=allowed_tool_names,
+                evidence_types=evidence_types,
+                spec_hash=spec_hash,
+                reference_hash=reference_hash,
+            ) if skill.has_skill_spec else None
+            status = SkillStatus.ACTIVE if (report is None or report.passed) else SkillStatus.DISABLED
+            entries.append(
+                SkillSnapshotEntry(
+                    skill_id=skill.name,
+                    status=status,
+                    skill_version=SkillVersion(str(spec.get("version") or skill.version or "0.1.0")).normalized,
+                    spec_hash=spec_hash,
+                    reference_hash=reference_hash,
+                    source=skill.source,
+                    disabled_reason=report.disabled_reason if report else "",
+                )
+            )
+        return build_registry_snapshot(entries)
+
+    def propose_snapshot(self):
+        """提出新快照但不立即切换，给 schema gate / shadow 流程留缓冲。"""
+        return self._snapshot_manager.propose_snapshot(self._build_snapshot())
+
+    def activate_snapshot(self, registry_version: str | None = None):
+        return self._snapshot_manager.activate_snapshot(registry_version)
+
+    def rollback_snapshot(self):
+        return self._snapshot_manager.rollback_snapshot()
+
+    def get_active_snapshot(self):
+        return self._snapshot_manager.get_active_snapshot()
+
+    def get_last_known_good_snapshot(self):
+        return self._snapshot_manager.get_last_known_good_snapshot()
+
+    def get_loader(self, token_budget_per_stage: int = 2048) -> SkillLoader:
+        return SkillLoader(registry=self, token_budget_per_stage=token_budget_per_stage)
 
     def find_references(self, name: str, query: str, limit: int = 5) -> list[dict[str, str]]:
         skill = self.get_skill(name)

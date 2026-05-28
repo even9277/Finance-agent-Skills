@@ -1,0 +1,2 @@
+{"case_id":"route_smoke_001","turns":[{"role":"user","content":"华安黄金 ETF 和博时黄金 ETF 哪个适合我"}],"gold":{"final_route":"financial-sop","skill_id":"fund-compare"},"labels":["sop_fund_compare"]}
+{"case_id":"route_smoke_002","turns":[{"role":"user","content":"ETF 和 LOF 有什么区别"}],"gold":{"final_route":"fallback"},"labels":["fallback_concept"]}

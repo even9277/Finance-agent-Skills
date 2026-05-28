@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,6 +42,14 @@ try:
 except Exception:
     pass
 
+# FIX-4: canonical symbol utility
+import sys as _sys
+
+_BACKEND_DIR = str(Path(__file__).resolve().parents[3] / "backend")
+if _BACKEND_DIR not in _sys.path:
+    _sys.path.insert(0, _BACKEND_DIR)
+from services.stock_resolver import canonicalize_symbol  # noqa: E402
+
 
 @dataclass(slots=True)
 class SkillExecutionResult:
@@ -48,6 +57,38 @@ class SkillExecutionResult:
     selected_skill: str
     trace: dict[str, Any] = field(default_factory=dict)
     used_fallback: bool = False
+    failure_code: str = ""         # FIX-9: internal failure code
+
+
+# ═══════════════════════════════════════════════════════════════
+# FIX-9: Failure Taxonomy
+# ═══════════════════════════════════════════════════════════════
+
+_FAILURE_USER_CATEGORY: dict[str, str] = {
+    # internal_code -> user-facing category
+    "symbol_resolution_failed": "data_unavailable",
+    "tool_timeout": "data_unavailable",
+    "tool_empty_payload": "data_unavailable",
+    "tool_invocation_error": "data_unavailable",
+    "insufficient_evidence": "data_incomplete",
+    "evidence_mismatch": "data_incomplete",
+    "wrong_mode_or_policy": "routing_error",
+    "skill_disabled": "routing_error",
+    "agent_invoke_error": "system_error",
+    "unknown_error": "system_error",
+}
+
+_USER_CATEGORY_MESSAGE: dict[str, str] = {
+    "data_unavailable": "当前无法获取所需数据，请稍后重试或更换查询方式。",
+    "data_incomplete": "获取到的数据不够完整，分析结果可能不够准确。",
+    "routing_error": "当前问题的处理路径有误，请尝试换一种方式提问。",
+    "system_error": "系统遇到了一些问题，请稍后重试。",
+}
+
+
+def _user_facing_failure_message(failure_code: str, fallback_msg: str = "") -> str:
+    category = _FAILURE_USER_CATEGORY.get(failure_code, "system_error")
+    return _USER_CATEGORY_MESSAGE.get(category, fallback_msg or "请稍后重试。")
 
 
 _VERIFIABLE_DATA_KEYWORDS = [
@@ -188,7 +229,7 @@ def _build_prompt(
     *,
     user_message: str,
     memory_context: str,
-    running_summary: str,
+    answer_policy_context: str,
     profile_summary: str,
     resolved_company: str | None,
     resolved_symbol: str | None,
@@ -218,8 +259,8 @@ def _build_prompt(
         sections.append(f"【建议工具计划】\n{tool_plan_summary}")
     if memory_context:
         sections.append(f"【memory_context】\n{memory_context[:1600]}")
-    if running_summary:
-        sections.append(f"【running_summary】\n{running_summary[:600]}")
+    if answer_policy_context:
+        sections.append(answer_policy_context[:600])
     if profile_summary:
         sections.append(f"【用户画像摘要】\n{profile_summary}")
     if resolved_company or resolved_symbol:
@@ -646,6 +687,132 @@ def _sop_missing_evidence_message(query: str, reasons: list[str]) -> str:
     )
 
 
+_MULTI_STOCK_INTENT_RE = re.compile(r"(推荐|挑|选).{0,8}([2-9]|[一二三四五六七八九])\s*(只|个|支)?(股票|标的)")
+_COMPARE_INTENT_RE = re.compile(r"(比较|对比|pk|vs|和)")
+_A_SHARE_CODE_RE = re.compile(r"(\b\d{6}\b|(?:SZ|SH)\d{6}|\d{6}\.(?:SZ|SH))", re.IGNORECASE)
+
+
+def _has_resolved_stock_subject(resolved_entities: list[str], skill_params: dict[str, Any], effective_query: str) -> bool:
+    if any(str(item).strip() for item in resolved_entities):
+        return True
+    candidate_entities = skill_params.get("candidate_entities")
+    if isinstance(candidate_entities, list) and any(str(item).strip() for item in candidate_entities):
+        return True
+    entities = skill_params.get("entities")
+    if isinstance(entities, list):
+        for item in entities:
+            if isinstance(item, dict):
+                name = str(item.get("display_name") or item.get("name") or "").strip()
+                if name:
+                    return True
+            elif str(item).strip():
+                return True
+    return bool(_A_SHARE_CODE_RE.search(effective_query or ""))
+
+
+def _looks_like_multi_stock_intent(effective_query: str) -> bool:
+    text = str(effective_query or "")
+    if _MULTI_STOCK_INTENT_RE.search(text):
+        return True
+    return bool(_COMPARE_INTENT_RE.search(text))
+
+
+def _slot_clarification_message(skill_name: str) -> str:
+    if skill_name == "stock-first-pass":
+        return "这个技能一次只支持分析一只股票。请先告诉我一个明确标的（股票名称或6位代码），我再继续。"
+    return "需要先补充一个明确标的后才能继续分析。"
+
+
+def _skill_clarification_message(skill_name: str, skill_params: dict[str, Any]) -> str:
+    question = str(skill_params.get("clarification_question") or "").strip()
+    if question:
+        return question
+    if skill_name == "fund-compare":
+        return "请至少告诉我两只明确的基金或 ETF 名称/代码，我再继续比较。"
+    if skill_name == "sector-hotspot-brief":
+        candidates = [str(item).strip() for item in (skill_params.get("candidate_sector_names") or []) if str(item).strip()]
+        if candidates:
+            return f"你想看的板块可能对应 {'、'.join(candidates[:4])}。请明确说一个申万行业名称。"
+        return "请直接说一个更明确的申万行业名称，比如电力设备、汽车、计算机。"
+    return _slot_clarification_message(skill_name)
+
+
+def _sector_graceful_decline_message(skill_params: dict[str, Any]) -> str:
+    raw_sector_query = str(skill_params.get("raw_sector_query") or "").strip()
+    sector_name = str(skill_params.get("sector_name") or "").strip()
+    label = raw_sector_query or sector_name or "这个板块"
+    return f"这次还没法把“{label}”稳定映射到可执行的申万行业指数，所以我先不直接下结论。请换成更明确的申万行业名称后我再继续。"
+
+
+def _apply_sector_contract_to_plan(tool_plan: Any, skill_params: dict[str, Any]) -> None:
+    sector_name = str(skill_params.get("sector_name") or "").strip()
+    index_code = str(skill_params.get("index_code") or "").strip()
+    if not sector_name and not index_code:
+        return
+
+    for item in tool_plan.tool_calls:
+        if item.tool_name in {"get_sector_snapshot", "get_sector_constituents"} and sector_name:
+            item.arguments["sector_name"] = sector_name
+        if item.tool_name == "get_index_bars" and index_code:
+            item.arguments["symbol"] = index_code
+            item.arguments.pop("query", None)
+
+
+def _build_preflight_skill_result(
+    *,
+    selected_skill: str,
+    skill_name: str,
+    analysis_mode: str,
+    execution_policy: str,
+    execution_path: str,
+    planner_type: str,
+    planned_tools: list[str],
+    tool_policy: dict[str, list[str]],
+    skill_params: dict[str, Any],
+    reply_mode: str,
+    reply_text: str,
+    failure_code: str,
+    preflight_result: str,
+    policy_violation_names: list[str],
+    route_confidence: float | None,
+) -> SkillExecutionResult:
+    reasons = [preflight_result]
+    observability_metrics = _execution_observability_metrics(
+        route_confidence=route_confidence,
+        planned_tool_names=planned_tools,
+        tool_results=[],
+        degrade_policy={"current_stage": "graceful_decline" if reply_mode == "graceful-decline" else "need_clarification"},
+        policy_violation_names=policy_violation_names,
+        evidence_ok=False,
+    )
+    return SkillExecutionResult(
+        reply_text=reply_text,
+        selected_skill=selected_skill,
+        trace={
+            "selected_skill_family": "financial-sop",
+            "selected_skill": selected_skill,
+            "skill_name": skill_name,
+            "analysis_mode": analysis_mode,
+            "execution_policy": execution_policy,
+            "execution_path": execution_path,
+            "planner_type": planner_type,
+            "planned_tools": planned_tools,
+            "tool_batch_size": len(planned_tools),
+            "tool_policy": tool_policy,
+            "reply_mode": reply_mode,
+            "used_tools": False,
+            "evidence_ok": False,
+            "missing_evidence_reasons": reasons,
+            "failure_code": failure_code,
+            "preflight_result": preflight_result,
+            "skill_params": skill_params,
+            "policy_violations": policy_violation_names,
+            **observability_metrics,
+        },
+        failure_code=failure_code,
+    )
+
+
 def _sop_skill_prompt(
     *,
     skill_name: str,
@@ -680,7 +847,7 @@ def _build_sop_synthesis_prompt(
     *,
     user_message: str,
     memory_context: str,
-    running_summary: str,
+    answer_policy_context: str,
     profile_summary: str,
     skill_name: str,
     skill_spec: dict[str, Any],
@@ -700,8 +867,8 @@ def _build_sop_synthesis_prompt(
         sections.append(reference_block)
     if memory_context:
         sections.append(f"【memory_context】\n{memory_context[:1600]}")
-    if running_summary:
-        sections.append(f"【running_summary】\n{running_summary[:600]}")
+    if answer_policy_context:
+        sections.append(answer_policy_context[:600])
     if profile_summary:
         sections.append(f"【用户画像摘要】\n{profile_summary}")
     tool_lines = []
@@ -722,7 +889,7 @@ async def _run_sop_deterministic_execution(
     skill_markdown: str,
     user_message: str,
     memory_context: str,
-    running_summary: str,
+    answer_policy_context: str,
     profile_summary: str,
     tool_plan: Any,
     concurrent: bool,
@@ -752,7 +919,7 @@ async def _run_sop_deterministic_execution(
     synthesis_prompt = _build_sop_synthesis_prompt(
         user_message=user_message,
         memory_context=memory_context,
-        running_summary=running_summary,
+        answer_policy_context=answer_policy_context,
         profile_summary=profile_summary,
         skill_name=skill_name,
         skill_spec=skill_spec,
@@ -775,7 +942,7 @@ async def _run_sop_deterministic_execution(
         data={
             "model_name": synthesis_model,
             "memory_context_used": bool(memory_context),
-            "running_summary_used": bool(running_summary),
+            "answer_policy_context_used": bool(answer_policy_context),
             "profile_summary_used": bool(profile_summary),
             "tool_result_refs": [
                 result.get("tool_result_id")
@@ -819,7 +986,7 @@ async def _execute_financial_sop_skill(
     user_message: str,
     effective_query: str,
     memory_context: str,
-    running_summary: str,
+    answer_policy_context: str,
     profile_summary: str,
     route_arguments: dict[str, Any],
     analysis_mode: str,
@@ -851,7 +1018,45 @@ async def _execute_financial_sop_skill(
         )
 
     tool_policy = _skill_tool_policy(skill_spec)
+    failure_code = ""
+    preflight_result = "not_run"
     resolved_entities = [str(item) for item in route_arguments.get("candidate_entities") or [] if str(item)]
+    if not resolved_entities:
+        for item in route_arguments.get("entities") or []:
+            if isinstance(item, dict):
+                name = str(item.get("display_name") or item.get("name") or "").strip()
+                if name:
+                    resolved_entities.append(name)
+            elif str(item).strip():
+                resolved_entities.append(str(item).strip())
+    skill_params = route_arguments.get("skill_params")
+    if not isinstance(skill_params, dict):
+        skill_params = {}
+    input_contract = skill_spec.get("input_contract") if isinstance(skill_spec.get("input_contract"), dict) else {}
+    required_slots = [str(item) for item in (input_contract.get("required_slots") or []) if str(item)]
+    missing_slot_policy = str(input_contract.get("on_missing_slots") or "").strip().lower()
+    requires_stock_subject = "stock_subject" in required_slots
+    if (
+        requires_stock_subject
+        and missing_slot_policy == "ask_clarification"
+        and not _has_resolved_stock_subject(resolved_entities, skill_params, effective_query)
+        and _looks_like_multi_stock_intent(effective_query)
+    ):
+        reply_text = _slot_clarification_message(skill_name)
+        log_reply_completed(mode="slot-missing", used_tools=False, evidence_ok=False)
+        return SkillExecutionResult(
+            reply_text=reply_text,
+            selected_skill=selected_skill,
+            trace={
+                "selected_skill_family": "financial-sop",
+                "skill_name": skill_name,
+                "analysis_mode": analysis_mode,
+                "execution_policy": execution_policy,
+                "reply_mode": "slot-missing",
+                "missing_slots": ["stock_subject"],
+            },
+            failure_code="routing_error",
+        )
     with trace_span(
         "planner",
         stage="executor",
@@ -859,6 +1064,7 @@ async def _execute_financial_sop_skill(
             "planner_type": "skill_planner",
             "skill_name": skill_name,
             "resolved_entities": resolved_entities,
+            "skill_params_keys": sorted(skill_params.keys()),
         },
     ):
         tool_plan = build_skill_tool_plan(
@@ -866,6 +1072,7 @@ async def _execute_financial_sop_skill(
             skill_spec=skill_spec,
             user_message=effective_query,
             resolved_entities=resolved_entities,
+            skill_params=skill_params,
         )
     original_planned_tools = [item.tool_name for item in tool_plan.tool_calls]
     policy_violation_names = _policy_violation_names(original_planned_tools, tool_policy["allowed_tools"])
@@ -957,6 +1164,81 @@ async def _execute_financial_sop_skill(
             },
         )
 
+    with trace_span(
+        "preflight",
+        stage="executor",
+        data={
+            "skill_name": skill_name,
+            "planned_tools": planned_tools,
+            "skill_params_keys": sorted(skill_params.keys()),
+        },
+    ):
+        if skill_params.get("need_clarification"):
+            failure_code = str(skill_params.get("failure_code") or "need_clarification")
+            preflight_result = "need_clarification"
+            reply_text = _skill_clarification_message(skill_name, skill_params)
+            log_degrade_transition(
+                skill_name=skill_name,
+                analysis_mode=analysis_mode,
+                stage="preflight",
+                reason=preflight_result,
+                outcome="need_clarification",
+            )
+            log_reply_completed(mode="need-clarification", used_tools=False, evidence_ok=False, failure_code=failure_code)
+            return _build_preflight_skill_result(
+                selected_skill=selected_skill,
+                skill_name=skill_name,
+                analysis_mode=analysis_mode,
+                execution_policy=execution_policy,
+                execution_path=execution_path,
+                planner_type=tool_plan.planner_type,
+                planned_tools=planned_tools,
+                tool_policy=tool_policy,
+                skill_params=skill_params,
+                reply_mode="need-clarification",
+                reply_text=reply_text,
+                failure_code=failure_code,
+                preflight_result=preflight_result,
+                policy_violation_names=policy_violation_names,
+                route_confidence=route_confidence,
+            )
+
+        if skill_name == "sector-hotspot-brief":
+            sector_name = str(skill_params.get("sector_name") or "").strip()
+            index_code = str(skill_params.get("index_code") or "").strip()
+            if sector_name and index_code:
+                _apply_sector_contract_to_plan(tool_plan, skill_params)
+                preflight_result = "sector_ready"
+            else:
+                failure_code = str(skill_params.get("failure_code") or "sector_unresolved")
+                preflight_result = "sector_unresolved"
+                reply_text = _sector_graceful_decline_message(skill_params)
+                log_degrade_transition(
+                    skill_name=skill_name,
+                    analysis_mode=analysis_mode,
+                    stage="preflight",
+                    reason=preflight_result,
+                    outcome="graceful_decline",
+                )
+                log_reply_completed(mode="graceful-decline", used_tools=False, evidence_ok=False, failure_code=failure_code)
+                return _build_preflight_skill_result(
+                    selected_skill=selected_skill,
+                    skill_name=skill_name,
+                    analysis_mode=analysis_mode,
+                    execution_policy=execution_policy,
+                    execution_path=execution_path,
+                    planner_type=tool_plan.planner_type,
+                    planned_tools=planned_tools,
+                    tool_policy=tool_policy,
+                    skill_params=skill_params,
+                    reply_mode="graceful-decline",
+                    reply_text=reply_text,
+                    failure_code=failure_code,
+                    preflight_result=preflight_result,
+                    policy_violation_names=policy_violation_names,
+                    route_confidence=route_confidence,
+                )
+
     try:
         reply_mode = "skill"
         if execution_path == "hybrid":
@@ -966,7 +1248,7 @@ async def _execute_financial_sop_skill(
                 skill_markdown=skill_markdown,
                 user_message=effective_query,
                 memory_context=memory_context,
-                running_summary=running_summary,
+                answer_policy_context=answer_policy_context,
                 profile_summary=profile_summary,
                 tool_plan=tool_plan,
                 concurrent=enable_tool_prefetch_concurrency,
@@ -978,7 +1260,7 @@ async def _execute_financial_sop_skill(
                 skill_markdown=skill_markdown,
                 user_message=effective_query,
                 memory_context=memory_context,
-                running_summary=running_summary,
+                answer_policy_context=answer_policy_context,
                 profile_summary=profile_summary,
                 tool_plan=tool_plan,
                 concurrent=enable_tool_prefetch_concurrency,
@@ -1042,6 +1324,7 @@ async def _execute_financial_sop_skill(
         )
         if not evidence.evidence_ok:
             reply_mode = "evidence-missing"
+            failure_code = "insufficient_evidence"
             reply_text = _sop_missing_evidence_message(user_message, evidence.missing_evidence_reasons)
             log_reply_completed(
                 mode="evidence-missing",
@@ -1066,6 +1349,7 @@ async def _execute_financial_sop_skill(
     except Exception as exc:
         logger.warning("[skill_executor] financial-sop invoke failed: %s", exc, exc_info=True)
         reply_mode = "skill-error"
+        failure_code = "agent_invoke_error"
         reply_text = _format_tool_failure_message(user_message, str(exc))
         tool_results = []
         artifact_refs = {"prompt_ref": None, "reply_ref": None, "payload_refs": []}
@@ -1137,6 +1421,8 @@ async def _execute_financial_sop_skill(
             "degrade_history": degrade_history,
             "final_degrade_outcome": degrade_history[-1]["outcome"] if degrade_history else "not_triggered",
             "reply_mode": reply_mode,
+            "failure_code": failure_code,
+            "preflight_result": preflight_result,
             "policy_violations": policy_violation_names,
             "router_model": router_model,
             "resolver_model": resolver_model,
@@ -1144,6 +1430,7 @@ async def _execute_financial_sop_skill(
             "reference_titles": [item["title"] for item in tool_plan.references],
             "available_tool_names": tool_policy["allowed_tools"],
             "prefetched_tool_names": [tool_name for tool_name, _ in tool_results],
+            "skill_params": skill_params,
             "official_skill_source": f"workspace:{skill_name}",
             "prompt_ref": artifact_refs.get("prompt_ref"),
             "reply_ref": artifact_refs.get("reply_ref"),
@@ -1151,6 +1438,7 @@ async def _execute_financial_sop_skill(
             "claim_ref": claim_artifact.get("path") if claim_artifact else None,
             **observability_metrics,
         },
+        failure_code=failure_code,
     )
 
 
@@ -1244,7 +1532,7 @@ def _deterministic_candidate_symbols(
     for row in payload:
         if not isinstance(row, dict):
             continue
-        ts_code = str(row.get("ts_code") or "").strip()
+        ts_code = canonicalize_symbol(str(row.get("ts_code") or "").strip())
         if ts_code and ts_code not in symbols:
             symbols.append(ts_code)
         if len(symbols) >= top_n:
@@ -1379,7 +1667,7 @@ def _build_synthesis_prompt(
     *,
     user_message: str,
     memory_context: str,
-    running_summary: str,
+    answer_policy_context: str,
     profile_summary: str,
     selected_skill: str,
     analysis_mode: str,
@@ -1399,8 +1687,8 @@ def _build_synthesis_prompt(
         sections.append(f"【技能描述】\n{meta.description}")
     if memory_context:
         sections.append(f"【memory_context】\n{memory_context[:1600]}")
-    if running_summary:
-        sections.append(f"【running_summary】\n{running_summary[:600]}")
+    if answer_policy_context:
+        sections.append(answer_policy_context[:600])
     if profile_summary:
         sections.append(f"【用户画像摘要】\n{profile_summary}")
     if resolved_company or resolved_symbol:
@@ -1420,7 +1708,7 @@ async def _run_deterministic_skill_execution(
     *,
     user_message: str,
     memory_context: str,
-    running_summary: str,
+    answer_policy_context: str,
     profile_summary: str,
     selected_skill: str,
     analysis_mode: str,
@@ -1445,7 +1733,7 @@ async def _run_deterministic_skill_execution(
     synthesis_prompt = _build_synthesis_prompt(
         user_message=user_message,
         memory_context=memory_context,
-        running_summary=running_summary,
+        answer_policy_context=answer_policy_context,
         profile_summary=profile_summary,
         selected_skill=selected_skill,
         analysis_mode=analysis_mode,
@@ -1469,7 +1757,7 @@ async def _run_deterministic_skill_execution(
         data={
             "model_name": synthesis_model,
             "memory_context_used": bool(memory_context),
-            "running_summary_used": bool(running_summary),
+            "answer_policy_context_used": bool(answer_policy_context),
             "profile_summary_used": bool(profile_summary),
             "tool_result_refs": [
                 result.get("tool_result_id")
@@ -1504,7 +1792,7 @@ async def execute_skill(
     selected_skill: str,
     user_message: str,
     memory_context: str = "",
-    running_summary: str = "",
+    answer_policy_context: str = "",
     profile_summary: str = "",
     session_id: str | None = None,
     user_id: str | None = None,
@@ -1532,6 +1820,10 @@ async def execute_skill(
     route_confidence = float((route_trace or {}).get("confidence") or 0.0)
     route_arguments = (route_trace or {}).get("arguments") or {}
     effective_query = str(route_arguments.get("effective_query") or user_message).strip() or user_message
+    # FIX-1: policy-driven evidence gate
+    grounding_policy = str((route_trace or {}).get("grounding_policy") or "")
+    claim_policy = str((route_trace or {}).get("claim_policy") or "")
+    route_kind = str((route_trace or {}).get("route_kind") or "")
     is_fund_query = _contains_any(effective_query, ("基金", "etf", "lof", "qdii", "联接"))
     execution_path = "deterministic" if _should_use_deterministic_path(
         analysis_mode=analysis_mode,
@@ -1581,7 +1873,7 @@ async def execute_skill(
                 user_message=user_message,
                 effective_query=effective_query,
                 memory_context=memory_context,
-                running_summary=running_summary,
+                answer_policy_context=answer_policy_context,
                 profile_summary=profile_summary,
                 route_arguments=route_arguments,
                 analysis_mode=analysis_mode,
@@ -1607,16 +1899,23 @@ async def execute_skill(
                 reply_text=reply_text,
                 selected_skill=selected_skill,
                 trace={"enabled": False, "reason": "skill disabled"},
+                failure_code="skill_disabled",
             )
 
         company_name = None
         stock_code = None
+        # FIX-3: pass inherited entity ID as session symbol hint
+        _inherited_entity_id = str(route_arguments.get("inherited_entity_id") or "").strip()
+        _session_symbols = [_inherited_entity_id] if _inherited_entity_id else None
         if analysis_mode in {"single_stock_data", "single_stock_fundamental"} and not is_fund_query:
             try:
                 from backend.services.stock_resolver import resolve_stock
 
                 log_model_stage(stage="resolver", model=resolver_model, execution_path=execution_path)
-                company_name, stock_code = await resolve_stock(effective_query)
+                company_name, stock_code = await resolve_stock(
+                    effective_query,
+                    session_symbols=_session_symbols,
+                )
             except Exception as exc:
                 logger.warning("[skill_executor] pre-resolve hint failed: %s", exc)
 
@@ -1652,7 +1951,7 @@ async def execute_skill(
         prompt = _build_prompt(
             user_message=effective_query,
             memory_context=memory_context,
-            running_summary=running_summary,
+            answer_policy_context=answer_policy_context,
             profile_summary=profile_summary,
             resolved_company=company_name,
             resolved_symbol=stock_code,
@@ -1667,7 +1966,7 @@ async def execute_skill(
                 reply_text, tool_results, evidence_response, artifact_refs = await _run_deterministic_skill_execution(
                     user_message=effective_query,
                     memory_context=memory_context,
-                    running_summary=running_summary,
+                    answer_policy_context=answer_policy_context,
                     profile_summary=profile_summary,
                     selected_skill=selected_skill,
                     analysis_mode=analysis_mode,
@@ -1696,7 +1995,7 @@ async def execute_skill(
                     data={
                         "model_name": synthesis_model,
                         "memory_context_used": bool(memory_context),
-                        "running_summary_used": bool(running_summary),
+                        "answer_policy_context_used": bool(answer_policy_context),
                         "profile_summary_used": bool(profile_summary),
                     },
                 ):
@@ -1779,8 +2078,17 @@ async def execute_skill(
                 policy_violation_names=[],
                 evidence_ok=evidence.evidence_ok,
             )
-            if _needs_verifiable_data(effective_query) and not evidence.evidence_ok:
+            # FIX-1: evidence gate driven by grounding_policy instead of keywords
+            evidence_gate_triggered = (
+                grounding_policy == "required" and not evidence.evidence_ok
+            ) or (
+                not grounding_policy
+                and _needs_verifiable_data(effective_query)
+                and not evidence.evidence_ok
+            )
+            if evidence_gate_triggered:
                 reply_mode = "evidence-missing"
+                failure_code = "insufficient_evidence"
                 reply_text = _missing_evidence_message(user_message)
                 log_reply_completed(
                     mode="evidence-missing",
@@ -1790,8 +2098,20 @@ async def execute_skill(
                     missing_evidence_reasons=evidence.missing_evidence_reasons,
                 )
             else:
+                # FIX-2: tier-aware reply qualification
+                if evidence.tier == "partial" and reply_text:
+                    partial_disclaimer = (
+                        "⚠️ 以下分析基于部分数据，"
+                        "部分维度（如{}）的数据未能获取，仅供参考。\n\n".format(
+                            "、".join(evidence.missing_dimensions) or "未知维度"
+                        )
+                    )
+                    reply_text = partial_disclaimer + reply_text
+                elif evidence.tier == "none" and claim_policy == "abstain":
+                    reply_text = _missing_evidence_message(user_message)
+                    reply_mode = "evidence-missing"
                 log_reply_completed(
-                    mode="skill",
+                    mode=reply_mode or "skill",
                     used_tools=used_tools,
                     successful_tools=evidence.successful_tools,
                     evidence_ok=evidence.evidence_ok,
@@ -1799,6 +2119,7 @@ async def execute_skill(
         except Exception as exc:
             logger.warning("[skill_executor] agent invoke failed: %s", exc, exc_info=True)
             reply_mode = "skill-error"
+            failure_code = "agent_invoke_error"
             reply_text = _format_tool_failure_message(user_message, str(exc))
             used_tools = False
             tool_results = []
@@ -1838,6 +2159,7 @@ async def execute_skill(
             )
             log_reply_completed(mode="skill-error", used_tools=False, error=str(exc), evidence_ok=False)
 
+        _final_failure_code = locals().get("failure_code", "")
         return SkillExecutionResult(
             reply_text=reply_text.strip(),
             selected_skill=selected_skill,
@@ -1847,10 +2169,17 @@ async def execute_skill(
                 "resolved_company": company_name,
                 "resolved_symbol": stock_code,
                 "used_tools": used_tools,
+                "failure_code": _final_failure_code,
                 "skill_aliases": get_skill_registry().get_skill(_source_skill_name(selected_skill)).aliases
                 if get_skill_registry().get_skill(_source_skill_name(selected_skill))
                 else [],
                 "analysis_mode": analysis_mode,
+                "route_kind": route_kind,
+                "grounding_policy": grounding_policy,
+                "claim_policy": claim_policy,
+                "evidence_tier": getattr(locals().get("evidence"), "tier", ""),
+                "evidence_missing_dimensions": getattr(locals().get("evidence"), "missing_dimensions", []),
+                "evidence_allowed_claim_level": getattr(locals().get("evidence"), "allowed_claim_level", ""),
                 "execution_policy": execution_policy,
                 "execution_path": execution_path,
                 "planner_type": tool_plan.planner_type,

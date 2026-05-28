@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any, Literal, Union
+
+from pydantic import BaseModel, Field
 
 from src.skills.skill_registry import get_skill_registry
+
+logger = logging.getLogger(__name__)
 
 try:
     from dotenv import load_dotenv
@@ -18,122 +23,187 @@ try:
 except Exception:
     pass
 
-_STOCK_CODE_RE = re.compile(r"\b(?:sh|sz)?\.?\d{6}\b", re.IGNORECASE)
 
-_REALTIME_HINTS = [
-    "今天",
-    "今日",
-    "现在",
-    "最新",
-    "最近",
-    "行情",
-    "财报",
-    "财务",
-    "估值",
-    "营收",
-    "利润",
-    "净利润",
-    "现金流",
-    "毛利率",
-    "涨幅",
-    "跌幅",
-    "成交额",
-    "北向资金",
+class DetectedEntity(BaseModel):
+    """Dead code placeholder kept for future rewrite module."""
+
+    value: str = Field(default="")
+    type: str = Field(default="")
+
+
+@dataclass(slots=True)
+class FollowUpResolution:
+    """Dead code placeholder kept for future rewrite module."""
+
+    effective_query: str
+    is_follow_up: bool
+    follow_up_confidence: float = 0.0
+    inherited_entity: str = ""
+    follow_up_dimension: str = ""
+    query_rewrite_reason: str = ""
+    route_state: dict[str, Any] | None = None
+    inherited_entity_id: str = ""
+    inherited_entity_display_name: str = ""
+    inherited_entity_type: str = ""
+
+
+def _resolve_follow_up(user_message: str, conversation_context: str) -> FollowUpResolution:
+    """Follow-up handling is intentionally disabled in this phase."""
+
+    _ = conversation_context
+    return FollowUpResolution(
+        effective_query=(user_message or "").strip(),
+        is_follow_up=False,
+        route_state={},
+    )
+
+
+class RouteSop(BaseModel):
+    route: Literal["sop"]
+    skill_id: str
+    execution_policy: Literal["deterministic", "agentic"] = "deterministic"
+
+
+class RouteTushare(BaseModel):
+    route: Literal["tushare"]
+
+
+class RouteFallback(BaseModel):
+    route: Literal["fallback"]
+
+
+RouteOutput = Annotated[
+    Union[RouteTushare, RouteFallback],
+    Field(discriminator="route"),
 ]
 
-_SECTOR_HINTS = ["板块", "行业", "指数", "概念", "资金流向"]
-_SELECTION_HINTS = ["选股", "筛选", "推荐", "组合", "适合我", "候选"]
-_FUNDAMENTAL_HINTS = ["基本面", "财务指标", "roe", "盈利能力", "报表", "估值"]
-_FUND_HINTS = ["基金", "etf", "黄金etf", "黄金基金", "联接基金", "lof", "qdii"]
-_COMPARE_HINTS = ["对比", "比较", "pk", "vs", "哪个好", "哪个更好", "二选一", "区别", "怎么选"]
-_MOVE_HINTS = ["为什么涨", "为什么跌", "异动", "拉升", "跳水", "冲高回落", "大涨", "大跌", "突然涨", "突然跌"]
-_ETF_SCREEN_HINTS = ["推荐", "筛选", "候选", "配置", "怎么买", "选哪个", "怎么选", "适合", "shortlist"]
-_HOTSPOT_HINTS = ["热点", "热度", "强势", "弱势", "龙头", "还能追", "还能看", "轮动"]
-_STOCK_FIRST_PASS_HINTS = ["值不值得", "还能买吗", "还能拿吗", "怎么看", "首轮判断", "跟踪", "财报怎么看", "能买吗"]
-_FOLLOW_UP_HINTS = [
-    "是",
-    "好的",
-    "好",
-    "请查询",
-    "继续",
-    "查一下",
-    "那就查",
-    "请继续",
-    "就这个",
-    "重新回答",
-    "请重新回答",
-    "重答",
-    "再回答",
-    "再说一遍",
-    "重来",
-]
-_FUND_ENTITY_RE = re.compile(r"[\u4e00-\u9fffA-Za-z0-9\-]{2,30}(?:ETF|etf|基金|联接|LOF|lof|QDII|qdii)")
 
-_ROUTER_PROMPT = """你是 A 股对话路由器。请基于用户问题和可用技能摘要，决定：
-1. 是否需要实时数据
-2. 是否需要专业分析
-3. 应进入哪个真实技能
-4. 采用哪种分析模式
-4. 如果不需要技能，是否直接 fallback 到普通 LLM
+class _RouteOutputPayload(BaseModel):
+    """LangChain structured-output compatibility payload."""
 
-可用技能：
-{skills}
-
-规则：
-- 普通闲聊、解释性知识、无需实时或专业金融数据：fallback
-- 需要股票、财务、报表、估值、基础数据、指数、行业、板块等可核对数据：tushare-data
-- 单股专业分析是 analysis_mode=single_stock_fundamental，不要伪造 skill 名
-- 板块/行业/指数分析是 analysis_mode=sector_market
-- 根据条件筛选股票是 analysis_mode=stock_selection
-- 如果只是普通闲聊或知识解释，不要进入 tushare-data
-
-只输出 JSON：
-{{
-  "selected_skill": "fallback|tushare-data",
-  "analysis_mode": "general_chat|single_stock_data|single_stock_fundamental|sector_market|stock_selection",
-  "needs_realtime_data": true,
-  "needs_professional_analysis": false,
-  "confidence": 0.0,
-  "why": "..."
-}}
-
-用户问题：
-{query}
-
-用户画像摘要（仅辅助路由，没有则忽略）：
-{profile_summary}
-
-对话上下文（用于处理“继续”“是，请查询”这类跟进式消息，如果为空则忽略）：
-{conversation_context}
-"""
+    route: Literal["sop", "tushare", "fallback"]
+    skill_id: str | None = None
+    execution_policy: Literal["deterministic", "agentic"] | None = None
 
 
 @dataclass(slots=True)
 class SkillRouteDecision:
-    selected_skill: str
-    confidence: float
-    arguments: dict[str, Any] = field(default_factory=dict)
-    why: str = ""
-    needs_realtime_data: bool = False
-    needs_professional_analysis: bool = False
-    analysis_mode: str = "general_chat"
-    selected_skill_family: str = ""
-    skill_name: str | None = None
-    execution_policy: str = ""
+    route: Literal["sop", "tushare", "fallback"]
+    skill_id: str | None = None
+    execution_policy: str = "deterministic"
+    confidence: float = 0.0
+    need_confirm: bool = False
+    confirm_candidates: list[str] | None = None
+    stage1: dict[str, Any] | None = None
+    stage2: dict[str, Any] | None = None
+    route_source: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "selected_skill_family": self.selected_skill_family,
-            "selected_skill": self.selected_skill,
-            "skill_name": self.skill_name,
-            "confidence": self.confidence,
-            "arguments": self.arguments,
-            "why": self.why,
-            "needs_realtime_data": self.needs_realtime_data,
-            "needs_professional_analysis": self.needs_professional_analysis,
-            "analysis_mode": self.analysis_mode,
-            "execution_policy": self.execution_policy,
-        }
+        data = _build_executor_route_trace(self, "")
+        data.update(
+            {
+                "route": self.route,
+                "skill_id": self.skill_id,
+                "execution_policy": self.execution_policy,
+                "confidence": self.confidence,
+                "need_confirm": self.need_confirm,
+                "confirm_candidates": list(self.confirm_candidates or []),
+                "route_stage1": self.stage1,
+                "route_stage2": self.stage2,
+                "route_source": self.route_source,
+            }
+        )
+        return data
+
+
+def skill_route_decision_from_dict(data: dict[str, Any]) -> SkillRouteDecision:
+    route = str(data.get("route") or "fallback").strip()
+    if route not in {"sop", "tushare", "fallback"}:
+        route = "fallback"
+    skill_id = data.get("skill_id")
+    if skill_id is not None:
+        skill_id = str(skill_id).strip() or None
+    execution_policy = _coerce_execution_policy(str(data.get("execution_policy") or "deterministic"))
+    if route != "sop":
+        skill_id = None
+        execution_policy = "deterministic"
+    confidence = float(data.get("confidence") or data.get("route_confidence") or 0.0)
+    return SkillRouteDecision(
+        route=route,
+        skill_id=skill_id,
+        execution_policy=execution_policy,
+        confidence=confidence,
+        need_confirm=bool(data.get("need_confirm") or data.get("hitl_pending")),
+        confirm_candidates=list(data.get("confirm_candidates") or []),
+        stage1=data.get("route_stage1") if isinstance(data.get("route_stage1"), dict) else None,
+        stage2=data.get("route_stage2") if isinstance(data.get("route_stage2"), dict) else None,
+        route_source=str(data.get("route_source") or ""),
+    )
+
+
+_ROUTER_PROMPT = """你是 A 股投研助手的路由器。你只做路由判断。
+
+【任务边界】
+- 你只输出路由 JSON，不输出分析过程。
+- 你可以利用对话快照做“指代消解、主语补全、意图补全”，但仅用于内部判断，不得输出补全过程。
+- 你不能输出实体识别结果、改写后的 query、推理链条或任何解释文本。
+
+【输入上下文】
+- 对话快照（含最近对话原文 + route slice）：
+{conversation_context}
+- 用户画像摘要：
+{profile_summary}
+- 当前用户问题：
+{query}
+
+【Route Slice 使用规则】
+- route slice 只用于主语补全、指代消解、follow-up 实体继承。
+- route slice 的 rolling-summary 可用字段只有 active_entities。
+- 不得把回答风格、约束文案、open_loops 当成路由信号。
+
+【路由决策顺序（必须按顺序）】
+步骤1：先做上下文补全
+- 若当前问题出现“继续、重新回答、它、这个、刚才那个、再说一下”等弱指代，先结合对话快照补全主语与意图。
+- 若补全后仍不明确，继续按是否需要实时金融数据来判断。
+
+步骤2：判断是否需要实时金融数据
+- 若问题（包含补全后的意图）明显需要实时/近期金融数据，则选 route="tushare"。
+- 典型触发词示例：今日、今天、最近、实时、最新、当前、盘中、收盘、行情、涨跌、财报、估值、PE、PB、资金流、板块、选股。
+
+步骤3：其余全部 fallback
+- 通用解释、闲聊、概念问答、非实时问答，统一 route="fallback"。
+
+【强约束（必须满足）】
+- 只输出 JSON，禁止任何额外文字
+- 禁止输出 analysis_mode、resolved_query、detected_entities、confidence、why、reasoning、thought、intent
+- route 只能是 "tushare" 或 "fallback"
+- 严禁输出 skill_id 与 execution_policy
+- 输出字段必须严格遵守 schema，不能增加任何新字段
+
+【正例】
+1) 弱指代命中 tushare：
+   - 对话快照：上一轮讨论贵州茅台
+   - 当前问题：重新回答，给我今天收盘和最近走势
+   - 正确：{{"route":"tushare"}}
+
+2) 弱指代命中 fallback：
+   - 对话快照：上一轮聊投资心理
+   - 当前问题：继续说说为什么要分散投资
+   - 正确：{{"route":"fallback"}}
+
+【反例】
+- 错误：输出解释文本或推理链，如“我认为应该先……”
+- 错误：输出额外字段，如 confidence、resolved_query、analysis_mode
+- 错误：输出 skill_id 或 execution_policy
+- 错误：输出 route="sop"
+
+【输出 Schema（仅可二选一）】
+route="tushare" 时：
+{{"route":"tushare"}}
+
+route="fallback" 时：
+{{"route":"fallback"}}
+"""
 
 
 def _safe_getenv(name: str, default: str = "") -> str:
@@ -144,306 +214,136 @@ def _router_model_name() -> str:
     return _safe_getenv("CHAT_ROUTER_MODEL") or _safe_getenv("OPENAI_COMPATIBLE_MODEL") or "kimi-k2.5"
 
 
-def _available_skill_names() -> list[str]:
-    return [skill.name for skill in get_skill_registry().list_skills()]
+def _available_sop_skill_ids() -> set[str]:
+    return {item.name for item in get_skill_registry().discoverable_sop_skills()}
 
 
-def _available_sop_skills() -> list[dict[str, str]]:
-    return [
-        {
-            "name": skill.name,
-            "description": skill.description,
-            "version": skill.version or "",
-            "source": skill.source,
-            "execution_mode": skill.execution_mode,
-        }
-        for skill in get_skill_registry().discoverable_sop_skills()
-    ]
-
-
-def _build_skill_summary() -> str:
-    parts = []
-    for item in get_skill_registry().matchable_descriptions():
-        parts.append(
-            f"- {item['name']}: {item['description']} (source={item.get('source','unknown')}, mode={item.get('execution_mode','agent')})"
-        )
-    return "\n".join(parts) if parts else "- fallback: 普通聊天"
-
-
-def _build_sop_skill_summary() -> str:
-    items = _available_sop_skills()
-    if not items:
-        return "- 无可用 financial-sop skills"
+def _build_sop_catalog() -> str:
+    skills = get_skill_registry().discoverable_sop_skills()
+    if not skills:
+        return "- 无可用 SOP 技能"
     return "\n".join(
-        f"- {item['name']}: {item['description']} (source={item['source']}, version={item['version'] or 'unknown'}, mode={item['execution_mode']})"
-        for item in items
+        f"- {item.name}: {item.description}"
+        for item in skills
     )
 
 
-def _default_execution_policy(*, selected_skill: str, analysis_mode: str) -> str:
-    if selected_skill == "fallback":
-        return "agentic"
-    if selected_skill == "financial-sop":
-        return "deterministic"
-    if analysis_mode in {"single_stock_data", "single_stock_fundamental", "sector_market", "stock_selection"}:
-        return "deterministic"
-    return "agentic"
-
-
-def _apply_p0_defaults(decision: SkillRouteDecision) -> SkillRouteDecision:
-    if not decision.selected_skill_family:
-        if decision.selected_skill in {"fallback", "tushare-data"}:
-            decision.selected_skill_family = decision.selected_skill
-        else:
-            decision.selected_skill_family = "financial-sop"
-    if decision.skill_name == "":
-        decision.skill_name = None
-    if not decision.execution_policy:
-        decision.execution_policy = _default_execution_policy(
-            selected_skill=decision.selected_skill,
-            analysis_mode=decision.analysis_mode,
-        )
-    return decision
-
-
-def _rule_based_route(user_message: str) -> SkillRouteDecision:
-    text = (user_message or "").strip()
-    lowered = text.lower()
-    has_stock_code = bool(_STOCK_CODE_RE.search(lowered))
-    has_realtime_data = any(keyword in text for keyword in _REALTIME_HINTS) or has_stock_code
-    is_sector = any(keyword in text for keyword in _SECTOR_HINTS)
-    is_selection = any(keyword in text for keyword in _SELECTION_HINTS)
-    is_fundamental = any(keyword.lower() in lowered for keyword in _FUNDAMENTAL_HINTS)
-    has_stock_hint = any(token in text for token in ("股票", "茅台", "比亚迪", "宁德时代", "贵州茅台", "北方华创"))
-
-    available = set(_available_skill_names())
-
-    if is_selection:
-        selected = "stock-selection" if "stock-selection" in available else "tushare-data"
-        return SkillRouteDecision(
-            selected_skill="tushare-data" if "tushare-data" in available else "fallback",
-            confidence=0.9,
-            arguments={"query": text},
-            why="matched stock-selection rule",
-            needs_realtime_data=True,
-            needs_professional_analysis=True,
-            analysis_mode="stock_selection",
-        )
-
-    if is_sector:
-        return SkillRouteDecision(
-            selected_skill="tushare-data" if "tushare-data" in available else "fallback",
-            confidence=0.88,
-            arguments={"query": text},
-            why="matched sector-analysis rule",
-            needs_realtime_data=True,
-            needs_professional_analysis=True,
-            analysis_mode="sector_market",
-        )
-
-    if is_fundamental and (has_stock_hint or has_stock_code):
-        return SkillRouteDecision(
-            selected_skill="tushare-data" if "tushare-data" in available else "fallback",
-            confidence=0.9,
-            arguments={"query": text},
-            why="matched single-stock fundamental rule",
-            needs_realtime_data=True,
-            needs_professional_analysis=True,
-            analysis_mode="single_stock_fundamental",
-        )
-
-    if has_realtime_data or has_stock_hint:
-        return SkillRouteDecision(
-            selected_skill="tushare-data" if "tushare-data" in available else "fallback",
-            confidence=0.85,
-            arguments={"query": text},
-            why="matched realtime-data rule",
-            needs_realtime_data=has_realtime_data,
-            needs_professional_analysis=False,
-            analysis_mode="single_stock_data" if (has_stock_hint or has_stock_code) else "general_chat",
-        )
-
-    return SkillRouteDecision(
-        selected_skill="fallback",
-        confidence=0.75,
-        arguments={"query": text},
-        why="no skill rule matched",
-        needs_realtime_data=False,
-        needs_professional_analysis=False,
-        analysis_mode="general_chat",
-    )
-
-
-async def _llm_route(user_message: str) -> SkillRouteDecision | None:
-    return await _llm_route_with_context(user_message, "")
-
-
-def _is_follow_up_message(text: str) -> bool:
-    clean = (text or "").strip()
-    if not clean:
-        return False
-    if len(clean) <= 16 and any(hint in clean for hint in _FOLLOW_UP_HINTS):
-        return True
-    return clean in {"嗯", "好的", "是的", "行", "可以"}
-
-
-def _effective_query(user_message: str, conversation_context: str) -> str:
-    text = (user_message or "").strip()
-    context = (conversation_context or "").strip()
-    if not context:
-        return text
-    if _is_follow_up_message(text):
-        return f"{context}\n当前用户补充：{text}"
-    return text
-
-
-def _contains_compare_hint(text: str) -> bool:
-    lowered = (text or "").lower()
-    return any(keyword in lowered for keyword in _COMPARE_HINTS)
-
-
-def _normalize_fund_entity_candidate(text: str) -> str:
-    candidate = (text or "").strip("，。！？,.!?：:；;()（）[]【】 ")
-    if not candidate:
-        return ""
-    match = _FUND_ENTITY_RE.search(candidate)
-    if match:
-        candidate = match.group(0)
-    candidate = re.sub(r"^(请|帮我|重新回答|请重新回答|比较|对比)+", "", candidate).strip()
-    candidate = candidate.strip("，。！？,.!?：:；;()（）[]【】 ")
-    return candidate
-
-
-def _extract_fund_compare_entities(text: str) -> list[str]:
-    raw_text = (text or "").strip()
-    if not raw_text:
-        return []
-
-    entities: list[str] = []
-    for match in _FUND_ENTITY_RE.findall(raw_text):
-        candidate = _normalize_fund_entity_candidate(match)
-        if any(token in candidate for token in ("和", "与", "对比", "比较", "vs", "VS", "pk", "PK")):
-            continue
-        if len(candidate) >= 2 and candidate not in entities:
-            entities.append(candidate)
-
-    cleaned = raw_text
-    for token in ("帮我", "请", "比较", "对比", "一下", "分析", "看看", "哪个", "更适合我", "更适合"):
-        cleaned = cleaned.replace(token, " ")
-    parts = re.split(r"\s+|和|与|跟|及|,|，|/|对比|比较|vs|VS|pk|PK", cleaned)
-    for part in parts:
-        candidate = _normalize_fund_entity_candidate(part)
-        if not candidate:
-            continue
-        if any(hint.lower() in candidate.lower() for hint in _FUND_HINTS) and candidate not in entities:
-            entities.append(candidate)
-    return entities[:4]
-
-
-def _looks_like_fund_compare_query(text: str) -> bool:
-    entities = _extract_fund_compare_entities(text)
-    if len(entities) >= 2 and _contains_compare_hint(text):
-        return True
-    lowered = (text or "").lower()
-    return _contains_compare_hint(text) and sum(1 for hint in _FUND_HINTS if hint.lower() in lowered) >= 2
-
-
-def _looks_like_etf_screen_query(text: str) -> bool:
-    lowered = (text or "").lower()
-    if _looks_like_fund_compare_query(text):
-        return False
-    has_fund_context = any(hint.lower() in lowered for hint in _FUND_HINTS)
-    has_screen_intent = any(hint.lower() in lowered for hint in _ETF_SCREEN_HINTS + _SELECTION_HINTS)
-    has_theme_hint = any(token in text for token in ("宽基", "黄金", "红利", "证券", "科创", "芯片", "半导体", "创业板", "沪深300", "中证"))
-    return has_fund_context and (has_screen_intent or has_theme_hint)
-
-
-def _looks_like_market_move_explain_query(text: str) -> bool:
-    lowered = (text or "").lower()
-    has_move_intent = any(hint.lower() in lowered for hint in _MOVE_HINTS)
-    has_market_object = (
-        any(hint.lower() in lowered for hint in _FUND_HINTS)
-        or any(token in text for token in _SECTOR_HINTS)
-        or any(token in text for token in ("股票", "个股", "茅台", "比亚迪", "宁德时代", "贵州茅台", "北方华创"))
-        or bool(_STOCK_CODE_RE.search(lowered))
-    )
-    return has_move_intent and has_market_object
-
-
-def _looks_like_sector_hotspot_query(text: str) -> bool:
-    lowered = (text or "").lower()
-    has_sector_context = any(token in text for token in _SECTOR_HINTS)
-    has_hotspot_intent = any(hint.lower() in lowered for hint in _HOTSPOT_HINTS + _SELECTION_HINTS)
-    return has_sector_context and has_hotspot_intent and not _looks_like_market_move_explain_query(text)
-
-
-def _looks_like_stock_first_pass_query(text: str) -> bool:
-    lowered = (text or "").lower()
-    if any(hint.lower() in lowered for hint in _FUND_HINTS):
-        return False
-    if any(token in text for token in _SECTOR_HINTS):
-        return False
-    has_stock_object = any(token in text for token in ("股票", "个股", "茅台", "比亚迪", "宁德时代", "贵州茅台", "北方华创")) or bool(_STOCK_CODE_RE.search(lowered))
-    has_first_pass_intent = (
-        any(hint.lower() in lowered for hint in _STOCK_FIRST_PASS_HINTS)
-        or any(hint.lower() in lowered for hint in _FUNDAMENTAL_HINTS)
-        or "财报" in text
-    )
-    return has_stock_object and has_first_pass_intent
-
-
-def _looks_like_financial_sop_query(text: str) -> bool:
-    return any(
-        checker(text)
-        for checker in (
-            _looks_like_fund_compare_query,
-            _looks_like_etf_screen_query,
-            _looks_like_market_move_explain_query,
-            _looks_like_sector_hotspot_query,
-            _looks_like_stock_first_pass_query,
-        )
-    )
-
-
-def _financial_sop_execution_policy(skill_name: str | None) -> str:
-    if not skill_name:
-        return "deterministic"
-    meta = get_skill_registry().get_skill(skill_name)
-    if meta and meta.execution_mode:
-        return str(meta.execution_mode)
+def _coerce_execution_policy(value: str) -> str:
+    normalized = (value or "").strip().lower()
+    if normalized in {"deterministic", "agentic"}:
+        return normalized
     return "deterministic"
 
 
-def _rule_select_financial_sop_skill(query: str) -> str | None:
-    available = {item["name"] for item in _available_sop_skills()}
-    if "fund-compare" in available and _looks_like_fund_compare_query(query):
-        return "fund-compare"
-    if "etf-screen" in available and _looks_like_etf_screen_query(query):
-        return "etf-screen"
-    if "market-move-explain" in available and _looks_like_market_move_explain_query(query):
-        return "market-move-explain"
-    if "sector-hotspot-brief" in available and _looks_like_sector_hotspot_query(query):
-        return "sector-hotspot-brief"
-    if "stock-first-pass" in available and _looks_like_stock_first_pass_query(query):
-        return "stock-first-pass"
-    return None
+def _registry_execution_policy(skill_id: str) -> str:
+    meta = get_skill_registry().get_skill(skill_id)
+    if meta is None:
+        return "deterministic"
+    return _coerce_execution_policy(str(meta.execution_mode or ""))
 
 
-async def _llm_select_financial_sop_skill(query: str) -> str | None:
+def registry_execution_policy_for_skill(skill_id: str) -> str:
+    return _registry_execution_policy(skill_id)
+
+
+def user_explicit_sop_decision(skill_id: str) -> SkillRouteDecision | None:
+    normalized_skill_id = str(skill_id or "").strip()
+    if not normalized_skill_id:
+        return None
+    if normalized_skill_id not in _available_sop_skill_ids():
+        return None
+    return SkillRouteDecision(
+        route="sop",
+        skill_id=normalized_skill_id,
+        execution_policy=_registry_execution_policy(normalized_skill_id),
+    )
+
+
+def _pydantic_validate(model_cls: Any, data: dict[str, Any]) -> Any:
+    if hasattr(model_cls, "model_validate"):
+        return model_cls.model_validate(data)
+    return model_cls.parse_obj(data)
+
+
+def _coerce_llm_content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                text_part = item.get("text")
+                if text_part:
+                    parts.append(str(text_part))
+                    continue
+            parts.append(str(item))
+        return "\n".join(part for part in parts if part)
+    return str(content or "")
+
+
+def _extract_json_dict(raw_text: Any) -> dict[str, Any] | None:
+    text = _coerce_llm_content_text(raw_text).strip()
+    if not text:
+        return None
+
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*```$", "", text)
+
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+
+    match = re.search(r"\{[\s\S]*\}", text)
+    if not match:
+        return None
+    try:
+        parsed = json.loads(match.group(0))
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        return None
+
+
+def _payload_to_route_output(payload: _RouteOutputPayload) -> RouteOutput | None:
+    route = payload.route
+    if route == "sop":
+        logger.warning("router_returned_legacy_sop_route degrade_to=fallback")
+        return RouteFallback(route="fallback")
+    if route == "tushare":
+        return RouteTushare(route="tushare")
+    return RouteFallback(route="fallback")
+
+
+def _validate_route_output(raw: RouteOutput) -> SkillRouteDecision:
+    try:
+        if isinstance(raw, RouteTushare):
+            return SkillRouteDecision(route="tushare")
+
+        return SkillRouteDecision(route="fallback")
+    except Exception:
+        logger.exception("route_validation_exception")
+        return SkillRouteDecision(route="fallback")
+
+
+async def _llm_route(
+    user_message: str,
+    conversation_context: str = "",
+    profile_summary: str = "",
+) -> RouteOutput | None:
     api_key = _safe_getenv("OPENAI_COMPATIBLE_API_KEY")
     base_url = _safe_getenv("OPENAI_COMPATIBLE_BASE_URL")
     model_name = _router_model_name()
     if not all([api_key, base_url, model_name]):
-        return None
-
-    skills_summary = _build_sop_skill_summary()
-    if "无可用 financial-sop skills" in skills_summary:
+        logger.warning("route_parse_error reason=missing_router_env")
         return None
 
     try:
         from langchain_core.messages import HumanMessage
         from langchain_openai import ChatOpenAI
     except Exception:
+        logger.warning("route_parse_error reason=langchain_import_failed")
         return None
 
     llm = ChatOpenAI(
@@ -451,210 +351,136 @@ async def _llm_select_financial_sop_skill(query: str) -> str | None:
         openai_api_key=api_key,
         openai_api_base=base_url,
         temperature=0,
-        max_tokens=120,
+        max_tokens=280,
     )
-    prompt = f"""你是金融 SOP skill discovery 路由器。只基于 skill metadata 选择最匹配的 skill。
+    prompt = _ROUTER_PROMPT.format(
+        conversation_context=conversation_context or "无",
+        profile_summary=profile_summary or "无",
+        query=user_message,
+    )
+    messages = [HumanMessage(content=prompt)]
 
-可用 skills：
-{skills_summary}
-
-规则：
-- 当用户明确要对比/比较两只或多只基金、ETF、LOF、联接基金时，优先选择 `fund-compare`
-- 当用户要筛选、推荐、shortlist 某类 ETF 或场内基金，而不是比较两个已知产品时，选择 `etf-screen`
-- 当用户问板块、行业、主题的热度、龙头、还能不能继续关注时，选择 `sector-hotspot-brief`
-- 当用户问个股、ETF、指数、板块为什么涨跌或异动时，选择 `market-move-explain`
-- 当用户围绕单只股票做首轮判断、财报快读、值不值得继续跟踪时，选择 `stock-first-pass`
-- 如果不确定或不匹配，返回 null
-- 不要臆造 skill 名
-
-只输出 JSON：
-{{
-  "skill_name": "fund-compare|etf-screen|sector-hotspot-brief|market-move-explain|stock-first-pass|null",
-  "why": "..."
-}}
-
-用户问题：
-{query}
-"""
     try:
-        response = await llm.ainvoke([HumanMessage(content=prompt)])
-        text = (response.content or "").strip()
-        if "{" not in text or "}" not in text:
-            return None
-        data = json.loads(text[text.index("{"): text.rindex("}") + 1])
+        result = await llm.ainvoke(messages)
     except Exception:
+        logger.exception("route_parse_error")
         return None
 
-    skill_name = str(data.get("skill_name") or "").strip()
-    if not skill_name or skill_name.lower() == "null":
-        return None
-    if skill_name not in {item["name"] for item in _available_sop_skills()}:
-        return None
-    return skill_name
-
-
-async def _route_financial_sop(
-    user_message: str,
-    conversation_context: str = "",
-    profile_summary: str = "",
-) -> SkillRouteDecision | None:
-    effective_query = _effective_query(user_message, conversation_context)
-    if not _looks_like_financial_sop_query(effective_query):
-        return None
-
-    skill_name = await _llm_select_financial_sop_skill(effective_query)
-    router_model = _router_model_name() if skill_name else "rule-based"
-    if not skill_name:
-        skill_name = _rule_select_financial_sop_skill(effective_query)
-    if not skill_name:
-        return None
-    analysis_mode = str(skill_name).replace("-", "_")
-
-    return _apply_p0_defaults(
-        SkillRouteDecision(
-            selected_skill="financial-sop",
-            confidence=0.9,
-            arguments={
-                "query": (user_message or "").strip(),
-                "effective_query": effective_query,
-                "conversation_context": (conversation_context or "").strip(),
-                "is_follow_up": _is_follow_up_message(user_message),
-                "profile_summary_used": bool((profile_summary or "").strip()),
-                "router_model": f"metadata-discovery:{router_model}",
-                "candidate_entities": _extract_fund_compare_entities(effective_query) if skill_name == "fund-compare" else [],
-            },
-            why=f"matched financial-sop query for {skill_name}",
-            needs_realtime_data=True,
-            needs_professional_analysis=True,
-            analysis_mode=analysis_mode,
-            selected_skill_family="financial-sop",
-            skill_name=skill_name,
-            execution_policy=_financial_sop_execution_policy(skill_name),
-        )
-    )
-
-
-def _rule_based_route_with_context(
-    user_message: str,
-    conversation_context: str = "",
-    profile_summary: str = "",
-) -> SkillRouteDecision:
-    effective_query = _effective_query(user_message, conversation_context)
-    base = _rule_based_route(effective_query)
-    base.arguments = {
-        "query": (user_message or "").strip(),
-        "effective_query": effective_query,
-        "conversation_context": (conversation_context or "").strip(),
-        "is_follow_up": _is_follow_up_message(user_message),
-        "profile_summary_used": bool((profile_summary or "").strip()),
-        "router_model": "rule-based",
-    }
-    if base.selected_skill == "fallback" and _is_follow_up_message(user_message) and conversation_context:
-        context_text = conversation_context.strip()
-        if any(token in context_text for token in (_REALTIME_HINTS + _SECTOR_HINTS + _SELECTION_HINTS + _FUND_HINTS)):
-            base.selected_skill = "tushare-data" if "tushare-data" in _available_skill_names() else "fallback"
-            base.analysis_mode = "stock_selection" if any(token in context_text for token in _SELECTION_HINTS + _FUND_HINTS) else "single_stock_data"
-            base.needs_realtime_data = True
-            base.confidence = max(base.confidence, 0.82)
-            base.why = "follow-up message inherited prior finance/data context"
-    return _apply_p0_defaults(base)
-
-
-async def _llm_route_with_context(
-    user_message: str,
-    conversation_context: str = "",
-    profile_summary: str = "",
-) -> SkillRouteDecision | None:
-    api_key = _safe_getenv("OPENAI_COMPATIBLE_API_KEY")
-    base_url = _safe_getenv("OPENAI_COMPATIBLE_BASE_URL")
-    model_name = _router_model_name()
-    if not all([api_key, base_url, model_name]):
+    payload_raw = _extract_json_dict(getattr(result, "content", ""))
+    if not isinstance(payload_raw, dict):
+        raw_head = _coerce_llm_content_text(getattr(result, "content", ""))[:200].replace("\n", " ")
+        logger.warning("route_parse_error reason=json_parse_failed raw_head=%s", raw_head)
         return None
 
     try:
-        from langchain_core.messages import HumanMessage
-        from langchain_openai import ChatOpenAI
+        payload = _pydantic_validate(_RouteOutputPayload, payload_raw)
     except Exception:
+        logger.warning("route_parse_error reason=schema_validate_failed payload=%s", payload_raw)
         return None
 
-    llm = ChatOpenAI(
-        model=model_name,
-        openai_api_key=api_key,
-        openai_api_base=base_url,
-        temperature=0,
-        max_tokens=220,
-    )
-    effective_query = _effective_query(user_message, conversation_context)
-    response = await llm.ainvoke(
-        [HumanMessage(content=_ROUTER_PROMPT.format(
-            skills=_build_skill_summary(),
-            query=effective_query,
-            profile_summary=profile_summary or "无",
-            conversation_context=conversation_context or "无",
-        ))]
-    )
-    text = (response.content or "").strip()
-    if "{" not in text or "}" not in text:
-        return None
-    text = text[text.index("{"): text.rindex("}") + 1]
-    data = json.loads(text)
-
-    selected_skill = str(data.get("selected_skill") or "").strip()
-    if selected_skill not in {"fallback", "tushare-data"}:
-        return None
-
-    analysis_mode = str(data.get("analysis_mode") or "general_chat").strip()
-    if analysis_mode not in {
-        "general_chat",
-        "single_stock_data",
-        "single_stock_fundamental",
-        "sector_market",
-        "stock_selection",
-    }:
-        return None
-
-    return _apply_p0_defaults(SkillRouteDecision(
-        selected_skill=selected_skill,
-        confidence=max(0.0, min(1.0, float(data.get("confidence") or 0.0))),
-        arguments={
-            "query": (user_message or "").strip(),
-            "effective_query": effective_query,
-            "conversation_context": (conversation_context or "").strip(),
-            "is_follow_up": _is_follow_up_message(user_message),
-            "profile_summary_used": bool((profile_summary or "").strip()),
-            "router_model": model_name,
-        },
-        why=str(data.get("why") or "llm router"),
-        needs_realtime_data=bool(data.get("needs_realtime_data")),
-        needs_professional_analysis=bool(data.get("needs_professional_analysis")),
-        analysis_mode=analysis_mode,
-    ))
+    return _payload_to_route_output(payload)
 
 
 async def route_chat_skill(
     user_message: str,
     conversation_context: str = "",
     profile_summary: str = "",
+    enable_route_v2: bool | None = None,
+    active_entity: dict[str, Any] | None = None,
 ) -> SkillRouteDecision:
-    sop_decision = await _route_financial_sop(
-        user_message,
-        conversation_context,
-        profile_summary,
+    if enable_route_v2 is None:
+        enable_route_v2 = _safe_getenv("ENABLE_ROUTE_V2").lower() in {"1", "true", "yes", "on"}
+    if enable_route_v2:
+        try:
+            from src.agents.router import route_v2
+
+            decision_v2 = await route_v2(user_message, active_entity=active_entity)
+            stage1 = decision_v2.stage1.model_dump() if decision_v2.stage1 is not None else None
+            stage2 = decision_v2.stage2.model_dump() if decision_v2.stage2 is not None else None
+            confidence = float((stage1 or {}).get("confidence") or (1.0 if decision_v2.route_source == "user_explicit" else 0.0))
+            return SkillRouteDecision(
+                route=decision_v2.legacy_route,
+                skill_id=decision_v2.skill_id,
+                execution_policy=decision_v2.execution_policy,
+                confidence=confidence,
+                need_confirm=decision_v2.need_confirm,
+                confirm_candidates=list(decision_v2.confirm_candidates or []),
+                stage1=stage1,
+                stage2=stage2,
+                route_source=decision_v2.route_source,
+            )
+        except Exception:
+            logger.exception("route_v2_failed_fallback_to_legacy")
+    raw = await _llm_route(
+        user_message=user_message,
+        conversation_context=conversation_context,
+        profile_summary=profile_summary,
     )
-    if sop_decision is not None:
-        return sop_decision
-    try:
-        decision = await _llm_route_with_context(
-            user_message,
-            conversation_context,
-            profile_summary,
-        )
-        if decision is not None:
-            return decision
-    except Exception:
-        pass
-    return _rule_based_route_with_context(
-        user_message,
-        conversation_context,
-        profile_summary,
-    )
+    if raw is None:
+        return SkillRouteDecision(route="fallback")
+    return _validate_route_output(raw)
+
+
+def _build_executor_route_trace(decision: SkillRouteDecision, user_message: str) -> dict[str, Any]:
+    """Temporary adapter from minimal route decision to executor route_trace."""
+    # DEPRECATED: replaced by rewrite pipeline (kept for compatibility path)
+
+    query = (user_message or "").strip()
+    args = {
+        "query": query,
+        "effective_query": query,
+    }
+    if decision.route == "sop":
+        return {
+            "selected_skill_family": "financial-sop",
+            "selected_skill": "financial-sop",
+            "skill_name": decision.skill_id,
+            "execution_policy": _coerce_execution_policy(decision.execution_policy),
+            "analysis_mode": "general_chat",
+            "needs_realtime_data": False,
+            "arguments": args,
+            "confidence": decision.confidence,
+            "need_confirm": decision.need_confirm,
+            "confirm_candidates": list(decision.confirm_candidates or []),
+            "route_stage1": decision.stage1,
+            "route_stage2": decision.stage2,
+            "route_source": decision.route_source,
+        }
+    if decision.route == "tushare":
+        return {
+            "selected_skill_family": "tushare-data",
+            "selected_skill": "tushare-data",
+            "skill_name": None,
+            "execution_policy": "deterministic",
+            "analysis_mode": "general_chat",
+            "needs_realtime_data": True,
+            "arguments": args,
+            "confidence": decision.confidence,
+            "need_confirm": decision.need_confirm,
+            "confirm_candidates": list(decision.confirm_candidates or []),
+            "route_stage1": decision.stage1,
+            "route_stage2": decision.stage2,
+            "route_source": decision.route_source,
+        }
+    return {
+        "selected_skill_family": "fallback",
+        "selected_skill": "fallback",
+        "skill_name": None,
+        "execution_policy": "deterministic",
+        "analysis_mode": "general_chat",
+        "needs_realtime_data": False,
+        "arguments": args,
+        "confidence": decision.confidence,
+        "need_confirm": decision.need_confirm,
+        "confirm_candidates": list(decision.confirm_candidates or []),
+        "route_stage1": decision.stage1,
+        "route_stage2": decision.stage2,
+        "route_source": decision.route_source,
+    }
+
+
+async def rewrite_query_for_skill(*args: Any, **kwargs: Any) -> None:
+    """Temporarily disabled in this phase."""
+
+    _ = args, kwargs
+    return None

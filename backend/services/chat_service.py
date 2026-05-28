@@ -19,13 +19,14 @@ STM/LTM 分工：
 """
 
 import asyncio
+import json
 import os
 import re
 import sys
 from datetime import datetime
 from pathlib import Path
 import time
-from typing import AsyncGenerator, Optional
+from typing import Any, AsyncGenerator, Optional
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -33,9 +34,26 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.db.models import Message, Session, SessionSummary, User
 from backend.config import settings
 from backend.services import memory_service as _memory_svc
+from backend.services.chat_hitl_pending import pop_pending_skill_confirm, set_pending_skill_confirm
+from backend.services.chat_route_runtime import (
+    enrich_context_window,
+    get_runtime_route_state,
+    record_route_runtime_state,
+    seed_route_runtime_from_summary_payload,
+)
+from backend.services.entity_resolver import resolve_entity
+from backend.services.working_state import get_working_state, upsert_active_entity
 from backend.services.stm_context_service import (
-    maybe_enqueue_compaction,
     refresh_session_context_metrics,
+)
+from backend.services.stm_summary_runtime import (
+    apply_route_entity_hot_update,
+    format_answer_policy_context,
+    format_route_active_entities_context,
+    maybe_run_preflight_summary_compaction,
+    resolve_session_rolling_payload,
+    run_summary_compaction,
+    should_run_preflight_summary_compaction,
 )
 from backend.services.token_counter import count_message_tokens
 
@@ -45,14 +63,39 @@ if str(_AGENT_ROOT) not in sys.path:
 
 from src.utils.logging_config import setup_logger  # noqa: E402
 from src.agents.skill_executor_node import execute_skill  # noqa: E402
-from src.agents.skill_router_node import route_chat_skill  # noqa: E402
+from src.agents.query_rewriter import (  # noqa: E402
+    _load_skill_doc_sections,
+    rewrite_for_fallback,
+    rewrite_for_sop,
+    rewrite_for_tushare,
+    rewrite_for_tushare_v2,
+)
+from src.agents.synthesis.synthesize_fallback import build_fallback_synthesis_prompt  # noqa: E402
+from src.agents.synthesis.synthesize_sop import build_sop_synthesis_prompt  # noqa: E402
+from src.agents.synthesis.synthesize_tushare import build_tushare_synthesis_prompt  # noqa: E402
+from src.agents.entity_resolver_v2 import resolve_authoritative_entity  # noqa: E402
+from src.agents.constraints_extractor import extract_constraints  # noqa: E402
+from src.agents.reply_preference_extractor import extract_reply_preference  # noqa: E402
+from src.agents.rewrite_context import RewriteContextPacket  # noqa: E402
+from src.agents.skill_runner_v2 import run_sop_v2_pipeline, run_tushare_v2_pipeline  # noqa: E402
+from src.agents.skill_router_node import (  # noqa: E402
+    _build_executor_route_trace,
+    registry_execution_policy_for_skill,
+    route_chat_skill,
+    rewrite_query_for_skill,
+    skill_route_decision_from_dict,
+    user_explicit_sop_decision,
+)
+from src.agents.tushare_plan_executor import execute_tushare_plan  # noqa: E402
 from src.skills.skill_registry import get_skill_registry  # noqa: E402
 from src.tools.skill_trace import (  # noqa: E402
     log_compaction_enqueue,
+    log_degrade_transition,
     log_memory_enqueue,
     log_model_stage,
     log_reply_completed,
     log_router_decision,
+    log_tool_plan,
     log_trace_finished,
     log_trace_started,
     new_trace_id,
@@ -66,10 +109,23 @@ logger = setup_logger("chat_service", log_dir=str(_AGENT_ROOT / "logs"))
 # ─────────────────────────────────────────────────────────────
 # 常量配置
 # ─────────────────────────────────────────────────────────────
-_RECENT_MSG_LIMIT = 12          # Phase 1/2 保留最近 N 条消息作为上下文
-_STM_COMPRESS_THRESHOLD = int(settings.stm_legacy_count_threshold)
+_RECENT_MSG_LIMIT = int(settings.stm_keep_recent) + 2  # 保留最近 N+2 条消息作为上下文
+_STM_FALLBACK_MIN_UNCOMPRESSED_MESSAGES = int(
+    settings.stm_fallback_min_uncompressed_messages
+)
 _CHAT_STREAM_CHUNK_SIZE = 48
 _skill_runtime_checked = False
+_STM_OVERFLOW_ERROR_PATTERNS = (
+    "context length",
+    "context window",
+    "maximum context",
+    "max context",
+    "too many tokens",
+    "token limit",
+    "prompt is too long",
+    "context too long",
+)
+_ROUTE_SNAPSHOT_ASSISTANT_TRUNCATE = 500
 
 # ─────────────────────────────────────────────────────────────
 # Phase 3：画像 action 规范化（修复“模型输出枚举混乱/不在范围内”）
@@ -307,26 +363,6 @@ _MEMORY_CONTEXT_PROMPT_TEMPLATE = """
 _MIN_LTM_INTERVAL_SEC = int(os.getenv("MIN_LTM_INTERVAL", "300"))  # 最小间隔 300s
 _LTM_TRIGGER_MSG_COUNT = 5  # 未处理 user 消息数阈值
 
-# STM 压缩 Prompt（金融专版，与 stm_nodes.py 中一致）
-_SUMMARIZE_CONVERSATION_PROMPT = """
-你是一个金融对话摘要助手。请将以下对话历史压缩成精炼摘要，
-严格保留以下关键信息，不得遗漏：
-
-必须保留：
-- 用户提到的所有股票代码/公司名称
-- 用户明确表达的投资偏好（风险偏好、持有期限、关注板块）
-- 用户提出的具体投资问题和关键约束
-- 已生成报告的核心结论（股票代码、买入/持有/卖出建议、关键数值）
-
-可以省略：
-- 打招呼、寒暄等无实质内容的对话
-- 重复表达同一意思的内容
-- analyst 分析过程的中间步骤（只保留最终结论）
-
-输出格式：纯文字段落，300字以内，使用中文。
-"""
-
-
 def _get_llm():
     """懒加载 LLM 客户端（复用 agent 环境变量）。"""
     from langchain_openai import ChatOpenAI
@@ -336,8 +372,6 @@ def _get_llm():
         openai_api_base=os.getenv("OPENAI_COMPATIBLE_BASE_URL", ""),
         temperature=0.7,
     )
-
-
 def _profile_to_summary(profile: dict) -> str:
     if not profile:
         return ""
@@ -381,6 +415,48 @@ def _trace_query_summary(text: str, limit: int = 120) -> str:
     if len(summary) <= limit:
         return summary
     return summary[: limit - 3] + "..."
+
+
+async def _prepare_chat_preflight_inputs(
+    db: AsyncSession,
+    session: Session,
+    *,
+    user_id: str,
+    user_message: str,
+) -> tuple[dict, str]:
+    memory_profile, memory_system_prompt = await _load_memory_context_for_chat(
+        db,
+        user_id,
+        user_message,
+    )
+    del session
+    return memory_profile, memory_system_prompt
+
+
+async def _run_chat_preflight_compaction(
+    db: AsyncSession,
+    session: Session,
+    *,
+    user_message: str,
+    user_message_id: int,
+    memory_system_prompt: str,
+    trigger: str,
+    stream_status_emitter: Any | None = None,
+) -> None:
+    if not settings.enable_stm or not settings.stm_summary_preflight_enabled:
+        return
+
+    await maybe_run_preflight_summary_compaction(
+        db=db,
+        session=session,
+        pending_user_message=user_message,
+        system_prompt_text=_CHAT_SYSTEM_PROMPT,
+        memory_prompt_text=memory_system_prompt,
+        exclude_message_ids={int(user_message_id)},
+        trigger=trigger,
+        stream_status_emitter=stream_status_emitter,
+    )
+    await db.refresh(session)
 
 
 def _trace_root_metrics(skill_trace: dict | None) -> dict[str, object]:
@@ -436,6 +512,10 @@ def _trace_root_refs(skill_trace: dict | None) -> dict[str, object]:
     }
 
 
+class InvalidSopSkillError(ValueError):
+    """Raised when the user explicitly selects an unknown SOP skill."""
+
+
 def _ensure_skill_runtime_ready() -> None:
     global _skill_runtime_checked
     if _skill_runtime_checked:
@@ -450,6 +530,37 @@ def _ensure_skill_runtime_ready() -> None:
         lambda: TushareClient(token=settings.tushare_token or "")
     )
     _skill_runtime_checked = True
+
+
+def normalize_requested_sop_skill_id(sop_skill_id: str | None) -> str | None:
+    normalized = str(sop_skill_id or "").strip()
+    return normalized or None
+
+
+def validate_requested_sop_skill_id(sop_skill_id: str | None) -> str | None:
+    normalized = normalize_requested_sop_skill_id(sop_skill_id)
+    if normalized is None:
+        return None
+
+    _ensure_skill_runtime_ready()
+    if user_explicit_sop_decision(normalized) is None:
+        raise InvalidSopSkillError(f"无效的 sop_skill_id: {normalized}")
+    return normalized
+
+
+def list_discoverable_sop_skills() -> list[dict[str, str]]:
+    _ensure_skill_runtime_ready()
+    items: list[dict[str, str]] = []
+    for skill in get_skill_registry().discoverable_sop_skills():
+        items.append(
+            {
+                "name": skill.name,
+                "official_name": str(skill.official_name or ""),
+                "description": str(skill.description or ""),
+                "execution_mode": registry_execution_policy_for_skill(skill.name),
+            }
+        )
+    return items
 
 
 async def _load_memory_context_for_chat(
@@ -517,10 +628,17 @@ async def _build_skill_route_context(
     session: Session,
     *,
     exclude_message_id: int | None = None,
+    route_slice_text: str = "",
 ) -> str:
+    """构建路由"对话快照"：route slice + 最近对话原文。
+
+    用户消息保留全文，助手消息截断到 _ROUTE_SNAPSHOT_ASSISTANT_TRUNCATE 字符。
+    route slice 只承担主语补全、指代消解、follow-up 实体继承，不再注入全文摘要。
+    """
     parts: list[str] = []
-    if settings.enable_stm and session.running_summary:
-        parts.append(f"running_summary:\n{session.running_summary[:600]}")
+
+    if settings.enable_stm and route_slice_text:
+        parts.append(route_slice_text)
 
     if settings.enable_stm:
         stmt = select(Message).where(
@@ -533,17 +651,612 @@ async def _build_skill_route_context(
     if exclude_message_id is not None:
         stmt = stmt.where(Message.id != exclude_message_id)
 
-    stmt = stmt.order_by(Message.created_at.desc()).limit(6)
+    stmt = stmt.order_by(Message.created_at.desc()).limit(_RECENT_MSG_LIMIT + 1)
     history_result = await db.execute(stmt)
-
     recent_messages = list(reversed(history_result.scalars().all()))
+
     if recent_messages:
         dialogue_lines = []
+        truncate_len = _ROUTE_SNAPSHOT_ASSISTANT_TRUNCATE
         for msg in recent_messages:
             role = "用户" if msg.role == "user" else "助手"
-            dialogue_lines.append(f"{role}: {msg.content[:240]}")
-        parts.append("recent_messages:\n" + "\n".join(dialogue_lines))
+            content = (msg.content or "").strip()
+            if msg.role == "assistant" and len(content) > truncate_len:
+                content = content[:truncate_len] + "…"
+            dialogue_lines.append(f"{role}: {content}")
+        parts.append("【最近对话记录】\n" + "\n".join(dialogue_lines))
+
     return "\n\n".join(parts)
+
+
+def _resolve_session_summary_contexts(session: Session) -> tuple[dict[str, Any], str, str]:
+    if not settings.enable_stm:
+        return {}, "", ""
+    payload = resolve_session_rolling_payload(session)
+    route_slice_text = format_route_active_entities_context(payload)
+    answer_policy_context = format_answer_policy_context(payload)
+    return payload, route_slice_text, answer_policy_context
+
+
+def _resolver_hint_to_prompt_block(resolver_hint: dict[str, Any] | None) -> str:
+    hint = dict(resolver_hint or {})
+    if not hint:
+        return ""
+    display_name = str(hint.get("display_name") or "").strip() or "unknown"
+    asset_type = str(hint.get("asset_type") or "").strip() or "unknown"
+    symbol = str(hint.get("symbol") or "").strip() or "unknown"
+    confidence = float(hint.get("confidence") or 0.0)
+    stage = str(hint.get("resolver_stage") or "").strip() or "unknown"
+    return (
+        "【已解析实体提示】\n"
+        f"display_name={display_name}\n"
+        f"asset_type={asset_type}\n"
+        f"symbol={symbol}\n"
+        f"confidence={confidence:.4f}\n"
+        f"resolver_stage={stage}"
+    )
+
+
+def _resolver_hint_payload(resolution: Any) -> dict[str, Any] | None:
+    if resolution is None or not getattr(resolution, "ok", False):
+        return None
+    confidence = float(getattr(resolution, "confidence", 0.0) or 0.0)
+    if confidence < 0.75:
+        return None
+    payload = {
+        "display_name": str(getattr(resolution, "display_name", "") or "").strip(),
+        "asset_type": str(getattr(resolution, "asset_type", "") or "").strip(),
+        "symbol": str(getattr(resolution, "symbol", "") or "").strip(),
+        "confidence": confidence,
+        "resolver_stage": str(getattr(resolution, "resolver_stage", "") or "").strip(),
+        "resolver_source": str(getattr(resolution, "resolver_source", "") or "").strip(),
+    }
+    if not payload["display_name"] and not payload["symbol"]:
+        return None
+    return payload
+
+
+async def _resolve_entity_hint_for_route(session: Session, user_message: str) -> dict[str, Any] | None:
+    runtime_state = get_runtime_route_state(session.id)
+    summary_active_symbols: list[str] | None = None
+    if runtime_state is None and settings.enable_stm:
+        payload = resolve_session_rolling_payload(session)
+        runtime_state = seed_route_runtime_from_summary_payload(payload, runtime_state)
+        route_slice = payload.get("active_entities") if isinstance(payload, dict) else None
+        if isinstance(route_slice, list):
+            summary_active_symbols = [
+                str(item.get("canonical_id") or "").strip()
+                for item in route_slice
+                if isinstance(item, dict) and str(item.get("canonical_id") or "").strip()
+            ] or None
+    session_symbols: list[str] | None = None
+    if runtime_state is not None and str(runtime_state.active_entity_id or "").strip():
+        session_symbols = [str(runtime_state.active_entity_id or "").strip()]
+    try:
+        resolution = await resolve_entity(
+            user_message,
+            session_symbols=session_symbols,
+            summary_active_symbols=summary_active_symbols,
+        )
+    except Exception as exc:
+        logger.warning("[chat-skill] resolve_entity hint failed (non-fatal): %s", exc)
+        return None
+    return _resolver_hint_payload(resolution)
+
+
+def _executor_qualifies_for_evidence_retry(executor_trace: dict | None) -> bool:
+    if not executor_trace:
+        return False
+    if executor_trace.get("evidence_ok"):
+        return False
+    if str(executor_trace.get("reply_mode") or "") != "evidence-missing":
+        return False
+    if str(executor_trace.get("failure_code") or "") == "skill_disabled":
+        return False
+    return True
+
+
+_EXPLICIT_SKILL_INTENT_RE = re.compile(
+    r"(使用\s*skills?|用\s*skills?|走\s*skills?|调用\s*skills?|"
+    r"请\s*用\s*技能|使用\s*技能|必须\s*用\s*技能|financial[-\s]?sop|"
+    r"工具\s*分析|结构化\s*技能|走\s*工具)",
+    re.IGNORECASE,
+)
+
+
+def _user_explicit_skill_intent(user_message: str) -> bool:
+    """用户明确要求走技能/工具链路（与路由是否命中无关）。"""
+    return bool(_EXPLICIT_SKILL_INTENT_RE.search(user_message or ""))
+
+
+def _build_broad_skill_confirm_options() -> list[dict[str, Any]]:
+    """fallback 或未命中时，列出可选 SOP 技能 + tushare + 纯对话。"""
+    opts: list[dict[str, Any]] = []
+    skills = get_skill_registry().discoverable_sop_skills()
+    for i, s in enumerate(skills[:14]):
+        label = (s.official_name or s.name or "").strip() or s.name
+        desc = (s.description or "")[:48]
+        if desc:
+            label = f"{label} — {desc}"
+        opts.append(
+            {
+                "key": s.name,
+                "label": label,
+                "recommended": i == 0,
+            }
+        )
+    opts.append(
+        {
+            "key": "tushare-data",
+            "label": "实时行情 / Tushare 数据拉取",
+            "recommended": False,
+        }
+    )
+    opts.append(
+        {
+            "key": "fallback",
+            "label": "不要技能链路，直接 AI 回答",
+            "recommended": False,
+        }
+    )
+    return opts
+
+
+def _should_offer_skill_hitl(route: Any) -> bool:
+    if not settings.enable_skill_route_hitl:
+        return False
+    thr = float(settings.skill_route_hitl_confidence_threshold)
+    if float(route.confidence or 0.0) >= thr:
+        return False
+    if str(route.selected_skill or "") == "fallback":
+        return False
+    return True
+
+
+def _sop_execution_policy_for_name(skill_name: str) -> str:
+    return registry_execution_policy_for_skill(skill_name)
+
+
+def _resolve_sop_skill_id(route_trace: dict[str, Any], decision: Any) -> str:
+    """Concrete SOP skill id (e.g. stock-first-pass), not skill family (financial-sop)."""
+    skill_name = str((route_trace or {}).get("skill_name") or "").strip()
+    if skill_name:
+        return skill_name
+    return str(getattr(decision, "skill_id", None) or "").strip()
+
+
+def _build_skill_confirm_options(route: Any) -> list[dict[str, Any]]:
+    opts: list[dict[str, Any]] = []
+    fam = str(route.selected_skill_family or "")
+    if fam == "financial-sop" and route.skill_name:
+        opts.append(
+            {
+                "key": str(route.skill_name),
+                "label": f"按推荐执行技能：{route.skill_name}",
+                "recommended": True,
+            }
+        )
+    elif str(route.selected_skill) == "tushare-data":
+        opts.append(
+            {
+                "key": "tushare-data",
+                "label": "使用实时金融数据（Tushare）",
+                "recommended": True,
+            }
+        )
+    else:
+        sk = str(route.selected_skill or "")
+        if sk and sk != "fallback":
+            opts.append({"key": sk, "label": f"继续：{sk}", "recommended": True})
+    opts.append(
+        {
+            "key": "fallback",
+            "label": "直接由 AI 回答（不强制工具链路）",
+            "recommended": False,
+        }
+    )
+    return opts
+
+
+def _build_skill_confirm_options_from_trace(route_trace: dict[str, Any]) -> list[dict[str, Any]]:
+    candidates = [str(item) for item in (route_trace.get("confirm_candidates") or []) if str(item).strip()]
+    if not candidates and route_trace.get("skill_name"):
+        candidates = [str(route_trace["skill_name"])]
+    opts: list[dict[str, Any]] = []
+    sop_names = {s.name for s in get_skill_registry().discoverable_sop_skills()}
+    for idx, key in enumerate(candidates):
+        if key in sop_names:
+            opts.append({"key": key, "label": f"按推荐执行技能：{key}", "recommended": idx == 0})
+        elif key == "tushare-data":
+            opts.append({"key": key, "label": "使用实时金融数据（Tushare）", "recommended": idx == 0})
+    if not any(item.get("key") == "fallback" for item in opts):
+        opts.append({"key": "fallback", "label": "直接由 AI 回答（不强制工具链路）", "recommended": False})
+    return opts
+
+
+def _apply_hitl_choice_to_route_dict(route_dict: dict[str, Any], choice: str) -> dict[str, Any]:
+    import copy
+
+    out = copy.deepcopy(route_dict)
+    choice = (choice or "").strip()
+    args = dict(out.get("arguments") or {})
+    sop_names = {s.name for s in get_skill_registry().discoverable_sop_skills()}
+
+    if choice == "fallback":
+        out["selected_skill"] = "fallback"
+        out["selected_skill_family"] = "fallback"
+        out["skill_name"] = None
+        out["route_kind"] = "fallback"
+        out["grounding_policy"] = "none"
+        out["claim_policy"] = "full"
+        out["execution_policy"] = "agentic"
+        out["analysis_mode"] = "general_chat"
+        out["needs_realtime_data"] = False
+        out["needs_professional_analysis"] = False
+        out["confidence"] = 1.0
+        out["skill_contract"] = ""
+        out["arguments"] = args
+        return out
+
+    if choice in sop_names:
+        out["selected_skill"] = "financial-sop"
+        out["selected_skill_family"] = "financial-sop"
+        out["skill_name"] = choice
+        out["route_kind"] = "financial_sop"
+        out["grounding_policy"] = "preferred"
+        out["claim_policy"] = "cautious"
+        out["execution_policy"] = _sop_execution_policy_for_name(choice)
+        out["skill_contract"] = choice
+        out["needs_realtime_data"] = True
+        out["needs_professional_analysis"] = True
+        out["confidence"] = 1.0
+        out["analysis_mode"] = str(out.get("analysis_mode") or "")
+        out["arguments"] = args
+        return out
+
+    if choice == "tushare-data":
+        out["selected_skill"] = "tushare-data"
+        out["selected_skill_family"] = "tushare-data"
+        out["skill_name"] = None
+        out["route_kind"] = "tushare_data"
+        out["grounding_policy"] = "required"
+        out["claim_policy"] = "cautious"
+        out["execution_policy"] = "deterministic"
+        out["skill_contract"] = ""
+        out["needs_realtime_data"] = True
+        out["needs_professional_analysis"] = False
+        out["confidence"] = 1.0
+        if not str(out.get("analysis_mode") or "").strip():
+            out["analysis_mode"] = "general_chat"
+        out["arguments"] = args
+        return out
+
+    return out
+
+
+async def _apply_skill_query_rewrite(
+    route: Any,
+    route_context: str,
+    *,
+    error_feedback: str = "",
+) -> None:
+    try:
+        rewritten = await rewrite_query_for_skill(
+            route,
+            conversation_context=route_context,
+            error_feedback=error_feedback or "",
+        )
+        if rewritten is None:
+            return
+        args = dict(route.arguments or {})
+        args["effective_query"] = rewritten.query
+        args["detected_entities"] = [{"value": e.value, "type": e.type} for e in rewritten.entities]
+        if rewritten.tool_hints:
+            args["tool_hints"] = rewritten.tool_hints
+        route.arguments = args
+        logger.info(
+            "[chat-skill] query rewrite%s: entities=%d",
+            " (retry)" if error_feedback else "",
+            len(rewritten.entities),
+        )
+    except Exception as exc:
+        logger.warning("[chat-skill] query rewrite failed (non-fatal): %s", exc)
+
+
+def _serialize_prompt_payload(payload: Any, *, max_chars: int = 24000) -> str:
+    try:
+        text = json.dumps(payload, ensure_ascii=False, default=str, indent=2)
+    except Exception:
+        text = str(payload)
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "\n...<truncated>..."
+
+
+def _extract_model_text(response: Any) -> str:
+    if response is None:
+        return ""
+    content = getattr(response, "content", "")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        chunks: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if text:
+                    chunks.append(str(text))
+            elif isinstance(item, str):
+                chunks.append(item)
+        return "\n".join(chunks).strip()
+    return str(content).strip()
+
+
+async def summarize_sop_reply(
+    *,
+    effective_query: str,
+    tool_data: dict[str, Any],
+    answer_policy_context: str,
+    ltm_full: str,
+    skill_id: str,
+    session_id: str,
+    user_id: str,
+) -> str:
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    sections = _load_skill_doc_sections(skill_id)
+    if settings.enable_synthesis_v2:
+        prompt = build_sop_synthesis_prompt(
+            effective_query=effective_query,
+            tool_data=tool_data,
+            answer_policy_context=answer_policy_context,
+            ltm_full=ltm_full,
+            skill_id=skill_id,
+            output_template=sections.get("output_template") or "",
+            fallbacks=sections.get("fallbacks") or "",
+            decision_rules=sections.get("decision_rules") or "",
+        )
+    else:
+        answer_policy_block = answer_policy_context or "【回答策略上下文】\n无"
+        prompt = (
+            "[角色]\n你是A股投研助手总结器，请依据证据回答。\n\n"
+            "[SKILL 输出合同]\n"
+            f"Output Template:\n{sections.get('output_template') or '无'}\n\n"
+            f"Fallbacks:\n{sections.get('fallbacks') or '无'}\n\n"
+            f"Decision Rules:\n{sections.get('decision_rules') or '无'}\n\n"
+            f"[证据包 tool_data]\n{_serialize_prompt_payload(tool_data)}\n\n"
+            f"[effective_query]\n{effective_query}\n\n"
+            f"{answer_policy_block}\n\n"
+            f"[全量 LTM]\n{ltm_full or '无'}\n\n"
+            "[禁止项]\n"
+            "- 不得编造证据包中不存在的数值\n"
+            "- 若证据不足，按 Fallbacks 保守回答\n"
+        )
+    llm = _get_llm()
+    log_model_stage(
+        stage="summarize",
+        model=os.getenv("OPENAI_COMPATIBLE_MODEL", ""),
+        execution_path="sop",
+        session_id=session_id,
+        user_id=user_id,
+    )
+    try:
+        response = await llm.ainvoke(
+            [
+                SystemMessage(content="你是金融问答总结器。"),
+                HumanMessage(content=prompt),
+            ]
+        )
+        reply = _extract_model_text(response) or "我已完成这次分析，但当前暂无可复述内容。"
+    except Exception as exc:
+        logger.warning("[chat-skill] summarize_sop_reply failed: %s", exc, exc_info=True)
+        log_degrade_transition(from_stage="summarize", reason=f"sop_summarize_failed: {exc}")
+        reply = "我已完成工具执行，但总结阶段异常。你可以继续追问我具体维度。"
+
+    log_reply_completed(
+        mode="sop",
+        session_id=session_id,
+        user_id=user_id,
+        selected_skill_family="financial-sop",
+        selected_skill="financial-sop",
+        skill_name=skill_id,
+        used_tools=bool((tool_data or {}).get("results") or (tool_data or {}).get("executor_trace")),
+    )
+    return reply
+
+
+async def summarize_tushare_reply(
+    *,
+    effective_query: str,
+    tool_data: dict[str, Any],
+    answer_policy_context: str,
+    ltm_full: str,
+    session_id: str,
+    user_id: str,
+) -> str:
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    if settings.enable_synthesis_v2:
+        prompt = build_tushare_synthesis_prompt(
+            effective_query=effective_query,
+            tool_data=tool_data,
+            answer_policy_context=answer_policy_context,
+            ltm_full=ltm_full,
+        )
+    else:
+        answer_policy_block = answer_policy_context or "【回答策略上下文】\n无"
+        prompt = (
+            "[角色]\n你是A股投研助手总结器，请依据证据回答。\n\n"
+            f"[证据包 tool_data]\n{_serialize_prompt_payload(tool_data)}\n\n"
+            f"[effective_query]\n{effective_query}\n\n"
+            f"{answer_policy_block}\n\n"
+            f"[全量 LTM]\n{ltm_full or '无'}\n\n"
+            "[禁止项]\n"
+            "- 不得编造证据包中不存在的数值\n"
+        )
+    llm = _get_llm()
+    log_model_stage(
+        stage="summarize",
+        model=os.getenv("OPENAI_COMPATIBLE_MODEL", ""),
+        execution_path="tushare",
+        session_id=session_id,
+        user_id=user_id,
+    )
+    try:
+        response = await llm.ainvoke(
+            [
+                SystemMessage(content="你是金融问答总结器。"),
+                HumanMessage(content=prompt),
+            ]
+        )
+        reply = _extract_model_text(response) or "已完成实时数据检索，但暂无可复述内容。"
+    except Exception as exc:
+        logger.warning("[chat-skill] summarize_tushare_reply failed: %s", exc, exc_info=True)
+        log_degrade_transition(from_stage="summarize", reason=f"tushare_summarize_failed: {exc}")
+        reply = "我已执行实时数据工具，但总结阶段异常。你可以继续追问具体指标。"
+
+    log_reply_completed(
+        mode="tushare",
+        session_id=session_id,
+        user_id=user_id,
+        selected_skill_family="tushare-data",
+        selected_skill="tushare-data",
+        used_tools=bool((tool_data or {}).get("results")),
+    )
+    return reply
+
+
+async def summarize_fallback_reply(
+    *,
+    effective_query: str,
+    answer_policy_context: str,
+    ltm_full: str,
+    session_id: str,
+    user_id: str,
+) -> str:
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    if settings.enable_synthesis_v2:
+        prompt = build_fallback_synthesis_prompt(
+            effective_query=effective_query,
+            answer_policy_context=answer_policy_context,
+            ltm_full=ltm_full,
+        )
+    else:
+        answer_policy_block = answer_policy_context or "【回答策略上下文】\n无"
+        prompt = (
+            "[角色]\n你是通用问答总结器。\n\n"
+            f"[effective_query]\n{effective_query}\n\n"
+            f"{answer_policy_block}\n\n"
+            f"[LTM 全量]\n{ltm_full or '无'}\n\n"
+            "[要求]\n结合上下文给出直接回答，尽量简洁。"
+        )
+    llm = _get_llm()
+    log_model_stage(
+        stage="summarize",
+        model=os.getenv("OPENAI_COMPATIBLE_MODEL", ""),
+        execution_path="fallback",
+        session_id=session_id,
+        user_id=user_id,
+    )
+    try:
+        response = await llm.ainvoke(
+            [
+                SystemMessage(content="你是对话助手。"),
+                HumanMessage(content=prompt),
+            ]
+        )
+        reply = _extract_model_text(response) or "我理解了你的问题，但暂时无法给出完整回答。"
+    except Exception as exc:
+        logger.warning("[chat-skill] summarize_fallback_reply failed: %s", exc, exc_info=True)
+        log_degrade_transition(from_stage="summarize", reason=f"fallback_summarize_failed: {exc}")
+        reply = "我暂时没能完成回答生成，请换一种问法再试。"
+
+    log_reply_completed(
+        mode="fallback",
+        session_id=session_id,
+        user_id=user_id,
+        selected_skill_family="fallback",
+        selected_skill="fallback",
+        used_tools=False,
+    )
+    return reply
+
+
+async def _run_post_rewrite_extractors_if_enabled(
+    *,
+    db: AsyncSession,
+    session: Session,
+    route: str,
+    skill_id: str | None,
+    user_message: str,
+    resolver_hint: dict[str, Any] | None,
+    rewrite_result: Any,
+    message_id: int | None,
+) -> None:
+    if not settings.enable_post_rewrite_extractors:
+        return
+    ctx = RewriteContextPacket(
+        route=route,  # type: ignore[arg-type]
+        skill_id=skill_id,
+        user_query=user_message,
+        active_entity=resolver_hint,
+        candidate_entities=list((resolver_hint or {}).get("candidate_entities") or []),
+        resolution_status=str((resolver_hint or {}).get("resolution_status") or "no_entity"),
+        working_state_prev=get_working_state(session),
+    )
+    try:
+        constraints_result, pref_result = await asyncio.gather(
+            extract_constraints(ctx, rewrite_result),
+            extract_reply_preference(ctx, rewrite_result),
+        )
+        if constraints_result.operation != "no_update":
+            from backend.services.working_state import upsert_constraints
+
+            await upsert_constraints(
+                db,
+                session,
+                constraints_result.constraints,
+                message_id=message_id,
+                confidence=constraints_result.confidence,
+            )
+        if pref_result.operation != "no_update":
+            from backend.services.working_state import upsert_reply_preference
+
+            await upsert_reply_preference(
+                db,
+                session,
+                pref_result.reply_preference_hint,
+                message_id=message_id,
+                confidence=pref_result.confidence,
+            )
+    except Exception as exc:
+        logger.warning("[chat-skill] post rewrite extractors failed (non-fatal): %s", exc, exc_info=True)
+
+
+def _trace_plan_artifacts(trace: dict[str, Any]) -> tuple[dict | None, dict | None, dict | None, str | None]:
+    executor = trace.get("executor") if isinstance(trace.get("executor"), dict) else {}
+    plan_artifact = None
+    if executor.get("plan_id") or executor.get("plan_preview"):
+        plan_artifact = {
+            "plan_id": executor.get("plan_id"),
+            "discovery_trace_id": executor.get("discovery_trace_id"),
+            "plan_preview": executor.get("plan_preview") or [],
+        }
+    skill_artifact = None
+    if executor.get("skill_loader_artifacts"):
+        skill_artifact = {
+            "skill_loader_artifacts": executor.get("skill_loader_artifacts") or [],
+            "skill_version": executor.get("skill_version") or "",
+            "spec_hash": executor.get("spec_hash") or "",
+            "registry_version": executor.get("registry_version") or "",
+        }
+    verification = executor.get("verification") if isinstance(executor.get("verification"), dict) else None
+    allowed = None
+    if verification:
+        allowed = str(verification.get("allowed_claim_level") or "") or None
+    allowed = allowed or str(executor.get("allowed_claim_level") or executor.get("evidence_allowed_claim_level") or "") or None
+    return plan_artifact, skill_artifact, verification, allowed
 
 
 async def _run_skill_chat_if_enabled(
@@ -552,108 +1265,872 @@ async def _run_skill_chat_if_enabled(
     session: Session,
     user_id: str,
     user_message: str,
+    sop_skill_id: str | None = None,
     exclude_message_id: int | None = None,
+    preloaded_memory_profile: dict | None = None,
+    preloaded_memory_system_prompt: str | None = None,
 ) -> tuple[str | None, dict, dict, str]:
     if not settings.enable_chat_skills:
-        return None, {}, {}, ""
+        return None, dict(preloaded_memory_profile or {}), {}, preloaded_memory_system_prompt or ""
 
     _ensure_skill_runtime_ready()
-    memory_profile, memory_system_prompt = await _load_memory_context_for_chat(db, user_id, user_message)
+    if preloaded_memory_profile is None or preloaded_memory_system_prompt is None:
+        memory_profile, memory_system_prompt = await _load_memory_context_for_chat(db, user_id, user_message)
+    else:
+        memory_profile = dict(preloaded_memory_profile)
+        memory_system_prompt = preloaded_memory_system_prompt
+    route_ltm_summary = _profile_to_route_summary(memory_profile)
+    _, route_context_slice_text, answer_policy_context = _resolve_session_summary_contexts(session)
     route_context = await _build_skill_route_context(
         db,
         session,
         exclude_message_id=exclude_message_id,
+        route_slice_text=route_context_slice_text,
     )
+    resolver_hint = None
+    if settings.enable_entity_resolver_v2:
+        previous_active = get_working_state(session).get("active_entity")
+        with trace_span("entity_resolution_v2", stage="entity_resolution_v2", data={"enabled": True}):
+            entity_v2 = await resolve_authoritative_entity(
+                user_message,
+                allowed_asset_types={"stock", "fund", "sector", "index"},
+                previous_active_entity=previous_active if isinstance(previous_active, dict) else None,
+                source_message_id=exclude_message_id,
+            )
+        entity_payload = entity_v2.model_dump() if hasattr(entity_v2, "model_dump") else entity_v2.dict()
+        if entity_v2.primary_entity is not None:
+            primary = entity_v2.primary_entity
+            resolver_hint = {
+                "display_name": primary.display_name,
+                "asset_type": primary.entity_type,
+                "symbol": primary.canonical_id,
+                "confidence": entity_v2.confidence,
+                "resolver_stage": primary.resolver_path,
+                "resolver_source": "entity_resolver_v2",
+                "resolution_status": entity_v2.resolution_status,
+                "candidate_entities": [item.model_dump() for item in entity_v2.candidate_entities],
+            }
+            await upsert_active_entity(
+                db,
+                session,
+                {**resolver_hint, "entity_type": primary.entity_type, "canonical_id": primary.canonical_id},
+                message_id=exclude_message_id,
+                confidence=entity_v2.confidence,
+            )
+        if entity_v2.need_clarification:
+            await upsert_active_entity(
+                db,
+                session,
+                {"resolution_status": entity_v2.resolution_status, "candidate_entities": entity_payload.get("candidate_entities", [])},
+                message_id=exclude_message_id,
+                confidence=entity_v2.confidence,
+            )
+            return (
+                entity_v2.clarification_question or "我需要先确认一下你说的是哪个标的？",
+                memory_profile,
+                {
+                    "selected_skill_family": "clarification",
+                    "selected_skill": "entity-clarification",
+                    "skill_name": None,
+                    "analysis_mode": "entity_resolution",
+                    "execution_policy": "deterministic",
+                    "entity_resolution": entity_payload,
+                    "executor": {"reply_mode": "clarification", "used_tools": False},
+                },
+                memory_system_prompt,
+            )
+    else:
+        resolver_hint = await _resolve_entity_hint_for_route(session, user_message)
+    resolver_hint_block = _resolver_hint_to_prompt_block(resolver_hint)
+    if resolver_hint_block:
+        route_context = f"{resolver_hint_block}\n\n{route_context}" if route_context else resolver_hint_block
+    normalized_sop_skill_id = normalize_requested_sop_skill_id(sop_skill_id)
+    skipped_llm_router = normalized_sop_skill_id is not None
+    route_source = "user_explicit" if skipped_llm_router else "llm"
     with trace_span(
         "route",
         stage="route",
         data={
             "user_query_summary": _trace_query_summary(user_message),
-            "profile_summary_used": bool(_profile_to_route_summary(memory_profile)),
+            "profile_summary_used": bool(route_ltm_summary),
+            "user_sop_skill_id": normalized_sop_skill_id,
+            "skipped_llm_router": skipped_llm_router,
         },
     ):
-        route = await route_chat_skill(
-            user_message,
-            conversation_context=route_context,
-            profile_summary=_profile_to_route_summary(memory_profile),
-        )
+        if normalized_sop_skill_id is not None:
+            decision = user_explicit_sop_decision(normalized_sop_skill_id)
+            if decision is None:
+                raise InvalidSopSkillError(f"无效的 sop_skill_id: {normalized_sop_skill_id}")
+        else:
+            decision = await route_chat_skill(
+                user_message,
+                conversation_context=route_context,
+                profile_summary=route_ltm_summary,
+                enable_route_v2=settings.enable_route_v2,
+                active_entity=resolver_hint,
+            )
+    route_trace = _build_executor_route_trace(decision, user_message)
+    if skipped_llm_router:
+        route_trace["confidence"] = 1.0
     log_model_stage(
         stage="router",
-        model=(route.arguments or {}).get("router_model"),
+        model=None,
         execution_path="routing",
         session_id=session.id,
         user_id=user_id,
+        route_source=route_source,
+        skipped_llm_router=skipped_llm_router,
     )
     log_router_decision(
-        selected_skill_family=route.selected_skill_family,
-        selected_skill=route.selected_skill,
-        skill_name=route.skill_name,
-        confidence=route.confidence,
-        why=route.why,
-        needs_realtime_data=route.needs_realtime_data,
-        needs_professional_analysis=route.needs_professional_analysis,
-        analysis_mode=route.analysis_mode,
-        execution_policy=route.execution_policy,
-        effective_query=(route.arguments or {}).get("effective_query"),
-        profile_summary_used=bool((route.arguments or {}).get("profile_summary_used")),
-        router_model=(route.arguments or {}).get("router_model"),
+        route=decision.route,
+        skill_id=decision.skill_id,
+        execution_policy=decision.execution_policy,
+        session_id=session.id,
+        user_id=user_id,
+        route_source=route_source,
+        route_confidence=1.0 if skipped_llm_router else None,
+    )
+    logger.info(
+        "[chat-skill] route=%s skill_id=%s execution_policy=%s selected_skill=%s route_source=%s",
+        decision.route,
+        decision.skill_id or "",
+        decision.execution_policy,
+        route_trace.get("selected_skill"),
+        route_source,
+    )
+
+    if bool(route_trace.get("need_confirm")) and settings.enable_skill_route_hitl:
+        options = _build_skill_confirm_options_from_trace(route_trace)
+        payload = {
+            "session_id": session.id,
+            "user_id": user_id,
+            "user_message": user_message,
+            "route_context": route_context,
+            "route_dict": route_trace,
+            "options": options,
+            "reasoning": str((route_trace.get("route_stage1") or {}).get("reasoning_brief") or "需要确认是否进入技能链路"),
+            "resolved_query": user_message,
+            "confidence": float(route_trace.get("confidence") or 0.0),
+        }
+        set_pending_skill_confirm(session.id, payload)
+        return (
+            "",
+            memory_profile,
+            {
+                **route_trace,
+                "hitl_pending": True,
+                "skill_confirm": {
+                    "options": options,
+                    "reasoning": payload["reasoning"],
+                    "resolved_query": user_message,
+                    "confidence": payload["confidence"],
+                },
+            },
+            memory_system_prompt,
+        )
+
+    if decision.route == "sop":
+        rewrite_result = await rewrite_for_sop(
+            decision,
+            user_message,
+            stm_snapshot=route_context,
+            ltm_summary=route_ltm_summary,
+            resolver_hint=resolver_hint,
+        )
+        await _run_post_rewrite_extractors_if_enabled(
+            db=db,
+            session=session,
+            route="financial-sop",
+            skill_id=decision.skill_id,
+            user_message=user_message,
+            resolver_hint=resolver_hint,
+            rewrite_result=rewrite_result,
+            message_id=exclude_message_id,
+        )
+
+        args = dict(route_trace.get("arguments") or {})
+        args["effective_query"] = rewrite_result.effective_query
+        args["skill_params"] = dict(rewrite_result.skill_params or {})
+        if resolver_hint:
+            args["resolved_entity_hint"] = dict(resolver_hint)
+            args["inherited_entity"] = str(resolver_hint.get("display_name") or "")
+            args["inherited_entity_id"] = str(resolver_hint.get("symbol") or "")
+        args["candidate_entities"] = [item.display_name for item in rewrite_result.entities]
+        args["entities"] = [
+            item.model_dump() if hasattr(item, "model_dump") else item.dict()
+            for item in rewrite_result.entities
+        ]
+        route_trace["arguments"] = args
+
+        _exec_data = {
+            "selected_skill": route_trace.get("selected_skill"),
+            "skill_name": route_trace.get("skill_name"),
+            "analysis_mode": route_trace.get("analysis_mode"),
+            "execution_policy": route_trace.get("execution_policy"),
+        }
+        if settings.enable_sop_v2:
+            sop_skill_id = _resolve_sop_skill_id(route_trace, decision)
+            skill_spec = get_skill_registry().load_skill_spec(sop_skill_id)
+            if not skill_spec:
+                raise ValueError(f"SOP v2 缺少 skill_spec.yaml: {sop_skill_id or decision.skill_id}")
+            with trace_span("executor_v2", stage="executor", data={**_exec_data, "version": "v2"}):
+                v2_result = await run_sop_v2_pipeline(
+                    skill_name=sop_skill_id,
+                    skill_spec=skill_spec,
+                    user_message=user_message,
+                    rewrite_result=rewrite_result,
+                    active_entity=resolver_hint,
+                    trace_id=session.id,
+                    config=settings,
+                )
+            result_trace = v2_result.tool_data().get("executor_trace") or {}
+            tool_data = v2_result.tool_data()
+            log_tool_plan(
+                planner_type="sop_v2",
+                analysis_mode=str(route_trace.get("analysis_mode") or "general_chat"),
+                planned_tools=list(result_trace.get("planned_tools") or []),
+                plan_preview=list(result_trace.get("plan_preview") or []),
+                execution_path=str(route_trace.get("execution_policy") or "deterministic"),
+                skill_name=sop_skill_id,
+                plan_id=result_trace.get("plan_id"),
+            )
+        else:
+            with trace_span("executor", stage="executor", data=_exec_data):
+                result = await execute_skill(
+                    selected_skill=str(route_trace.get("selected_skill") or "fallback"),
+                    user_message=user_message,
+                    memory_context=memory_system_prompt,
+                    answer_policy_context=answer_policy_context,
+                    profile_summary=_profile_to_summary(memory_profile),
+                    session_id=session.id,
+                    user_id=user_id,
+                    route_trace=route_trace,
+                    enable_tushare_skills=settings.enable_tushare_skills,
+                    enable_tushare_planner=settings.enable_tushare_planner,
+                    enable_tushare_market_tools=settings.enable_tushare_market_tools,
+                    enable_tushare_index_tools=settings.enable_tushare_index_tools,
+                    enable_tushare_sector_tools=settings.enable_tushare_sector_tools,
+                    enable_fundamental_analysis=settings.enable_fundamental_analysis,
+                    enable_sector_analysis=settings.enable_sector_analysis,
+                    enable_stock_selection=settings.enable_stock_selection,
+                    enable_deterministic_skill_execution=settings.enable_deterministic_skill_execution,
+                    enable_tool_prefetch_concurrency=settings.enable_tool_prefetch_concurrency,
+                )
+            result_trace = result.trace
+            tool_data = {"executor_trace": result.trace, "route_arguments": args}
+        reply = await summarize_sop_reply(
+            effective_query=rewrite_result.effective_query,
+            tool_data={**tool_data, "route_arguments": args},
+            answer_policy_context=answer_policy_context,
+            ltm_full=memory_system_prompt,
+            skill_id=str(decision.skill_id or ""),
+            session_id=session.id,
+            user_id=user_id,
+        )
+        trace = dict(route_trace)
+        trace["executor"] = result_trace
+        return reply, memory_profile, trace, memory_system_prompt
+
+    if decision.route == "tushare":
+        use_tushare_v2_pipeline = (
+            settings.enable_tushare_v2
+            and settings.enable_planner_v2
+            and settings.enable_executor_v2
+        )
+        if use_tushare_v2_pipeline:
+            rewrite_ctx = RewriteContextPacket(
+                route="tushare-data",
+                user_query=user_message,
+                active_entity=resolver_hint,
+                working_state_prev=get_working_state(session),
+            )
+            rewrite_result = await rewrite_for_tushare_v2(rewrite_ctx)
+        else:
+            rewrite_result = await rewrite_for_tushare(
+                decision,
+                user_message,
+                stm_snapshot=route_context,
+                ltm_summary=route_ltm_summary,
+                resolver_hint=resolver_hint,
+            )
+        await _run_post_rewrite_extractors_if_enabled(
+            db=db,
+            session=session,
+            route="tushare-data",
+            skill_id=None,
+            user_message=user_message,
+            resolver_hint=resolver_hint,
+            rewrite_result=rewrite_result,
+            message_id=exclude_message_id,
+        )
+        args = dict(route_trace.get("arguments") or {})
+        args["effective_query"] = rewrite_result.effective_query
+        if resolver_hint:
+            args["resolved_entity_hint"] = dict(resolver_hint)
+            args["inherited_entity"] = str(resolver_hint.get("display_name") or "")
+            args["inherited_entity_id"] = str(resolver_hint.get("symbol") or "")
+        args["entities"] = [
+            item.model_dump() if hasattr(item, "model_dump") else item.dict()
+            for item in rewrite_result.entities
+        ]
+        if hasattr(rewrite_result, "tool_plan"):
+            args["tool_plan"] = [
+                item.model_dump() if hasattr(item, "model_dump") else item.dict()
+                for item in rewrite_result.tool_plan
+            ]
+        route_trace["arguments"] = args
+        planned_tool_names = [step.tool_name for step in getattr(rewrite_result, "tool_plan", [])]
+        log_tool_plan(
+            planner_type="rewrite_tushare_v2" if use_tushare_v2_pipeline else "rewrite_tushare",
+            analysis_mode="general_chat",
+            planned_tools=planned_tool_names,
+            execution_path="deterministic",
+            tool_batch_size=len(planned_tool_names),
+        )
+        if use_tushare_v2_pipeline:
+            with trace_span(
+                "executor_v2",
+                stage="executor",
+                data={"selected_skill": "tushare-data", "analysis_mode": "general_chat", "version": "v2"},
+            ):
+                v2_result = await run_tushare_v2_pipeline(
+                    rewrite_result=rewrite_result,
+                    active_entity=resolver_hint,
+                    trace_id=session.id,
+                    config=settings,
+                )
+            tool_data = v2_result.tool_data()
+        else:
+            with trace_span(
+                "executor",
+                stage="executor",
+                data={"selected_skill": "tushare-data", "analysis_mode": "general_chat"},
+            ):
+                tool_data = await execute_tushare_plan(
+                    rewrite_result.tool_plan,
+                    rewrite_result.entities,
+                    session_id=session.id,
+                    user_id=user_id,
+                    decision=decision,
+                    user_message=rewrite_result.effective_query,
+                    stm_snapshot=route_context,
+                    ltm_summary=route_ltm_summary,
+                )
+        reply = await summarize_tushare_reply(
+            effective_query=rewrite_result.effective_query,
+            tool_data=tool_data,
+            answer_policy_context=answer_policy_context,
+            ltm_full=memory_system_prompt,
+            session_id=session.id,
+            user_id=user_id,
+        )
+        trace = dict(route_trace)
+        trace["executor"] = dict(tool_data.get("executor_trace") or {})
+        return reply, memory_profile, trace, memory_system_prompt
+
+    rewrite_result = await rewrite_for_fallback(
+        user_message,
+        stm_snapshot=route_context,
+        ltm_summary=route_ltm_summary,
+        resolver_hint=resolver_hint,
+    )
+    await _run_post_rewrite_extractors_if_enabled(
+        db=db,
+        session=session,
+        route="fallback",
+        skill_id=None,
+        user_message=user_message,
+        resolver_hint=resolver_hint,
+        rewrite_result=rewrite_result,
+        message_id=exclude_message_id,
+    )
+    args = dict(route_trace.get("arguments") or {})
+    args["effective_query"] = rewrite_result.effective_query
+    if resolver_hint:
+        args["resolved_entity_hint"] = dict(resolver_hint)
+        args["inherited_entity"] = str(resolver_hint.get("display_name") or "")
+        args["inherited_entity_id"] = str(resolver_hint.get("symbol") or "")
+    route_trace["arguments"] = args
+    reply = await summarize_fallback_reply(
+        effective_query=rewrite_result.effective_query,
+        answer_policy_context=answer_policy_context,
+        ltm_full=memory_system_prompt,
         session_id=session.id,
         user_id=user_id,
     )
-    logger.info(
-        "[chat-skill] route=%s confidence=%.2f why=%s realtime=%s professional=%s mode=%s follow_up=%s",
-        route.selected_skill,
-        route.confidence,
-        route.why,
-        route.needs_realtime_data,
-        route.needs_professional_analysis,
-        route.analysis_mode,
-        bool((route.arguments or {}).get("is_follow_up")),
+    route_trace["executor"] = {
+        "selected_skill_family": "fallback",
+        "selected_skill": "fallback",
+        "skill_name": None,
+        "analysis_mode": "general_chat",
+        "execution_policy": "deterministic",
+        "reply_mode": "fallback",
+        "used_tools": False,
+        "planned_tools": [],
+        "prefetched_tool_names": [],
+        "evidence_ok": False,
+        "missing_evidence_reasons": [],
+        "failure_code": "",
+    }
+    return reply, memory_profile, route_trace, memory_system_prompt
+
+
+async def confirm_skill_route(
+    db: AsyncSession,
+    user_id: str,
+    session_id: str,
+    user_choice: str,
+) -> tuple[str, dict, object, dict | None]:
+    """
+    Resume a low-confidence route after user confirms skill choice (HITL).
+    Consumes one pending record from chat_hitl_pending.
+    """
+    pending = pop_pending_skill_confirm(session_id)
+    if not pending or pending.get("user_id") != user_id:
+        raise ValueError("没有待确认的路由，或已过期。请重新发送消息。")
+
+    session_result = await db.execute(
+        select(Session).where(Session.id == session_id, Session.user_id == user_id)
     )
+    session = session_result.scalar_one_or_none()
+    if not session:
+        raise ValueError("会话不存在")
 
-    if route.selected_skill == "fallback":
-        return None, memory_profile, route.to_dict(), memory_system_prompt
+    user_message = str(pending.get("user_message") or "")
+    route_dict = _apply_hitl_choice_to_route_dict(pending.get("route_dict") or {}, user_choice)
+    route_trace = dict(route_dict)
 
-    with trace_span(
-        "executor",
-        stage="executor",
-        data={
-            "selected_skill_family": route.selected_skill_family,
-            "selected_skill": route.selected_skill,
-            "skill_name": route.skill_name,
-            "analysis_mode": route.analysis_mode,
-            "execution_policy": route.execution_policy,
-        },
-    ):
-        result = await execute_skill(
-            selected_skill=route.selected_skill,
-            user_message=user_message,
-            memory_context=memory_system_prompt,
-            running_summary=session.running_summary or "",
-            profile_summary=_profile_to_summary(memory_profile),
+    memory_profile, memory_system_prompt = await _load_memory_context_for_chat(db, user_id, user_message)
+    _, _, answer_policy_context = _resolve_session_summary_contexts(session)
+    turn_trace: dict = dict(route_trace)
+
+    if str(route_trace.get("selected_skill") or "") == "fallback":
+        llm = _get_llm()
+        lc_messages = await _build_fallback_chat_messages(
+            db,
+            session,
+            memory_system_prompt=memory_system_prompt,
+        )
+        try:
+            response = await llm.ainvoke(lc_messages)
+        except Exception as exc:
+            if not _is_context_overflow_error(exc):
+                raise
+            recovered = await _force_overflow_recovery_compaction(
+                db,
+                session,
+                user_message=user_message,
+                exc=exc,
+            )
+            if not recovered:
+                raise
+            lc_messages = await _build_fallback_chat_messages(
+                db,
+                session,
+                memory_system_prompt=memory_system_prompt,
+            )
+            response = await llm.ainvoke(lc_messages)
+        reply_text = response.content if hasattr(response, "content") else str(response)
+        log_reply_completed(
+            mode="fallback-hitl-confirm",
             session_id=session.id,
             user_id=user_id,
-            route_trace=route.to_dict(),
-            enable_tushare_skills=settings.enable_tushare_skills,
-            enable_tushare_planner=settings.enable_tushare_planner,
-            enable_tushare_market_tools=settings.enable_tushare_market_tools,
-            enable_tushare_index_tools=settings.enable_tushare_index_tools,
-            enable_tushare_sector_tools=settings.enable_tushare_sector_tools,
-            enable_fundamental_analysis=settings.enable_fundamental_analysis,
-            enable_sector_analysis=settings.enable_sector_analysis,
-            enable_stock_selection=settings.enable_stock_selection,
-            enable_deterministic_skill_execution=settings.enable_deterministic_skill_execution,
-            enable_tool_prefetch_concurrency=settings.enable_tool_prefetch_concurrency,
+            selected_skill_family="fallback",
+            selected_skill="fallback",
+            analysis_mode="general_chat",
+            execution_policy="agentic",
         )
-    trace = route.to_dict()
-    trace["executor"] = result.trace
-    return result.reply_text, memory_profile, trace, memory_system_prompt
+    else:
+        _exec_data = {
+            "selected_skill_family": route_trace.get("selected_skill_family"),
+            "selected_skill": route_trace.get("selected_skill"),
+            "skill_name": route_trace.get("skill_name"),
+            "analysis_mode": route_trace.get("analysis_mode"),
+            "execution_policy": route_trace.get("execution_policy"),
+        }
+        with trace_span("executor", stage="executor", data=_exec_data):
+            result = await execute_skill(
+                selected_skill=str(route_trace.get("selected_skill") or "fallback"),
+                user_message=user_message,
+                memory_context=memory_system_prompt,
+                answer_policy_context=answer_policy_context,
+                profile_summary=_profile_to_summary(memory_profile),
+                session_id=session.id,
+                user_id=user_id,
+                route_trace=route_trace,
+                enable_tushare_skills=settings.enable_tushare_skills,
+                enable_tushare_planner=settings.enable_tushare_planner,
+                enable_tushare_market_tools=settings.enable_tushare_market_tools,
+                enable_tushare_index_tools=settings.enable_tushare_index_tools,
+                enable_tushare_sector_tools=settings.enable_tushare_sector_tools,
+                enable_fundamental_analysis=settings.enable_fundamental_analysis,
+                enable_sector_analysis=settings.enable_sector_analysis,
+                enable_stock_selection=settings.enable_stock_selection,
+                enable_deterministic_skill_execution=settings.enable_deterministic_skill_execution,
+                enable_tool_prefetch_concurrency=settings.enable_tool_prefetch_concurrency,
+            )
+        if _executor_qualifies_for_evidence_retry(result.trace):
+            reasons = (result.trace or {}).get("missing_evidence_reasons") or []
+            fb = "; ".join(str(x) for x in reasons[:8])
+            with trace_span("executor_retry", stage="executor", data={**_exec_data, "retry": True}):
+                result = await execute_skill(
+                    selected_skill=str(route_trace.get("selected_skill") or "fallback"),
+                    user_message=user_message,
+                    memory_context=memory_system_prompt,
+                    answer_policy_context=answer_policy_context,
+                    profile_summary=_profile_to_summary(memory_profile),
+                    session_id=session.id,
+                    user_id=user_id,
+                    route_trace=route_trace,
+                    enable_tushare_skills=settings.enable_tushare_skills,
+                    enable_tushare_planner=settings.enable_tushare_planner,
+                    enable_tushare_market_tools=settings.enable_tushare_market_tools,
+                    enable_tushare_index_tools=settings.enable_tushare_index_tools,
+                    enable_tushare_sector_tools=settings.enable_tushare_sector_tools,
+                    enable_fundamental_analysis=settings.enable_fundamental_analysis,
+                    enable_sector_analysis=settings.enable_sector_analysis,
+                    enable_stock_selection=settings.enable_stock_selection,
+                    enable_deterministic_skill_execution=settings.enable_deterministic_skill_execution,
+                    enable_tool_prefetch_concurrency=settings.enable_tool_prefetch_concurrency,
+                )
+        reply_text = result.reply_text
+        turn_trace = dict(route_trace)
+        turn_trace["executor"] = result.trace
+        log_reply_completed(
+            mode="skill-hitl-confirm",
+            session_id=session.id,
+            user_id=user_id,
+            selected_skill_family=turn_trace.get("selected_skill_family"),
+            selected_skill=turn_trace.get("selected_skill"),
+            skill_name=turn_trace.get("skill_name"),
+            analysis_mode=turn_trace.get("analysis_mode"),
+            execution_policy=turn_trace.get("execution_policy"),
+        )
+
+    if settings.enable_memory and user_id:
+        reply_text = await _prepare_reply_for_user(reply_text, user_id=user_id, db=db)
+
+    _record_route_runtime_with_log(
+        session_id=session.id,
+        user_message=user_message,
+        route_trace=turn_trace,
+        reply_text=reply_text,
+    )
+    route_summary = _build_route_summary(turn_trace)
+
+    ai_msg = Message(
+        session_id=session.id,
+        role="assistant",
+        content=str(reply_text or ""),
+        token_count=count_message_tokens("assistant", str(reply_text or ""))[0],
+        route_summary_json=_persistable_route_summary(route_summary),
+    )
+    db.add(ai_msg)
+    session.turn_count = (session.turn_count or 0) + 1
+    session.updated_at = datetime.utcnow()
+    await db.flush()
+    user_msg_id_result = await db.execute(
+        select(Message.id)
+        .where(Message.session_id == session.id, Message.role == "user")
+        .order_by(Message.id.desc())
+        .limit(1)
+    )
+    latest_user_msg_id = user_msg_id_result.scalar_one_or_none()
+    await _apply_route_entities_to_stm_with_log(
+        db=db,
+        session=session,
+        user_message=user_message,
+        route_trace=turn_trace,
+    )
+    if latest_user_msg_id is not None:
+        logger.info(
+            "[STM-chat] 旧异步 STM 链路已停用: session=%s user_msg=%s assistant_msg=%s",
+            session.id,
+            latest_user_msg_id,
+            ai_msg.id,
+        )
+    context_window = await refresh_session_context_metrics(db, session)
+    context_window = enrich_context_window(context_window, session.id)
+    await db.commit()
+
+    if settings.enable_memory and user_id:
+        asyncio.create_task(maybe_update_ltm_from_chat(session.id, user_id, session.turn_count))
+        log_memory_enqueue(
+            session_id=session.id,
+            user_id=user_id,
+            queued=True,
+            turn_index=session.turn_count,
+        )
+
+    return reply_text, memory_profile, context_window, route_summary
 
 
 def _chunk_text(text: str, chunk_size: int = _CHAT_STREAM_CHUNK_SIZE) -> list[str]:
     if not text:
         return []
     return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
+
+
+def _context_window_to_payload(context_window) -> dict:
+    if context_window is None:
+        return {}
+    if hasattr(context_window, "model_dump"):
+        return context_window.model_dump(mode="json")
+    if hasattr(context_window, "dict"):
+        return context_window.dict()
+    return dict(context_window)
+
+
+def _unique_strings(values: list[object], *, limit: int = 6) -> list[str]:
+    items: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in items:
+            continue
+        items.append(text)
+        if len(items) >= limit:
+            break
+    return items
+
+
+def _route_summary_skill_label(
+    *,
+    skill_contract: str,
+    skill_name: str | None,
+    selected_skill_family: str,
+    selected_skill: str,
+) -> str:
+    """用户可见技能名：优先 SOP 注册表 official_name，其次 skill id，避免只显示 tushare-data。"""
+    sid = (skill_contract or (skill_name or "")).strip()
+    if sid:
+        meta = get_skill_registry().get_skill(sid)
+        if meta:
+            on = (meta.official_name or "").strip()
+            if on and on != sid:
+                return on
+        return sid
+    if selected_skill == "fallback":
+        return "普通对话"
+    if selected_skill_family == "tushare-data" or selected_skill == "tushare-data":
+        return "实时数据（Tushare）"
+    return selected_skill_family or selected_skill
+
+
+def _build_route_summary(skill_trace: dict | None) -> dict | None:
+    trace = skill_trace or {}
+    if not trace:
+        return None
+    executor = trace.get("executor") if isinstance(trace.get("executor"), dict) else {}
+    accepted_evidences = executor.get("accepted_evidences") if isinstance(executor.get("accepted_evidences"), list) else []
+    evidence_tools = [
+        item.get("tool_name")
+        for item in accepted_evidences
+        if isinstance(item, dict) and item.get("tool_name")
+    ]
+    attempted_tools = executor.get("prefetched_tool_names") if isinstance(executor.get("prefetched_tool_names"), list) else []
+    planned_tools = executor.get("planned_tools") if isinstance(executor.get("planned_tools"), list) else []
+    notes = executor.get("missing_evidence_reasons") if isinstance(executor.get("missing_evidence_reasons"), list) else []
+
+    selected_skill_family = str(trace.get("selected_skill_family") or executor.get("selected_skill_family") or "fallback")
+    selected_skill = str(trace.get("selected_skill") or executor.get("selected_skill") or selected_skill_family or "fallback")
+    if selected_skill_family == "fallback" and selected_skill == "fallback" and executor:
+        selected_skill_family = str(executor.get("selected_skill_family") or selected_skill_family)
+
+    route_kind = str(trace.get("route_kind") or executor.get("route_kind") or "")
+    grounding_policy = str(trace.get("grounding_policy") or executor.get("grounding_policy") or "")
+    claim_policy = str(trace.get("claim_policy") or executor.get("claim_policy") or "")
+    skill_contract = str(trace.get("skill_contract") or executor.get("skill_contract") or "")
+    failure_code = str(executor.get("failure_code") or "")
+    sn = str(trace.get("skill_name") or executor.get("skill_name") or "").strip() or None
+    verification = executor.get("verification") if isinstance(executor.get("verification"), dict) else {}
+    verification_status = str(verification.get("status") or "")
+    evidence_status = "ok" if bool(executor.get("evidence_ok")) else "missing"
+    if verification_status == "partial":
+        evidence_status = "partial"
+    elif verification_status == "insufficient":
+        evidence_status = "missing"
+
+    user_facing = {
+        "skill_label": _route_summary_skill_label(
+            skill_contract=skill_contract,
+            skill_name=sn,
+            selected_skill_family=selected_skill_family,
+            selected_skill=selected_skill,
+        ),
+        "analysis_mode": str(trace.get("analysis_mode") or executor.get("analysis_mode") or "general_chat"),
+        "evidence_status": evidence_status,
+        "failure_hint": failure_code if failure_code else "",
+    }
+    debug = {
+        "route_kind": route_kind,
+        "grounding_policy": grounding_policy,
+        "claim_policy": claim_policy,
+        "skill_contract": skill_contract,
+        "evidence_tier": str(executor.get("evidence_tier") or ""),
+        "evidence_missing_dimensions": list(executor.get("evidence_missing_dimensions") or verification.get("missing_dimensions") or []),
+        "evidence_allowed_claim_level": str(executor.get("evidence_allowed_claim_level") or verification.get("allowed_claim_level") or ""),
+        "failure_code": failure_code,
+    }
+
+    return {
+        "selected_skill_family": selected_skill_family or "fallback",
+        "selected_skill": selected_skill or "fallback",
+        "skill_name": sn,
+        "analysis_mode": str(trace.get("analysis_mode") or executor.get("analysis_mode") or "general_chat"),
+        "execution_policy": str(trace.get("execution_policy") or executor.get("execution_policy") or "agentic"),
+        "reply_mode": str(executor.get("reply_mode") or ("fallback" if selected_skill == "fallback" else "skill")),
+        "route_confidence": round(float(trace.get("confidence") or 0.0), 4),
+        "used_tools": bool(executor.get("used_tools") or evidence_tools or attempted_tools),
+        "evidence_ok": bool(executor.get("evidence_ok")),
+        "tools_used": _unique_strings(evidence_tools),
+        "tools_attempted": _unique_strings(list(attempted_tools) + list(planned_tools)),
+        "notes": _unique_strings(notes, limit=3),
+        "route_kind": route_kind,
+        "grounding_policy": grounding_policy,
+        "claim_policy": claim_policy,
+        "skill_contract": skill_contract,
+        "failure_code": failure_code,
+        "user_facing": user_facing,
+        "debug": debug,
+        # FIX-3: entity info from executor
+        "resolved_company": str(executor.get("resolved_company") or ""),
+        "resolved_symbol": str(executor.get("resolved_symbol") or ""),
+    }
+
+
+def _persistable_route_summary(route_summary: dict | None) -> dict | None:
+    """Extract the user-facing portion of route_summary for persistence.
+
+    Debug information is deliberately excluded from stored messages
+    to keep history payloads lean and avoid leaking internal details.
+    """
+    if not route_summary:
+        return None
+    kept_keys = {
+        "selected_skill_family", "selected_skill", "skill_name",
+        "analysis_mode", "execution_policy", "reply_mode",
+        "route_confidence", "used_tools", "evidence_ok",
+        "tools_used", "tools_attempted", "notes",
+        "user_facing", "resolved_company", "resolved_symbol",
+    }
+    return {k: v for k, v in route_summary.items() if k in kept_keys}
+
+
+def _record_route_runtime_with_log(
+    *,
+    session_id: str,
+    user_message: str,
+    route_trace: dict | None,
+    reply_text: str,
+) -> Any | None:
+    if not route_trace:
+        return None
+    state = record_route_runtime_state(
+        session_id=session_id,
+        user_message=user_message,
+        route_trace=route_trace,
+        reply_text=reply_text,
+    )
+    logger.info(
+        "[chat-route-state] session=%s entity=%s mode=%s tool_status=%s fail_streak=%s followup_dim=%s",
+        session_id,
+        state.last_active_entity or "",
+        state.last_analysis_mode or "",
+        state.last_tool_status or "",
+        int(state.inherited_fail_streak or 0),
+        state.last_followup_dimension or "",
+    )
+    return state
+
+
+def _route_trace_to_summary_entities(route_trace: dict | None) -> list[dict[str, Any]]:
+    if not isinstance(route_trace, dict):
+        return []
+    executor = route_trace.get("executor") if isinstance(route_trace.get("executor"), dict) else {}
+    if str(route_trace.get("selected_skill") or "") == "fallback":
+        return []
+    if executor and executor.get("evidence_ok") is False:
+        return []
+
+    args = route_trace.get("arguments") if isinstance(route_trace.get("arguments"), dict) else {}
+    candidates: list[dict[str, Any]] = []
+
+    def _append_entity(raw: dict[str, Any] | None, *, source: str) -> None:
+        if not isinstance(raw, dict):
+            return
+        canonical_id = str(
+            raw.get("canonical_id")
+            or raw.get("symbol")
+            or raw.get("inherited_entity_id")
+            or ""
+        ).strip()
+        display_name = str(
+            raw.get("display_name")
+            or raw.get("company_name")
+            or raw.get("name")
+            or raw.get("inherited_entity")
+            or ""
+        ).strip()
+        entity_type = str(raw.get("entity_type") or raw.get("asset_type") or "stock").strip() or "stock"
+        if not canonical_id and not display_name:
+            return
+        candidate = {
+            "canonical_id": canonical_id,
+            "display_name": display_name,
+            "entity_type": entity_type,
+            "status": "active",
+            "confidence": "high",
+            "source": source,
+            "evidence_text": display_name or canonical_id,
+        }
+        if candidate not in candidates:
+            candidates.append(candidate)
+
+    _append_entity(args.get("resolved_entity_hint"), source="resolver_hint")
+    for item in list(args.get("entities") or []):
+        _append_entity(item, source="route_trace_entities")
+    _append_entity(
+        {
+            "canonical_id": executor.get("resolved_symbol"),
+            "display_name": executor.get("resolved_company"),
+            "entity_type": "stock",
+        },
+        source="executor_trace",
+    )
+    return candidates
+
+
+async def _apply_route_entities_to_stm_with_log(
+    *,
+    db: AsyncSession,
+    session: Session,
+    user_message: str,
+    route_trace: dict | None,
+) -> list[str]:
+    if not settings.enable_stm or not route_trace:
+        return []
+    candidate_entities = _route_trace_to_summary_entities(route_trace)
+    if not candidate_entities:
+        return []
+    _, updated_fields = await apply_route_entity_hot_update(
+        session,
+        user_message=user_message,
+        candidate_entities=candidate_entities,
+    )
+    if not updated_fields:
+        return []
+    await db.flush()
+    logger.info(
+        "event=route_entities_synced_to_stm session=%s updated_fields=%s entities=%s",
+        session.id,
+        ",".join(updated_fields),
+        ",".join(
+            str(item.get("canonical_id") or item.get("display_name") or "").strip()
+            for item in candidate_entities
+            if isinstance(item, dict)
+        ),
+    )
+    return updated_fields
 
 
 def _strip_profile_actions_from_reply(reply_text: str) -> str:
@@ -783,23 +2260,37 @@ async def rename_session(
 # ─────────────────────────────────────────────────────────────
 # Phase 2 STM：compress_if_needed
 # ─────────────────────────────────────────────────────────────
-async def compress_if_needed(db: AsyncSession, session_id: str) -> Optional[dict]:
+async def compress_if_needed(
+    db: AsyncSession,
+    session_id: str,
+    *,
+    trigger: str = "fallback_sync_compaction",
+    force: bool = False,
+) -> Optional[dict]:
     """
-    检查并在必要时压缩对话历史（对话模式 STM）。
+    Legacy STM 同步压缩入口。
 
-    触发条件：DB 中该会话的未压缩消息数 >= _STM_COMPRESS_THRESHOLD（10）。
-    压缩逻辑：
-      1. 调用 LLM + _SUMMARIZE_CONVERSATION_PROMPT → 新 running_summary
-      2. 更新 sessions.running_summary / last_compress_at
-      3. 将已压缩的消息打上 is_compressed=True 标记（保留原文）
-    返回压缩结果 dict（压缩后），或 None（未触发压缩）。
+    当前默认主链路已经切到：
+      refresh metrics -> pre_compaction 判定 -> 同步 compaction / fallback
 
-    注意：此函数不使用 ExecutionLogger，仅通过 logger（setup_logger）记录日志。
+    本函数保留给以下场景使用：
+      1. overflow fallback（上下文超限时的应急压缩）
+      2. admin/debug repair
+      3. emergency compaction
+
+    Phase 2 起，本函数不再自己拼摘要 prompt，而是复用统一的
+    `stm_summary_runtime.run_summary_compaction(...)`。
     """
     if not settings.enable_stm:
         return None  # ENABLE_STM=false 时跳过
 
-    # 查找未压缩消息
+    session_result = await db.execute(
+        select(Session).where(Session.id == session_id)
+    )
+    session = session_result.scalar_one_or_none()
+    if not session:
+        return None
+
     result = await db.execute(
         select(Message)
         .where(Message.session_id == session_id, Message.is_compressed == False)  # noqa: E712
@@ -807,156 +2298,89 @@ async def compress_if_needed(db: AsyncSession, session_id: str) -> Optional[dict
     )
     uncompressed = list(result.scalars().all())
 
-    if len(uncompressed) < _STM_COMPRESS_THRESHOLD:
+    if not force and len(uncompressed) < _STM_FALLBACK_MIN_UNCOMPRESSED_MESSAGES:
         return None  # 未达阈值，不压缩
 
     print(
         f"\n[STM-chat] 会话 {session_id[:8]}... 未压缩消息数={len(uncompressed)}，"
-        f"触发压缩（阈值={_STM_COMPRESS_THRESHOLD}）"
+        f"触发压缩（fallback 条数阈值={_STM_FALLBACK_MIN_UNCOMPRESSED_MESSAGES} force={force}）"
     )
     logger.info(
-        f"[STM-chat] 触发压缩: session={session_id}, "
-        f"uncompressed_count={len(uncompressed)}"
+        "[STM-chat] 触发压缩: session=%s uncompressed_count=%s force=%s trigger=%s",
+        session_id,
+        len(uncompressed),
+        force,
+        trigger,
     )
 
-    # 获取当前会话的旧 running_summary
-    session_result = await db.execute(
-        select(Session).where(Session.id == session_id)
-    )
-    session = session_result.scalar_one_or_none()
-    old_summary = (session.running_summary or "") if session else ""
-
-    # 保留最近 4 条消息不压缩（同 LangGraph 节点的 STM_KEEP_RECENT）
-    keep_recent = 4
-    msgs_to_compress = uncompressed[:-keep_recent] if len(uncompressed) > keep_recent else uncompressed
-
-    # 统计本次压缩的用户/助手消息条数 + 时间轴范围（便于前端直观展示）
-    compressed_user_count = sum(1 for m in msgs_to_compress if m.role == "user")
-    compressed_assistant_count = sum(1 for m in msgs_to_compress if m.role == "assistant")
-    start_message_id = min((m.id for m in msgs_to_compress), default=None)
-    end_message_id = max((m.id for m in msgs_to_compress), default=None)
-    start_created_at = msgs_to_compress[0].created_at if msgs_to_compress else None
-    end_created_at = msgs_to_compress[-1].created_at if msgs_to_compress else None
-
-    # 构建压缩输入文本
-    compress_parts = []
-    if old_summary.strip():
-        compress_parts.append(f"【已有摘要】\n{old_summary}")
-    for msg in msgs_to_compress:
-        compress_parts.append(f"[{msg.role}]: {msg.content[:800]}")
-
-    compress_input = "\n".join(compress_parts)
-
-    # 统计总消息数（用于百分比展示）
-    total_count_result = await db.execute(
-        select(func.count(Message.id)).where(Message.session_id == session_id)
-    )
-    total_message_count = int(total_count_result.scalar() or 0)
+    # Legacy fallback 模式也必须保住最新消息，避免应急压缩后丢掉当前用户问题。
+    keep_recent = max(1, int(settings.stm_keep_recent or 0))
+    if len(uncompressed) > keep_recent:
+        msgs_to_compress = uncompressed[:-keep_recent]
+    else:
+        msgs_to_compress = uncompressed[:-1]
+    if not msgs_to_compress:
+        logger.warning(
+            "[STM-fallback] 无安全可压缩消息，跳过同步应急压缩: session=%s uncompressed=%s",
+            session_id,
+            len(uncompressed),
+        )
+        return None
 
     try:
-        from langchain_core.messages import HumanMessage, SystemMessage
-        llm = _get_llm()
-        lc_messages = [
-            SystemMessage(content=_SUMMARIZE_CONVERSATION_PROMPT),
-            HumanMessage(content=f"请压缩以下对话历史：\n\n{compress_input}")
-        ]
-        response = await llm.ainvoke(lc_messages)
-        new_summary = response.content.strip()
-
-        # 更新 sessions.running_summary
-        if session:
-            session.running_summary = new_summary
-            session.last_compress_at = datetime.utcnow()
-
-        # 标记已压缩消息
-        compress_ids = {m.id for m in msgs_to_compress}
-        for msg in uncompressed:
-            if msg.id in compress_ids:
-                msg.is_compressed = True
-
-        # 写入摘要历史快照（用于“查看摘要历史”）
-        # 注意：若 PostgreSQL 表尚未完成增量迁移（缺少新列），这里会触发 UndefinedColumnError。
-        # 为避免影响主链路与流式会话，这里做降级：缺列时仅写入旧字段，保证压缩功能可用。
-        snapshot = SessionSummary(
-            session_id=session_id,
-            summary=new_summary,
-            compressed_message_count=len(msgs_to_compress),
-            total_message_count=total_message_count,
-            compressed_user_count=compressed_user_count,
-            compressed_assistant_count=compressed_assistant_count,
-            start_message_id=start_message_id,
-            end_message_id=end_message_id,
-            start_created_at=start_created_at,
-            end_created_at=end_created_at,
+        timeout_sec = max(1, int(settings.stm_fallback_compaction_timeout_sec))
+        compaction_result = await asyncio.wait_for(
+            run_summary_compaction(
+                db=db,
+                session=session,
+                source_rows=msgs_to_compress,
+                cutoff_message_id=msgs_to_compress[-1].id if msgs_to_compress else None,
+                trigger=trigger,
+            ),
+            timeout=float(timeout_sec),
         )
-        db.add(snapshot)
-
-        try:
-            await db.commit()
-        except Exception as commit_exc:
-            # 事务已失败，先 rollback
-            try:
-                await db.rollback()
-            except Exception:
-                pass
-
-            msg = str(commit_exc)
-            # 常见：asyncpg.exceptions.UndefinedColumnError: column "compressed_user_count" does not exist
-            if "UndefinedColumnError" in msg or "does not exist" in msg:
-                try:
-                    from sqlalchemy import text
-                    # 降级插入：仅写入旧字段（兼容旧表结构）
-                    await db.execute(
-                        text(
-                            "INSERT INTO session_summaries "
-                            "(session_id, summary, compressed_message_count, total_message_count, created_at) "
-                            "VALUES (:sid, :summary, :cmc, :tmc, :now)"
-                        ),
-                        {
-                            "sid": session_id,
-                            "summary": new_summary,
-                            "cmc": len(msgs_to_compress),
-                            "tmc": total_message_count,
-                            "now": datetime.utcnow(),
-                        },
-                    )
-                    await db.commit()
-                    snapshot = None  # 降级路径无 ORM id
-                    logger.warning(
-                        f"[STM-chat] session_summaries 缺少新列，已降级仅写旧字段（建议重启/迁移补列）: session={session_id}"
-                    )
-                except Exception as fallback_exc:
-                    logger.error(
-                        f"[STM-chat] 降级写 session_summaries 仍失败（不影响主流程）: {fallback_exc}",
-                        exc_info=True,
-                    )
-                    return None
-            else:
-                logger.error(f"[STM-chat] commit 失败（不影响主流程）: {commit_exc}", exc_info=True)
-                return None
-
-        print(
-            f"[STM-chat] 压缩完成：{len(msgs_to_compress)} 条消息 → "
-            f"摘要 {len(new_summary)} 字"
-        )
-        logger.info(
-            f"[STM-chat] 压缩完成: session={session_id}, "
-            f"compressed={len(msgs_to_compress)}, summary_len={len(new_summary)}"
-        )
-        percent = int(round((len(msgs_to_compress) / total_message_count) * 100)) if total_message_count else 100
-        return {
-            "session_id": session_id,
-            "summary": new_summary,
-            "snapshot_id": getattr(snapshot, "id", None),
-            "compressed_message_count": len(msgs_to_compress),
-            "total_message_count": total_message_count,
-            "percent": max(0, min(100, percent)),
-        }
-
     except Exception as exc:
         logger.error(f"[STM-chat] 压缩失败（不影响主流程）: {exc}", exc_info=True)
         print(f"[STM-chat] 压缩失败（不影响主流程）: {exc}")
         return None
+
+    if not compaction_result.compacted:
+        logger.warning(
+            "[STM-chat] 统一压缩 runtime 未落盘: session=%s reason=%s",
+            session_id,
+            compaction_result.reason,
+        )
+        return None
+
+    await db.refresh(session)
+    print(
+        f"[STM-chat] 压缩完成：{compaction_result.compressed_message_count} 条消息 → "
+        f"摘要 {len(compaction_result.summary_text or '')} 字"
+    )
+    logger.info(
+        "[STM-chat] 压缩完成: session=%s compressed=%s/%s summary_len=%s strategy=%s summary_version=%s",
+        session_id,
+        compaction_result.compressed_message_count,
+        compaction_result.total_message_count,
+        len(compaction_result.summary_text or ""),
+        compaction_result.final_strategy,
+        compaction_result.summary_version_after,
+    )
+    percent = (
+        int(round((compaction_result.compressed_message_count / compaction_result.total_message_count) * 100))
+        if compaction_result.total_message_count
+        else 100
+    )
+    return {
+        "session_id": session_id,
+        "summary": compaction_result.summary_text,
+        "snapshot_id": None,
+        "compressed_message_count": compaction_result.compressed_message_count,
+        "total_message_count": compaction_result.total_message_count,
+        "percent": max(0, min(100, percent)),
+        "reason": compaction_result.reason,
+        "final_strategy": compaction_result.final_strategy,
+    }
 
 
 async def get_session_summaries(db: AsyncSession, session_id: str, user_id: str) -> list[SessionSummary]:
@@ -974,6 +2398,112 @@ async def get_session_summaries(db: AsyncSession, session_id: str, user_id: str)
     return list(result.scalars().all())
 
 
+def _is_context_overflow_error(exc: Exception) -> bool:
+    message = str(exc or "").lower()
+    return any(pattern in message for pattern in _STM_OVERFLOW_ERROR_PATTERNS)
+
+
+async def _build_fallback_chat_messages(
+    db: AsyncSession,
+    session: Session,
+    *,
+    memory_system_prompt: str = "",
+):
+    from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+
+    lc_messages = [SystemMessage(content=_CHAT_SYSTEM_PROMPT)]
+
+    if memory_system_prompt:
+        lc_messages.append(SystemMessage(content=memory_system_prompt))
+        logger.info(
+            "[LTM-chat] 注入 memory_context: session=%s len=%s",
+            session.id[:8],
+            len(memory_system_prompt),
+        )
+
+    _, _, answer_policy_context = _resolve_session_summary_contexts(session)
+    if settings.enable_stm and answer_policy_context:
+        lc_messages.append(SystemMessage(content=answer_policy_context))
+        logger.info(
+            "[STM-chat] 注入 answer_policy_context: session=%s summary_len=%s",
+            session.id[:8],
+            len(answer_policy_context),
+        )
+
+    if settings.enable_stm:
+        history_result = await db.execute(
+            select(Message)
+            .where(Message.session_id == session.id, Message.is_compressed == False)  # noqa: E712
+            .order_by(Message.created_at.desc())
+            .limit(_RECENT_MSG_LIMIT + 1)
+        )
+    else:
+        history_result = await db.execute(
+            select(Message)
+            .where(Message.session_id == session.id)
+            .order_by(Message.created_at.desc())
+            .limit(_RECENT_MSG_LIMIT + 1)
+        )
+    recent_messages = list(reversed(history_result.scalars().all()))
+
+    for msg in recent_messages:
+        if msg.role == "user":
+            lc_messages.append(HumanMessage(content=msg.content))
+        elif msg.role == "assistant":
+            lc_messages.append(AIMessage(content=msg.content))
+
+    return lc_messages
+
+
+async def _force_overflow_recovery_compaction(
+    db: AsyncSession,
+    session: Session,
+    *,
+    user_message: str,
+    exc: Exception,
+) -> bool:
+    if not settings.enable_stm:
+        return False
+
+    logger.warning(
+        "[STM-fallback] 检测到上下文超限，开始同步应急压缩: session=%s user_len=%s error=%s",
+        session.id,
+        len(user_message or ""),
+        str(exc)[:300],
+    )
+    print(f"[STM-fallback] session={session.id[:8]} 检测到上下文超限，开始同步应急压缩")
+
+    compressed = await compress_if_needed(
+        db,
+        session.id,
+        trigger="overflow_fallback_compaction",
+        force=True,
+    )
+    if not compressed:
+        try:
+            await refresh_session_context_metrics(db, session)
+            await db.commit()
+        except Exception:
+            await db.rollback()
+        logger.warning(
+            "[STM-fallback] 应急压缩未执行或无可压缩内容: session=%s",
+            session.id,
+        )
+        return False
+
+    await db.refresh(session)
+    await refresh_session_context_metrics(db, session)
+    await db.commit()
+    logger.warning(
+        "[STM-fallback] 应急压缩完成，准备重试: session=%s compressed=%s strategy=%s",
+        session.id,
+        compressed.get("compressed_message_count"),
+        compressed.get("final_strategy"),
+    )
+    print(f"[STM-fallback] session={session.id[:8]} 应急压缩完成，准备重试")
+    return True
+
+
 # ─────────────────────────────────────────────────────────────
 # Phase 1 保留：chat_single_turn（同步返回，无流式）
 # ─────────────────────────────────────────────────────────────
@@ -982,11 +2512,13 @@ async def chat_single_turn(
     user_id: str,
     user_message: str,
     session_id: Optional[str] = None,
-) -> tuple[str, str, dict, object]:
+    sop_skill_id: str | None = None,
+) -> tuple[str, str, dict, object, dict | None, dict | None, dict | None]:
     """
-    执行单轮对话，返回 (reply, session_id, memory_profile, context_window)。
-    Phase 2：STM 模式下加载 running_summary 前置上下文。
-    Phase 3：LTM 模式下注入用户画像，并在回复后触发异步 LTM 更新。
+    执行单轮对话，返回 (
+        reply, session_id, memory_profile, context_window, route_summary, skill_confirm, reserved
+    )。
+    skill_confirm 非空时表示 HITL，reply 为空，需调 confirm-skill。
     """
     session = await get_or_create_session(db, user_id, session_id)
     trace_id = new_trace_id()
@@ -1011,6 +2543,10 @@ async def chat_single_turn(
     ):
         log_trace_started(user_query_summary=_trace_query_summary(user_message))
         try:
+            normalized_sop_skill_id = None
+            if settings.enable_chat_skills:
+                normalized_sop_skill_id = validate_requested_sop_skill_id(sop_skill_id)
+
             # Phase 3：支持用户直接发送 JSON action（而非由 LLM 输出 <action>）
             # 例如：{"action":"update_profile","field":"sectors","value":[...]}后面跟自然语言
             if settings.enable_memory and user_id:
@@ -1031,12 +2567,30 @@ async def chat_single_turn(
                 session.title = user_message[:30]
                 await db.flush()
 
+            memory_profile, memory_system_prompt = await _prepare_chat_preflight_inputs(
+                db,
+                session,
+                user_id=user_id,
+                user_message=user_message,
+            )
+            await _run_chat_preflight_compaction(
+                db,
+                session,
+                user_message=user_message,
+                user_message_id=int(user_msg.id),
+                memory_system_prompt=memory_system_prompt,
+                trigger="preflight_budget_sync_chat",
+            )
+
             skill_reply_text, memory_profile, skill_trace, memory_system_prompt = await _run_skill_chat_if_enabled(
                 db=db,
                 session=session,
                 user_id=user_id,
                 user_message=user_message,
+                sop_skill_id=normalized_sop_skill_id,
                 exclude_message_id=user_msg.id,
+                preloaded_memory_profile=memory_profile,
+                preloaded_memory_system_prompt=memory_system_prompt,
             )
             turn_trace = skill_trace or {}
             final_selected_skill_family = str(
@@ -1049,14 +2603,37 @@ async def chat_single_turn(
                 skill_trace.get("execution_policy") or final_execution_policy
             )
 
+            if skill_trace.get("hitl_pending"):
+                context_window = await refresh_session_context_metrics(db, session)
+                context_window = enrich_context_window(context_window, session.id)
+                await db.commit()
+                sc = skill_trace.get("skill_confirm") or {}
+                skill_confirm_payload = {
+                    "session_id": session.id,
+                    "options": sc.get("options", []),
+                    "reasoning": sc.get("reasoning", ""),
+                    "resolved_query": sc.get("resolved_query", ""),
+                    "confidence": sc.get("confidence", 0),
+                }
+                return (
+                    "",
+                    session.id,
+                    memory_profile,
+                    context_window,
+                    None,
+                    skill_confirm_payload,
+                    None,
+                )
+
             reply_prepared = False
             if skill_reply_text is not None:
                 reply_text = await _prepare_reply_for_user(skill_reply_text, user_id=user_id, db=db)
                 reply_prepared = True
                 logger.info(
-                    "[chat-skill] sync executed: session=%s skill=%s",
+                    "[chat-skill] sync executed: session=%s skill=%s mode=%s",
                     session.id,
                     skill_trace.get("selected_skill"),
+                    "skill",
                 )
                 log_reply_completed(
                     mode="skill",
@@ -1069,60 +2646,31 @@ async def chat_single_turn(
                     execution_policy=skill_trace.get("execution_policy"),
                 )
             else:
-                # skills 关闭时，fallback 主链路仍需要单独读取一次 memory_context
-                if not memory_system_prompt and settings.enable_memory and user_id:
-                    memory_profile, memory_system_prompt = await _load_memory_context_for_chat(
-                        db, user_id, user_message
-                    )
-
-                # 构建 LLM messages 上下文
-                from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-
-                lc_messages = [SystemMessage(content=_CHAT_SYSTEM_PROMPT)]
-
-                # 注入 LTM 画像（ENABLE_MEMORY=true 且有实质内容时）
-                if memory_system_prompt:
-                    lc_messages.append(SystemMessage(content=memory_system_prompt))
-
-                # Phase 2 STM：若有 running_summary，前置注入
-                if settings.enable_stm and session.running_summary:
-                    stm_hint = (
-                        f"【对话历史摘要（已压缩 {session.turn_count} 轮早期对话）】\n"
-                        f"{session.running_summary}\n\n以下是最近的对话记录："
-                    )
-                    lc_messages.append(SystemMessage(content=stm_hint))
-                    print(f"[STM-chat] 注入 running_summary（{len(session.running_summary)} 字）到上下文")
-                    logger.info(
-                        f"[STM-chat] 注入 running_summary: session={session.id[:8]}, "
-                        f"summary_len={len(session.running_summary)}"
-                    )
-
-                # 加载最近消息（STM 模式只取未压缩的；非 STM 模式取最近 N 条）
-                if settings.enable_stm:
-                    history_result = await db.execute(
-                        select(Message)
-                        .where(Message.session_id == session.id, Message.is_compressed == False)  # noqa: E712
-                        .order_by(Message.created_at.desc())
-                        .limit(_RECENT_MSG_LIMIT + 1)
-                    )
-                else:
-                    history_result = await db.execute(
-                        select(Message)
-                        .where(Message.session_id == session.id)
-                        .order_by(Message.created_at.desc())
-                        .limit(_RECENT_MSG_LIMIT + 1)
-                    )
-                recent_messages = list(reversed(history_result.scalars().all()))
-
-                for msg in recent_messages:
-                    if msg.role == "user":
-                        lc_messages.append(HumanMessage(content=msg.content))
-                    elif msg.role == "assistant":
-                        lc_messages.append(AIMessage(content=msg.content))
-
-                # 调用 LLM（同步返回）
                 llm = _get_llm()
-                response = await llm.ainvoke(lc_messages)
+                lc_messages = await _build_fallback_chat_messages(
+                    db,
+                    session,
+                    memory_system_prompt=memory_system_prompt,
+                )
+                try:
+                    response = await llm.ainvoke(lc_messages)
+                except Exception as exc:
+                    if not _is_context_overflow_error(exc):
+                        raise
+                    recovered = await _force_overflow_recovery_compaction(
+                        db,
+                        session,
+                        user_message=user_message,
+                        exc=exc,
+                    )
+                    if not recovered:
+                        raise
+                    lc_messages = await _build_fallback_chat_messages(
+                        db,
+                        session,
+                        memory_system_prompt=memory_system_prompt,
+                    )
+                    response = await llm.ainvoke(lc_messages)
                 reply_text = response.content
                 final_selected_skill = "fallback"
                 final_analysis_mode = "general_chat"
@@ -1140,12 +2688,27 @@ async def chat_single_turn(
             if settings.enable_memory and not reply_prepared:
                 reply_text = await _prepare_reply_for_user(reply_text, user_id=user_id, db=db)
 
-            # 保存 assistant 消息
+            _record_route_runtime_with_log(
+                session_id=session.id,
+                user_message=user_message,
+                route_trace=turn_trace,
+                reply_text=reply_text,
+            )
+
+            route_summary = _build_route_summary(turn_trace)
+            plan_artifact, skill_artifact, verification_artifact, allowed_claim_level = _trace_plan_artifacts(turn_trace)
+
+            # 保存 assistant 消息（FIX-8: persist user-facing route summary）
             ai_msg = Message(
                 session_id=session.id,
                 role="assistant",
                 content=reply_text,
                 token_count=count_message_tokens("assistant", reply_text)[0],
+                route_summary_json=_persistable_route_summary(route_summary),
+                plan_artifact_json=plan_artifact,
+                skill_artifact_json=skill_artifact,
+                verification_json=verification_artifact,
+                allowed_claim_level=allowed_claim_level,
             )
             db.add(ai_msg)
 
@@ -1153,18 +2716,20 @@ async def chat_single_turn(
             session.turn_count = (session.turn_count or 0) + 1
             session.updated_at = datetime.utcnow()
             await db.flush()
-            context_window, compaction_queued = await maybe_enqueue_compaction(
-                db,
-                session,
-                system_prompt=_CHAT_SYSTEM_PROMPT,
-                memory_system_prompt=memory_system_prompt,
+            await _apply_route_entities_to_stm_with_log(
+                db=db,
+                session=session,
                 user_message=user_message,
+                route_trace=turn_trace,
             )
-            log_compaction_enqueue(
-                session_id=session.id,
-                queued=bool(compaction_queued),
-                enqueue_skipped_reason=None if compaction_queued else "threshold_not_met_or_budget_ok",
+            logger.info(
+                "[STM-chat] 旧异步 STM 链路已停用: session=%s user_msg=%s assistant_msg=%s",
+                session.id,
+                int(user_msg.id),
+                int(ai_msg.id),
             )
+            context_window = await refresh_session_context_metrics(db, session)
+            context_window = enrich_context_window(context_window, session.id)
             await db.commit()
 
             logger.info(
@@ -1211,10 +2776,20 @@ async def chat_single_turn(
                         enqueue_skipped_reason="memory_disabled" if not settings.enable_memory else "missing_user_id",
                     )
 
-            if compaction_queued:
-                logger.info("[STM-chat] 已入队异步压缩: session=%s", session.id)
-
-            return reply_text, session.id, memory_profile, context_window
+            return (
+                reply_text,
+                session.id,
+                memory_profile,
+                context_window,
+                route_summary,
+                None,
+                {
+                    "plan_artifact": plan_artifact,
+                    "skill_artifact": skill_artifact,
+                    "verification": verification_artifact,
+                    "allowed_claim_level": allowed_claim_level,
+                },
+            )
         except Exception:
             final_status = "error"
             raise
@@ -1244,6 +2819,7 @@ async def stream_chat_single_turn(
     user_id: str,
     user_message: str,
     session_id: Optional[str] = None,
+    sop_skill_id: str | None = None,
 ) -> AsyncGenerator[str, None]:
     """
     流式对话生成器：逐 token yield 内容，供 WebSocket 路由使用。
@@ -1279,6 +2855,10 @@ async def stream_chat_single_turn(
     ):
         log_trace_started(user_query_summary=_trace_query_summary(user_message))
         try:
+            normalized_sop_skill_id = None
+            if settings.enable_chat_skills:
+                normalized_sop_skill_id = validate_requested_sop_skill_id(sop_skill_id)
+
             # Phase 3：流式模式同样支持用户直接发送 JSON action
             if settings.enable_memory and user_id:
                 user_message = await _handle_profile_action_in_user_message(db, user_id, user_message)
@@ -1300,12 +2880,68 @@ async def stream_chat_single_turn(
             # 通知前端会话 ID（新建会话时前端需要更新 currentSessionId）
             yield json.dumps({"type": "session_id", "session_id": session.id}, ensure_ascii=False)
 
+            memory_profile, memory_system_prompt = await _prepare_chat_preflight_inputs(
+                db,
+                session,
+                user_id=user_id,
+                user_message=user_message,
+            )
+            preflight_decision = None
+            if settings.enable_stm and settings.stm_summary_preflight_enabled:
+                preflight_context_window = await refresh_session_context_metrics(db, session)
+                preflight_decision = should_run_preflight_summary_compaction(
+                    session,
+                    user_message,
+                    system_prompt_text=_CHAT_SYSTEM_PROMPT,
+                    memory_prompt_text=memory_system_prompt,
+                )
+                if preflight_decision.should_compact:
+                    yield json.dumps(
+                        {
+                            "type": "task_status_running",
+                            "session_id": session.id,
+                            "task_kind": "pre_compaction",
+                            "context_window": _context_window_to_payload(preflight_context_window),
+                        },
+                        ensure_ascii=False,
+                    )
+
+                preflight_result = await maybe_run_preflight_summary_compaction(
+                    db=db,
+                    session=session,
+                    pending_user_message=user_message,
+                    system_prompt_text=_CHAT_SYSTEM_PROMPT,
+                    memory_prompt_text=memory_system_prompt,
+                    exclude_message_ids={int(user_msg.id)},
+                    trigger="preflight_budget_stream_chat",
+                )
+                await db.refresh(session)
+                if preflight_decision.should_compact:
+                    refreshed_preflight_window = await refresh_session_context_metrics(db, session)
+                    yield json.dumps(
+                        {
+                            "type": "task_status_done" if preflight_result.compacted else "task_status_failed",
+                            "session_id": session.id,
+                            "task_kind": "pre_compaction",
+                            "context_window": _context_window_to_payload(refreshed_preflight_window),
+                            **(
+                                {"message": preflight_result.reason}
+                                if not preflight_result.compacted
+                                else {}
+                            ),
+                        },
+                        ensure_ascii=False,
+                    )
+
             skill_reply_text, _, skill_trace, memory_system_prompt = await _run_skill_chat_if_enabled(
                 db=db,
                 session=session,
                 user_id=user_id,
                 user_message=user_message,
+                sop_skill_id=normalized_sop_skill_id,
                 exclude_message_id=user_msg.id,
+                preloaded_memory_profile=memory_profile,
+                preloaded_memory_system_prompt=memory_system_prompt,
             )
             turn_trace = skill_trace or {}
             final_selected_skill_family = str(
@@ -1318,12 +2954,42 @@ async def stream_chat_single_turn(
                 skill_trace.get("execution_policy") or final_execution_policy
             )
 
+            if skill_trace.get("hitl_pending"):
+                context_window = await refresh_session_context_metrics(db, session)
+                context_window = enrich_context_window(context_window, session.id)
+                await db.commit()
+                sc = skill_trace.get("skill_confirm") or {}
+                yield json.dumps(
+                    {
+                        "type": "skill_confirm",
+                        "session_id": session.id,
+                        "options": sc.get("options", []),
+                        "reasoning": sc.get("reasoning", ""),
+                        "resolved_query": sc.get("resolved_query", ""),
+                        "confidence": sc.get("confidence", 0),
+                    },
+                    ensure_ascii=False,
+                )
+                yield json.dumps(
+                    {
+                        "type": "done",
+                        "session_id": session.id,
+                        "awaiting_skill_confirm": True,
+                        "running_summary": session.running_summary or "",
+                        "running_summary_mode": session.running_summary_mode or "",
+                        "context_window": _context_window_to_payload(context_window),
+                    },
+                    ensure_ascii=False,
+                )
+                return
+
             if skill_reply_text is not None:
                 skill_reply_text = await _prepare_reply_for_user(skill_reply_text, user_id=user_id, db=db)
                 logger.info(
-                    "[chat-skill] stream executed: session=%s skill=%s",
+                    "[chat-skill] stream executed: session=%s skill=%s mode=%s",
                     session.id,
                     skill_trace.get("selected_skill"),
+                    "skill-stream",
                 )
                 log_reply_completed(
                     mode="skill-stream",
@@ -1335,31 +3001,91 @@ async def stream_chat_single_turn(
                     analysis_mode=skill_trace.get("analysis_mode"),
                     execution_policy=skill_trace.get("execution_policy"),
                 )
+                if settings.expose_plan_preview_to_user:
+                    executor_events = []
+                    executor_payload = skill_trace.get("executor") if isinstance(skill_trace.get("executor"), dict) else {}
+                    if isinstance(executor_payload, dict):
+                        executor_events = list(executor_payload.get("step_status_events") or [])
+                    for event in executor_events:
+                        if not isinstance(event, dict):
+                            continue
+                        frame_type = event.get("type")
+                        if frame_type == "plan_preview":
+                            yield json.dumps(
+                                {
+                                    "type": "plan_preview",
+                                    "session_id": session.id,
+                                    "plan_id": event.get("plan_id") or "",
+                                    "items": event.get("items") or [],
+                                },
+                                ensure_ascii=False,
+                            )
+                        elif frame_type == "step_status":
+                            yield json.dumps(
+                                {
+                                    "type": "step_status",
+                                    "session_id": session.id,
+                                    "plan_id": event.get("plan_id") or "",
+                                    "step_id": event.get("step_id") or "",
+                                    "tool_name": event.get("tool_name") or "",
+                                    "status": event.get("status") or "",
+                                },
+                                ensure_ascii=False,
+                            )
+                        elif frame_type == "verification_summary":
+                            verification = event.get("verification") if isinstance(event.get("verification"), dict) else {}
+                            yield json.dumps(
+                                {
+                                    "type": "verification_summary",
+                                    "session_id": session.id,
+                                    "plan_id": event.get("plan_id") or "",
+                                    "status": verification.get("status") or "",
+                                    "evidence_score": verification.get("evidence_score") or 0,
+                                    "allowed_claim_level": verification.get("allowed_claim_level") or "",
+                                    "missing_dimensions": verification.get("missing_dimensions") or [],
+                                },
+                                ensure_ascii=False,
+                            )
                 for chunk in _chunk_text(skill_reply_text):
                     yield chunk
 
+                _record_route_runtime_with_log(
+                    session_id=session.id,
+                    user_message=user_message,
+                    route_trace=turn_trace,
+                    reply_text=skill_reply_text,
+                )
+                _skill_route_summary = _build_route_summary(turn_trace)
+                plan_artifact, skill_artifact, verification_artifact, allowed_claim_level = _trace_plan_artifacts(turn_trace)
                 ai_msg = Message(
                     session_id=session.id,
                     role="assistant",
                     content=skill_reply_text,
                     token_count=count_message_tokens("assistant", skill_reply_text)[0],
+                    route_summary_json=_persistable_route_summary(_skill_route_summary),
+                    plan_artifact_json=plan_artifact,
+                    skill_artifact_json=skill_artifact,
+                    verification_json=verification_artifact,
+                    allowed_claim_level=allowed_claim_level,
                 )
                 db.add(ai_msg)
                 session.turn_count = (session.turn_count or 0) + 1
                 session.updated_at = datetime.utcnow()
                 await db.flush()
-                context_window, compaction_queued = await maybe_enqueue_compaction(
-                    db,
-                    session,
-                    system_prompt=_CHAT_SYSTEM_PROMPT,
-                    memory_system_prompt=memory_system_prompt,
+                await _apply_route_entities_to_stm_with_log(
+                    db=db,
+                    session=session,
                     user_message=user_message,
+                    route_trace=turn_trace,
                 )
-                log_compaction_enqueue(
-                    session_id=session.id,
-                    queued=bool(compaction_queued),
-                    enqueue_skipped_reason=None if compaction_queued else "threshold_not_met_or_budget_ok",
+                logger.info(
+                    "[STM-chat] 旧异步 STM 链路已停用: session=%s user_msg=%s assistant_msg=%s",
+                    session.id,
+                    int(user_msg.id),
+                    int(ai_msg.id),
                 )
+                context_window = await refresh_session_context_metrics(db, session)
+                context_window = enrich_context_window(context_window, session.id)
                 await db.commit()
 
                 if settings.enable_memory and user_id:
@@ -1398,69 +3124,30 @@ async def stream_chat_single_turn(
                     {
                         "type": "context_update",
                         "session_id": session.id,
-                        "context_window": context_window.model_dump(mode="json"),
+                        "context_window": _context_window_to_payload(context_window),
                     },
                     ensure_ascii=False,
                 )
-                if compaction_queued:
+                if _skill_route_summary:
                     yield json.dumps(
                         {
-                            "type": "compaction_queued",
+                            "type": "trace_summary",
                             "session_id": session.id,
-                            "context_window": context_window.model_dump(mode="json"),
+                            "route_summary": _skill_route_summary,
                         },
                         ensure_ascii=False,
                     )
 
-                yield json.dumps({"type": "done", "session_id": session.id}, ensure_ascii=False)
+                yield json.dumps({
+                    "type": "done",
+                    "session_id": session.id,
+                    "running_summary": session.running_summary or "",
+                    "running_summary_mode": session.running_summary_mode or "",
+                    "context_window": _context_window_to_payload(context_window),
+                }, ensure_ascii=False)
                 return
 
-            # 构建上下文（与 chat_single_turn 逻辑保持一致，包含 LTM 画像注入）
-            from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-
-            lc_messages = [SystemMessage(content=_CHAT_SYSTEM_PROMPT)]
-
             # Phase 3：对话流式模式也注入 LTM 用户画像
-            if not memory_system_prompt and settings.enable_memory and user_id:
-                _, memory_system_prompt = await _load_memory_context_for_chat(db, user_id, user_message)
-            if memory_system_prompt:
-                lc_messages.append(SystemMessage(content=memory_system_prompt))
-                print(f"[LTM-stream] 注入用户画像到对话上下文 (user={user_id[:8]}...)")
-                logger.info(
-                    f"[LTM-stream] 注入 memory_context: user={user_id}, len={len(memory_system_prompt)}"
-                )
-
-            if settings.enable_stm and session.running_summary:
-                stm_hint = (
-                    f"【对话历史摘要（已压缩 {session.turn_count} 轮早期对话）】\n"
-                    f"{session.running_summary}\n\n以下是最近的对话记录："
-                )
-                lc_messages.append(SystemMessage(content=stm_hint))
-                print(f"[STM-stream] 注入 running_summary（{len(session.running_summary)} 字）")
-                logger.info(f"[STM-stream] 注入 running_summary: session={session.id[:8]}")
-
-            if settings.enable_stm:
-                history_result = await db.execute(
-                    select(Message)
-                    .where(Message.session_id == session.id, Message.is_compressed == False)  # noqa: E712
-                    .order_by(Message.created_at.desc())
-                    .limit(_RECENT_MSG_LIMIT + 1)
-                )
-            else:
-                history_result = await db.execute(
-                    select(Message)
-                    .where(Message.session_id == session.id)
-                    .order_by(Message.created_at.desc())
-                    .limit(_RECENT_MSG_LIMIT + 1)
-                )
-            recent_messages = list(reversed(history_result.scalars().all()))
-
-            for msg in recent_messages:
-                if msg.role == "user":
-                    lc_messages.append(HumanMessage(content=msg.content))
-                elif msg.role == "assistant":
-                    lc_messages.append(AIMessage(content=msg.content))
-
             # 流式调用 LLM
             llm = _get_llm()
             reply_chunks = []
@@ -1468,11 +3155,35 @@ async def stream_chat_single_turn(
             print(f"[chat-stream] session={session.id[:8]} 开始流式输出...")
             logger.info(f"[chat-stream] 开始流式输出: session={session.id}")
 
-            async for chunk in llm.astream(lc_messages):
-                token = chunk.content if hasattr(chunk, "content") else str(chunk)
-                if token:
-                    reply_chunks.append(token)
-                    yield token
+            stream_attempted_fallback = False
+            while True:
+                lc_messages = await _build_fallback_chat_messages(
+                    db,
+                    session,
+                    memory_system_prompt=memory_system_prompt,
+                )
+                try:
+                    async for chunk in llm.astream(lc_messages):
+                        token = chunk.content if hasattr(chunk, "content") else str(chunk)
+                        if token:
+                            reply_chunks.append(token)
+                            yield token
+                    break
+                except Exception as exc:
+                    # 流式一旦已经向客户端发送过内容，就不能安全重试，只能原样抛出。
+                    if reply_chunks or stream_attempted_fallback or not _is_context_overflow_error(exc):
+                        raise
+                    recovered = await _force_overflow_recovery_compaction(
+                        db,
+                        session,
+                        user_message=user_message,
+                        exc=exc,
+                    )
+                    if not recovered:
+                        raise
+                    stream_attempted_fallback = True
+                    reply_chunks = []
+                    continue
 
             reply_text = "".join(reply_chunks)
             final_selected_skill = "fallback"
@@ -1491,17 +3202,39 @@ async def stream_chat_single_turn(
             if settings.enable_memory and user_id:
                 reply_text = await _prepare_reply_for_user(reply_text, user_id=user_id, db=db)
 
-            # 保存 assistant 消息
+            _record_route_runtime_with_log(
+                session_id=session.id,
+                user_message=user_message,
+                route_trace=turn_trace,
+                reply_text=reply_text,
+            )
+
+            route_summary = _build_route_summary(turn_trace)
+
+            # 保存 assistant 消息（FIX-8: persist user-facing route summary）
             ai_msg = Message(
                 session_id=session.id,
                 role="assistant",
                 content=reply_text,
                 token_count=count_message_tokens("assistant", reply_text)[0],
+                route_summary_json=_persistable_route_summary(route_summary),
             )
             db.add(ai_msg)
             session.turn_count = (session.turn_count or 0) + 1
             session.updated_at = datetime.utcnow()
             await db.flush()
+            await _apply_route_entities_to_stm_with_log(
+                db=db,
+                session=session,
+                user_message=user_message,
+                route_trace=turn_trace,
+            )
+            logger.info(
+                "[STM-chat] 旧异步 STM 链路已停用: session=%s user_msg=%s assistant_msg=%s",
+                session.id,
+                int(user_msg.id),
+                int(ai_msg.id),
+            )
 
             print(
                 f"[chat-stream] 流式完成: session={session.id[:8]} "
@@ -1512,21 +3245,10 @@ async def stream_chat_single_turn(
                 f"turn={session.turn_count}, reply_len={len(reply_text)}"
             )
 
-            context_window, compaction_queued = await maybe_enqueue_compaction(
-                db,
-                session,
-                system_prompt=_CHAT_SYSTEM_PROMPT,
-                memory_system_prompt=memory_system_prompt,
-                user_message=user_message,
-            )
-            log_compaction_enqueue(
-                session_id=session.id,
-                queued=bool(compaction_queued),
-                enqueue_skipped_reason=None if compaction_queued else "threshold_not_met_or_budget_ok",
-            )
+            context_window = await refresh_session_context_metrics(db, session)
+            context_window = enrich_context_window(context_window, session.id)
             await db.commit()
 
-            # Phase 3: 流式模式也要后台更新 LTM
             if settings.enable_memory and user_id:
                 with trace_span(
                     "memory_write_enqueue",
@@ -1563,21 +3285,27 @@ async def stream_chat_single_turn(
                 {
                     "type": "context_update",
                     "session_id": session.id,
-                    "context_window": context_window.model_dump(mode="json"),
+                    "context_window": _context_window_to_payload(context_window),
                 },
                 ensure_ascii=False,
             )
-            if compaction_queued:
+            if route_summary:
                 yield json.dumps(
                     {
-                        "type": "compaction_queued",
+                        "type": "trace_summary",
                         "session_id": session.id,
-                        "context_window": context_window.model_dump(mode="json"),
-                    },
-                    ensure_ascii=False,
-                )
+                        "route_summary": route_summary,
+                        },
+                        ensure_ascii=False,
+                    )
 
-            yield json.dumps({"type": "done", "session_id": session.id}, ensure_ascii=False)
+            yield json.dumps({
+                "type": "done",
+                "session_id": session.id,
+                "running_summary": session.running_summary or "",
+                "running_summary_mode": session.running_summary_mode or "",
+                "context_window": _context_window_to_payload(context_window),
+            }, ensure_ascii=False)
 
         except Exception as exc:
             final_status = "error"
@@ -1687,6 +3415,16 @@ async def maybe_update_ltm_from_chat(
     3. 对抽取到的结构化字段，直接更新 user_invest_profiles（快速生效）
     4. 入队 Mem0 的为 build_fact_messages 生成的高维度事实字符串（非原始对话），metadata 含 extracted_fields / mem0_infer=False
     """
+    if not settings.enable_memory:
+        return
+    if not bool(settings.enable_chat_ltm_extract):
+        logger.debug(
+            "[LTM-chat] skip: ENABLE_CHAT_LTM_EXTRACT=false session=%s turn=%s",
+            session_id,
+            turn_count,
+        )
+        return
+
     try:
         from src.memory.memory_service import MemoryService
         from backend.services.profile_extractor import extract_profile_updates
@@ -1854,6 +3592,14 @@ async def _extract_from_summary(session_id: str, user_id: str, summary: str) -> 
     仅在 ENABLE_MEMORY=true 且摘要非空时执行。
     同时将高维度事实字符串入队 Mem0，保持语义增强层与 DB 一致。
     """
+    if not settings.enable_memory:
+        return
+    if not bool(settings.enable_summary_ltm_extract):
+        logger.debug(
+            "[LTM-summary] skip: ENABLE_SUMMARY_LTM_EXTRACT=false session=%s",
+            session_id,
+        )
+        return
     if not summary or not user_id:
         return
     try:

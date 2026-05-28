@@ -9,8 +9,6 @@
 
 这份文档专门讲本项目里“**聊天对话 + 金融 Skill + Tushare 工具 + 记忆系统 + Trace 观测**”这一整条链路。
 
-全局架构与能力边界建议对照阅读：[股票Agent项目技术总览.md](./股票Agent项目技术总览.md)；仓库目录级说明见 [项目代码架构说明.md](./项目代码架构说明.md)。
-
 现在系统的工作方式已经不是：
 
 - 用户提问
@@ -36,11 +34,11 @@
 
 这里的 Skill 可以理解成“系统已经约定好的专业处理方式”。
 
-当前运行时真正会进入的能力入口有三类：
+当前运行时真正会进入的能力入口，分成两种“自动路由结果”加一种“用户显式选择”：
 
 - `fallback`
 - `tushare-data`
-- `financial-sop`
+- `financial-sop`（仅当用户显式选择某个 SOP skill 时进入）
 
 它们的含义可以先这样记：
 
@@ -48,12 +46,12 @@
 - `tushare-data`：旧的通用金融数据链路，适合“先判断问题类型，再临时规划工具”的场景
 - `financial-sop`：新的标准化业务 Skill 链路，适合“场景明确、操作步骤比较固定”的高频投研问题
 
-所以现在不是“只有一个金融 Skill”，而是：
+所以现在不是“让路由器直接三选一”，而是：
 
-- 一条旧的通用数据链路
-- 一条新的 SOP 化链路
+- 路由器只在 `tushare-data` 和 `fallback` 二选一
+- 用户如果从前端面板显式选了 SOP，则直接进入对应 `financial-sop`
 
-两条同时存在。
+三条入口都还存在，但 SOP 入口已经从“LLM 自主决定”切成“用户显式决定”。
 
 ### 2.2 什么是 `selected_skill`、`selected_skill_family`、`skill_name`
 
@@ -164,7 +162,9 @@ backend/services/chat_service.py
   ->
 route_chat_skill()
   ->
-决定走 fallback / tushare-data / financial-sop
+若用户显式传 sop_skill_id，则直接进入对应 financial-sop
+  ->
+否则由 route_chat_skill() 只在 fallback / tushare-data 中二选一
   ->
 execute_skill()
   ->
@@ -181,7 +181,7 @@ skill_evidence 做证据校验
 触发 LTM 入队 / STM 压缩 / trace 写入
 ```
 
-### 3.2 现在是“两层金融能力并存”
+### 3.2 现在是“二路自动路由 + 用户显式 SOP”
 
 这是当前最关键的认知点。
 
@@ -200,7 +200,7 @@ skill_evidence 做证据校验
 - 先根据 `analysis_mode` 做工具规划
 - 再走确定性执行或 agent 执行
 
-#### 第二层：新 SOP 链路 `financial-sop`
+#### 第二层：用户显式选择的 SOP 链路 `financial-sop`
 
 适合这些“问题模式比较稳定”的高频场景：
 
@@ -215,6 +215,7 @@ skill_evidence 做证据校验
 - 每个 Skill 都有自己的 `SKILL.md + skill_spec.yaml`
 - 工具白名单更严格
 - 降级策略更明确
+- 前端用 `sop_skill_id` 显式指定后，后端会直接构造 SOP 决策，跳过 LLM 对 SOP 的判断
 - 更适合做工业化、可观测、可治理的业务场景
 
 ### 3.3 现在有哪些 Skill 已经落地
@@ -254,7 +255,8 @@ skill_evidence 做证据校验
 - 保存用户消息
 - 读取用户画像和长短期记忆
 - 构造路由上下文
-- 调 `route_chat_skill()`
+- 校验用户是否显式传入 `sop_skill_id`
+- 若未显式选择 SOP，再调 `route_chat_skill()`
 - 调 `execute_skill()`
 - 保存 assistant 消息
 - 触发 LTM 入队和 STM 压缩
@@ -284,33 +286,27 @@ skill_evidence 做证据校验
 
 它负责判断：
 
-- 要不要走 Skill
-- 走 `fallback`、`tushare-data`，还是 `financial-sop`
-- 如果走 `financial-sop`，具体命中哪个 `skill_name`
-- 这次是否需要实时数据
-- 这次是否属于专业分析
+- 是否需要实时金融数据
+- 自动路由时走 `fallback` 还是 `tushare-data`
+- 如果用户显式选了 SOP，对应的 `SkillRouteDecision(route="sop", skill_id=...)` 会由程序构造，而不是由这里的 LLM 输出
 
-它的输出现在比以前更完整，典型结构大致像这样：
+自动路由阶段现在只需要输出很小的二选一 JSON：
 
 ```json
-{
-  "selected_skill": "financial-sop",
-  "selected_skill_family": "financial-sop",
-  "skill_name": "etf-screen",
-  "analysis_mode": "etf_screen",
-  "execution_policy": "deterministic",
-  "needs_realtime_data": true,
-  "needs_professional_analysis": true,
-  "confidence": 0.9,
-  "why": "matched financial-sop query for etf-screen"
-}
+{"route":"tushare"}
+```
+
+或：
+
+```json
+{"route":"fallback"}
 ```
 
 对小白最重要的是记住：
 
-- `selected_skill` 决定入口
-- `skill_name` 决定具体业务场景
-- `analysis_mode` 决定后续分析风格和证据规则
+- 自动路由器现在不再直接决定 SOP
+- `sop_skill_id` 才是 SOP 入口的唯一显式触发方式
+- 进入执行器前，系统仍会统一整理成兼容的 `route_trace`
 
 ### 4.4 Skill 执行层
 
@@ -729,7 +725,8 @@ skill_evidence 做证据校验
 
 配置主要在：
 
-- [backend/.env.example](../backend/.env.example)（仓库模板；本机覆盖复制为 `backend/.env`）
+- [backend/.env.example](../backend/.env.example)
+- [backend/.env](../backend/.env)
 - [config.py](../backend/config.py)
 
 ### 9.1 Skill 总开关
@@ -759,19 +756,20 @@ skill_evidence 做证据校验
 
 - `ENABLE_TRACE`
 - `ENABLE_EVIDENCE_LINEAGE`
-- `ENABLE_TRACE_ARTIFACT_REFS` / `ENABLE_TRACE_PROMPT_CAPTURE` / `ENABLE_TRACE_REPLY_CAPTURE`（按需打开，注意隐私与体积）
+- `ENABLE_TRACE_ARTIFACT_REFS`
+- `ENABLE_TRACE_PROMPT_CAPTURE`
+- `ENABLE_TRACE_REPLY_CAPTURE`
 - `ENABLE_LANGFUSE`
-- `TRACE_ARTIFACT_DIR`（本地产物目录，默认指向 `Financial-MCP-Agent/logs/chat_trace_artifacts`）
-- `LANGFUSE_BASE_URL` / `LANGFUSE_HOST`（二者兼容，任填或都填）
-- `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY`
-- `LANGFUSE_PROJECT` / `LANGFUSE_ENV` / `LANGFUSE_RELEASE`
-- `LANGFUSE_SAMPLE_RATE` / `LANGFUSE_FLUSH_AT` / `LANGFUSE_FLUSH_INTERVAL_SEC`
+- `LANGFUSE_BASE_URL`
+- `LANGFUSE_PUBLIC_KEY`
+- `LANGFUSE_SECRET_KEY`
+- `LANGFUSE_PROJECT`
+- `LANGFUSE_ENV`
 
 对新同学来说，最重要的是先记住：
 
 - Skill 功能开不开，看前几组 `ENABLE_*`
-- Langfuse 上不上报，看 `ENABLE_LANGFUSE`（建议先验证本地 `chat_traces.jsonl` 再打开）
-- **分步联调**：见 [部署指南-Langfuse-本机开发联调.md](./部署指南-Langfuse-本机开发联调.md)
+- Langfuse 上不上报，看 `ENABLE_LANGFUSE`
 
 ---
 

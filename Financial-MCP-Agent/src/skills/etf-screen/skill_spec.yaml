@@ -1,10 +1,58 @@
 skill_name: etf-screen
 skill_family: financial-sop
 version: "1.0.0"
+depends_on_tools:
+  - get_fund_basic_info
+  - get_fund_nav
+  - get_fund_market_bars
+  - get_fund_share
+min_tool_schema_version: "1.0.0"
+output_schema_version: "1.0.0"
+skill_md_section_map:
+  purpose: Purpose
+  when_to_use: When to Use
+  when_not_to_use: When Not to Use
+  required_inputs: Required Inputs
+  workflow: Workflow
+  tool_use_guide: Tool Use Guide
+  evidence_rules: Evidence Rules
+  degrade_policy: Degrade Policy
+  output_contract: Output Contract
+  references: References
+requires_web_news: false
 execution_policy: deterministic
+route_metadata:
+  when_to_use:
+    - 用户要求按主题、指数、风险偏好或持有周期筛选 ETF / 基金候选
+    - 用户问“帮我找几只”“筛几只”“配置哪些 ETF”
+  when_not_to_use:
+    - 用户比较两个已经明确给出的基金
+    - 用户只问 ETF 概念、交易规则或 LOF 区别
+  trigger_examples:
+    - 帮我筛几只黄金 ETF
+    - 想配新能源主题 ETF，给几个候选
+  anti_trigger_examples:
+    - 黄金 ETF 是什么
+    - 华安黄金 ETF 和博时黄金 ETF 哪个适合我
+  supported_entity_types:
+    - fund
+    - etf
+input_contract:
+  required_slots:
+    - screen_intent
+  optional_slots:
+    - theme
+    - index
+    - asset_class
+    - risk_preference
+    - holding_period
+  entity_cardinality: zero_or_more
+  supported_entity_types:
+    - etf
+    - fund
+  on_missing_slots: ask_clarification
 allowed_tools:
   - get_fund_basic_info
-  - get_etf_basic_info
   - get_fund_nav
   - get_fund_market_bars
   - get_fund_share
@@ -12,11 +60,6 @@ tool_plan_steps:
   - step: discover_fund_candidates
     tool: get_fund_basic_info
     required: true
-    arguments:
-      limit: 15
-  - step: discover_etf_candidates
-    tool: get_etf_basic_info
-    required: false
     arguments:
       limit: 15
   - step: inspect_candidate_nav
@@ -37,7 +80,6 @@ tool_plan_steps:
 candidate_expansion:
   trigger_tools:
     - get_fund_basic_info
-    - get_etf_basic_info
   top_n: 3
 required_evidence:
   must_have_all:

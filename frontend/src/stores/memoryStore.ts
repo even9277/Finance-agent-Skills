@@ -3,14 +3,12 @@ import { ref, computed } from 'vue'
 import type { MemoryProfile, MemoryItem, MemoryStats } from '@/api'
 
 export const useMemoryStore = defineStore('memory', () => {
-  // ── 结构化画像（来自 user_invest_profiles 权威表）──────────
   const profile = ref<MemoryProfile>({
     risk_profile: undefined,
     sectors: [],
     return_expectation: undefined,
     investment_horizon: undefined,
     watchlist: [],
-    // Phase 3 扩展字段
     risk_level: undefined,
     expected_return_min: undefined,
     expected_return_max: undefined,
@@ -22,8 +20,6 @@ export const useMemoryStore = defineStore('memory', () => {
 
   const loaded = ref(false)
   const totalMemories = ref(0)
-
-  // ── Phase 3 统计数据 ────────────────────────────────────────
   const stats = ref<MemoryStats>({
     from_conversations: 0,
     from_reports: 0,
@@ -31,16 +27,11 @@ export const useMemoryStore = defineStore('memory', () => {
     total_tasks: 0,
   })
 
-  // ── Mem0 语义记忆条目（来自 /api/memory/items）──────────────
   const memoryItems = ref<MemoryItem[]>([])
   const itemsLoaded = ref(false)
   const currentPage = ref(1)
   const totalItems = ref(0)
-  const hasMoreItems = computed(
-    () => memoryItems.value.length < totalItems.value
-  )
-
-  // ── Actions ─────────────────────────────────────────────────
+  const hasMoreItems = computed(() => memoryItems.value.length < totalItems.value)
 
   function setProfile(data: MemoryProfile) {
     profile.value = { ...profile.value, ...data }
@@ -83,7 +74,7 @@ export const useMemoryStore = defineStore('memory', () => {
   }
 
   function removeWatchlist(code: string) {
-    profile.value.watchlist = profile.value.watchlist.filter(c => c !== code)
+    profile.value.watchlist = profile.value.watchlist.filter((c) => c !== code)
   }
 
   function setMemoryItems(items: MemoryItem[], total: number, page: number) {
@@ -135,7 +126,6 @@ export const useMemoryStore = defineStore('memory', () => {
     currentPage,
     totalItems,
     hasMoreItems,
-    // actions
     setProfile,
     setStats,
     setTotalMemories,

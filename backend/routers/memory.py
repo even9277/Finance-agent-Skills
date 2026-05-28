@@ -7,11 +7,10 @@
 
 import sys
 from pathlib import Path
-from typing import Optional
-
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.config import settings
 from backend.db.database import get_db
 from backend.middleware.auth import require_query_user
 from backend.schemas.memory import (

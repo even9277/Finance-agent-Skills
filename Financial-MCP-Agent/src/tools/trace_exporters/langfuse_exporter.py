@@ -221,7 +221,11 @@ class LangfuseTraceExporter:
         data = record.get("data") or {}
         if record.get("status") == "started":
             summary = data.get("user_query_summary")
-            return {"summary": summary} if summary else data or None
+            if summary:
+                return {"summary": summary}
+            if not self._allow_prompt_reply_upload():
+                return self._privacy_preserving_payload(data)
+            return data or None
         return None
 
     def _trace_output(self, record: dict[str, Any]) -> Any:
@@ -229,10 +233,28 @@ class LangfuseTraceExporter:
             return None
         data = record.get("data") or {}
         metrics = record.get("metrics") or {}
-        payload = {**data}
+        # 默认只上传结构化状态、引用路径和指标，完整 prompt/reply 需显式开关放行。
+        payload = {**data} if self._allow_prompt_reply_upload() else self._privacy_preserving_payload(data)
         if metrics:
             payload["metrics"] = metrics
         return payload or None
+
+    def _allow_prompt_reply_upload(self) -> bool:
+        return os.getenv("LANGFUSE_UPLOAD_PROMPT_REPLY", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+    def _privacy_preserving_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        sensitive_keys = {
+            "prompt",
+            "prompt_text",
+            "synthesis_prompt",
+            "user_message",
+            "user_query",
+            "reply",
+            "reply_text",
+            "answer",
+            "final_answer",
+        }
+        return {key: value for key, value in payload.items() if key not in sensitive_keys}
 
     def _upsert_trace(self, record: dict[str, Any]) -> None:
         local_trace_id = str(record.get("trace_id") or "").strip()

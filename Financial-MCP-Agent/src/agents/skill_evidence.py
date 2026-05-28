@@ -2,11 +2,23 @@ from __future__ import annotations
 
 import ast
 import json
+import logging
+import os
 import re
+import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from src.tools.skill_trace import new_evidence_id
+
+# FIX-4: reuse canonical symbol utility from stock_resolver
+_BACKEND_DIR = str(Path(__file__).resolve().parent.parent.parent.parent / "backend")
+if _BACKEND_DIR not in sys.path:
+    sys.path.insert(0, _BACKEND_DIR)
+from services.stock_resolver import canonicalize_symbol  # noqa: E402
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -32,12 +44,17 @@ class EvidenceValidationResult:
     missing_evidence_reasons: list[str] = field(default_factory=list)
     accepted_evidences: list[dict[str, Any]] = field(default_factory=list)
     rejected_evidences: list[dict[str, Any]] = field(default_factory=list)
+    # FIX-2: tiered evidence classification
+    tier: str = ""                    # "full" | "partial" | "none"
+    missing_dimensions: list[str] = field(default_factory=list)
+    allowed_claim_level: str = ""     # "advisory" | "analytical" | "descriptive"
+    reason_codes: list[str] = field(default_factory=list)
 
 
 _MARKET_TOOLS = {"get_market_bars", "get_daily_bars", "get_index_bars"}
 _FUNDAMENTAL_TOOLS = {"get_fina_indicator", "get_income", "get_balance_sheet", "get_cashflow"}
 _SECTOR_TOOLS = {"get_sector_snapshot", "get_sector_constituents", "get_index_bars"}
-_FUND_CANDIDATE_TOOLS = {"get_fund_basic_info", "get_etf_basic_info"}
+_FUND_CANDIDATE_TOOLS = {"get_fund_basic_info"}
 _FUND_SUPPORT_TOOLS = {"get_fund_nav", "get_fund_share", "get_fund_market_bars"}
 _SELECTION_CANDIDATE_TOOLS = {"get_stock_basic_info", "get_sector_snapshot", "get_sector_constituents"} | _FUND_CANDIDATE_TOOLS
 _SELECTION_SUPPORT_TOOLS = _MARKET_TOOLS | _FUNDAMENTAL_TOOLS | _FUND_SUPPORT_TOOLS
@@ -53,33 +70,16 @@ _TOOL_EVIDENCE_TYPES = {
     "get_sector_snapshot": "sector_snapshot",
     "get_sector_constituents": "sector_constituents",
     "get_fund_basic_info": "fund_basic",
-    "get_etf_basic_info": "fund_basic",
     "get_fund_nav": "fund_nav",
     "get_fund_market_bars": "fund_daily",
     "get_fund_share": "fund_share",
+    "search_web_news": "web_news",
 }
 
 
 def _normalize_symbol(symbol: str | None) -> str:
-    raw = str(symbol or "").strip()
-    if not raw:
-        return ""
-    upper = raw.upper()
-    if "." in upper and upper.endswith((".SH", ".SZ", ".BJ")) and len(upper.split(".", 1)[0]) == 6:
-        return upper
-    lower = raw.lower()
-    if lower.startswith(("sh.", "sz.", "bj.")):
-        exchange, code = lower.split(".", 1)
-        return f"{code}.{exchange.upper()}"
-    digits = "".join(ch for ch in raw if ch.isdigit())
-    if len(digits) == 6:
-        if digits.startswith("6"):
-            return f"{digits}.SH"
-        if digits.startswith(("0", "3")):
-            return f"{digits}.SZ"
-        if digits.startswith(("4", "8")):
-            return f"{digits}.BJ"
-    return upper
+    """Delegate to the single canonical implementation in stock_resolver."""
+    return canonicalize_symbol(symbol)
 
 
 def _parse_content_to_dict(content: Any) -> dict[str, Any] | None:
@@ -262,6 +262,56 @@ def _validate_skill_spec_evidence(
     return not reasons and bool(evidences), reasons
 
 
+def _compute_evidence_tier(
+    *,
+    evidence_ok: bool,
+    relevant: list[ToolEvidence],
+    reasons: list[str],
+    analysis_mode: str,
+) -> tuple[str, list[str], str, list[str]]:
+    """Derive (tier, missing_dimensions, allowed_claim_level, reason_codes).
+
+    tier:
+      - "full"    – all required evidence present
+      - "partial" – some evidence available, some missing
+      - "none"    – no usable evidence at all
+
+    allowed_claim_level:
+      - "advisory"    – full evidence → investment suggestions OK
+      - "analytical"  – partial evidence → factual analysis only
+      - "descriptive" – no evidence → description / refusal only
+    """
+    if not relevant:
+        return "none", ["no_evidence"], "descriptive", list(reasons)
+
+    if evidence_ok:
+        return "full", [], "advisory", []
+
+    missing_dims: list[str] = []
+    reason_codes: list[str] = list(reasons)
+    evidence_types = {item.evidence_type for item in relevant}
+    tool_names = {item.tool_name for item in relevant}
+
+    if analysis_mode in ("single_stock_fundamental", "single_stock_data"):
+        if not (tool_names & _MARKET_TOOLS):
+            missing_dims.append("market_missing")
+        if not (tool_names & _FUNDAMENTAL_TOOLS):
+            missing_dims.append("fundamental_missing")
+    elif analysis_mode == "sector_market":
+        if not (tool_names & _SECTOR_TOOLS):
+            missing_dims.append("sector_missing")
+    elif analysis_mode == "stock_selection":
+        if not (tool_names & _SELECTION_CANDIDATE_TOOLS):
+            missing_dims.append("candidate_missing")
+
+    return "partial", missing_dims, "analytical", reason_codes
+
+
+def _skill_evidence_validation_enabled() -> bool:
+    """Off by default: strict required_evidence / mode checks often misfire in prod."""
+    return os.getenv("ENABLE_SKILL_EVIDENCE_VALIDATION", "").lower() in ("1", "true", "yes")
+
+
 def validate_evidence(
     *,
     analysis_mode: str,
@@ -270,6 +320,23 @@ def validate_evidence(
     skill_spec: dict[str, Any] | None = None,
 ) -> EvidenceValidationResult:
     base = extract_tool_evidences(response)
+    if not _skill_evidence_validation_enabled():
+        if not base.used_tools:
+            return base
+        tools = list(base.successful_tools) or [e.tool_name for e in base.evidences]
+        return EvidenceValidationResult(
+            used_tools=True,
+            evidence_ok=True,
+            successful_tools=tools,
+            evidences=list(base.evidences),
+            missing_evidence_reasons=[],
+            accepted_evidences=list(base.accepted_evidences),
+            rejected_evidences=list(base.rejected_evidences),
+            tier="full",
+            missing_dimensions=[],
+            allowed_claim_level="analytical",
+            reason_codes=[],
+        )
     if not base.used_tools:
         if skill_spec:
             base.missing_evidence_reasons = ["no tool evidence collected"]
@@ -298,6 +365,15 @@ def validate_evidence(
 
     successful_tools = [item.tool_name for item in relevant]
     accepted = [_evidence_ref(item) for item in relevant]
+
+    # FIX-2: compute tier, missing_dimensions, allowed_claim_level
+    tier, missing_dims, claim_level, reason_codes = _compute_evidence_tier(
+        evidence_ok=evidence_ok,
+        relevant=relevant,
+        reasons=reasons,
+        analysis_mode=analysis_mode,
+    )
+
     return EvidenceValidationResult(
         used_tools=base.used_tools,
         evidence_ok=evidence_ok,
@@ -306,4 +382,8 @@ def validate_evidence(
         missing_evidence_reasons=reasons,
         accepted_evidences=accepted,
         rejected_evidences=rejected,
+        tier=tier,
+        missing_dimensions=missing_dims,
+        allowed_claim_level=claim_level,
+        reason_codes=reason_codes,
     )

@@ -1,14 +1,3 @@
-/**
- * useMemory composable - Phase 3 完整实现
- *
- * 所有 MemorySidebar 子组件通过此 composable 与 API 交互，
- * 不直接调用 memoryApi（方便测试和 mock）。
- *
- * debounce 策略：
- * - updateSectors / updateReturn：写入本地立即响应，延迟 800ms 发请求
- * - updateRisk / updateHorizon：立即发请求（单选操作，频次低）
- */
-
 import { ref } from 'vue'
 import { memoryApi } from '@/api'
 import type { MemoryProfile, MemoryItem } from '@/api'
@@ -22,11 +11,8 @@ export function useMemory() {
   const loading = ref(false)
   const error = ref<string | null>(null)
 
-  // debounce 句柄
   let sectorsTimer: ReturnType<typeof setTimeout> | null = null
   let returnTimer: ReturnType<typeof setTimeout> | null = null
-
-  // ── 加载画像 ─────────────────────────────────────────────
 
   async function loadProfile() {
     const userId = userStore.userId
@@ -49,8 +35,6 @@ export function useMemory() {
     }
   }
 
-  // ── 更新风险偏好（立即 API 调用） ───────────────────────
-
   async function updateRisk(risk: string) {
     const userId = userStore.userId
     if (!userId) return
@@ -62,8 +46,6 @@ export function useMemory() {
       console.warn('[useMemory] updateRisk 失败:', error.value)
     }
   }
-
-  // ── 更新关注板块（debounce 800ms）────────────────────────
 
   function updateSectors(sectors: string[]) {
     const userId = userStore.userId
@@ -80,8 +62,6 @@ export function useMemory() {
       }
     }, 800)
   }
-
-  // ── 更新期望收益（debounce 800ms）────────────────────────
 
   function updateReturn(val: number, max?: number, horizon?: string) {
     const userId = userStore.userId
@@ -100,8 +80,6 @@ export function useMemory() {
     }, 800)
   }
 
-  // ── 更新投资周期（立即 API 调用）────────────────────────
-
   async function updateHorizon(horizon: string) {
     const userId = userStore.userId
     if (!userId) return
@@ -113,8 +91,6 @@ export function useMemory() {
       console.warn('[useMemory] updateHorizon 失败:', error.value)
     }
   }
-
-  // ── 清空所有记忆 ────────────────────────────────────────
 
   async function clearAllMemories() {
     const userId = userStore.userId
@@ -128,33 +104,24 @@ export function useMemory() {
     }
   }
 
-  // ── 加载记忆条目（Mem0 语义层）─────────────────────────
-
   async function loadMemoryItems(page = 1) {
     const userId = userStore.userId
     if (!userId) return
     try {
       const res = await memoryApi.getItems(userId, page)
       const { items, total } = res.data
-      memoryStore.setMemoryItems(
-        items as MemoryItem[],
-        total,
-        page,
-      )
+      memoryStore.setMemoryItems(items as MemoryItem[], total, page)
     } catch (e: unknown) {
       error.value = e instanceof Error ? e.message : '加载记忆条目失败'
       console.warn('[useMemory] loadMemoryItems 失败:', error.value)
     }
   }
 
-  // ── 添加记忆条目 ────────────────────────────────────────
-
   async function addMemoryItem(category: string, content: string) {
     const userId = userStore.userId
     if (!userId) return null
     try {
       const res = await memoryApi.addItem(userId, category, content)
-      // 刷新列表
       await loadMemoryItems(1)
       return res.data
     } catch (e: unknown) {
@@ -163,22 +130,19 @@ export function useMemory() {
     }
   }
 
-  // ── 删除记忆条目 ────────────────────────────────────────
-
-  async function deleteMemoryItem(memoryId: string) {
+  async function deleteSemanticMemoryItem(memoryId: string) {
     const userId = userStore.userId
     if (!userId) return
     try {
       await memoryApi.deleteItem(userId, memoryId)
-      // 从本地列表移除
       memoryStore.setMemoryItems(
-        memoryStore.memoryItems.filter(i => i.id !== memoryId),
-        memoryStore.totalItems - 1,
-        memoryStore.currentPage,
+        memoryStore.memoryItems.filter((i) => i.id !== memoryId),
+        Math.max(0, memoryStore.totalItems - 1),
+        1,
       )
     } catch (e: unknown) {
       error.value = e instanceof Error ? e.message : '删除记忆失败'
-      console.warn('[useMemory] deleteMemoryItem 失败:', error.value)
+      console.warn('[useMemory] deleteSemanticMemoryItem 失败:', error.value)
     }
   }
 
@@ -193,6 +157,6 @@ export function useMemory() {
     clearAllMemories,
     loadMemoryItems,
     addMemoryItem,
-    deleteMemoryItem,
+    deleteSemanticMemoryItem,
   }
 }

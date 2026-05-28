@@ -1,4 +1,6 @@
+import os
 import unittest
+from unittest.mock import patch
 
 from src.tools.trace_exporters.langfuse_exporter import LangfuseTraceExporter
 
@@ -88,6 +90,45 @@ class LangfuseExporterTestCase(unittest.TestCase):
 
         self.assertEqual(exporter._resolve_parent_observation_id(event_record), "obs_current")
         self.assertEqual(exporter._resolve_parent_observation_id(span_record), "obs_parent")
+
+    def test_trace_output_masks_prompt_reply_by_default(self):
+        exporter = self._build_exporter()
+        record = {
+            "status": "ok",
+            "data": {
+                "prompt": "full prompt",
+                "reply_text": "full reply",
+                "prompt_ref": "/tmp/prompt.json",
+                "reply_ref": "/tmp/reply.json",
+                "skill_name": "stock-first-pass",
+            },
+        }
+
+        with patch.dict(os.environ, {"LANGFUSE_UPLOAD_PROMPT_REPLY": "false"}, clear=False):
+            payload = exporter._trace_output(record)
+
+        self.assertNotIn("prompt", payload)
+        self.assertNotIn("reply_text", payload)
+        self.assertEqual(payload["prompt_ref"], "/tmp/prompt.json")
+        self.assertEqual(payload["reply_ref"], "/tmp/reply.json")
+        self.assertEqual(payload["skill_name"], "stock-first-pass")
+
+    def test_trace_output_can_upload_prompt_reply_when_explicitly_enabled(self):
+        exporter = self._build_exporter()
+        record = {
+            "status": "ok",
+            "data": {
+                "prompt": "full prompt",
+                "reply_text": "full reply",
+                "prompt_ref": "/tmp/prompt.json",
+            },
+        }
+
+        with patch.dict(os.environ, {"LANGFUSE_UPLOAD_PROMPT_REPLY": "true"}, clear=False):
+            payload = exporter._trace_output(record)
+
+        self.assertEqual(payload["prompt"], "full prompt")
+        self.assertEqual(payload["reply_text"], "full reply")
 
 
 if __name__ == "__main__":

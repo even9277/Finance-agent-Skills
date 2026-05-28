@@ -71,22 +71,101 @@ export interface ReportListItem {
   created_at: string
 }
 
+export interface SkillConfirmOption {
+  key: string
+  label: string
+  recommended?: boolean
+}
+
+export interface SkillConfirmPayload {
+  session_id: string
+  options: SkillConfirmOption[]
+  reasoning: string
+  resolved_query: string
+  confidence: number
+}
+
+export interface ChatMessageRequest {
+  user_id: string
+  message: string
+  session_id?: string
+  sop_skill_id?: string
+}
+
 export interface ChatMessageResponse {
   reply: string
   session_id: string
   // Phase 3：本次对话参考的用户画像（null 表示 ENABLE_MEMORY=false 或未设置）
   memory_profile?: MemoryProfile | null
   context_window?: ChatContextWindow | null
+  route_summary?: ChatRouteSummary | null
+  running_summary?: string | null
+  running_summary_state?: Record<string, any> | null
+  running_summary_mode?: string | null
+  /** 低置信度路由：需用户确认，此时 reply 可能为空 */
+  skill_confirm?: SkillConfirmPayload | null
+  plan_artifact?: Record<string, any> | null
+  skill_artifact?: Record<string, any> | null
+  verification?: Record<string, any> | null
+  allowed_claim_level?: string | null
+}
+
+export interface ChatRouteSummaryUserFacing {
+  skill_label: string
+  analysis_mode: string
+  evidence_status: string
+  failure_hint: string
+}
+
+export interface ChatRouteSummaryDebug {
+  route_kind: string
+  grounding_policy: string
+  claim_policy: string
+  skill_contract: string
+  evidence_tier: string
+  evidence_missing_dimensions: string[]
+  evidence_allowed_claim_level: string
+  failure_code: string
+}
+
+export interface ChatRouteSummary {
+  selected_skill_family: string
+  selected_skill: string
+  skill_name?: string | null
+  analysis_mode: string
+  execution_policy: string
+  reply_mode: string
+  route_confidence: number
+  used_tools: boolean
+  evidence_ok: boolean
+  tools_used: string[]
+  tools_attempted: string[]
+  notes: string[]
+  // FIX-7: layered route summary
+  route_kind?: string
+  grounding_policy?: string
+  claim_policy?: string
+  skill_contract?: string
+  failure_code?: string
+  user_facing?: ChatRouteSummaryUserFacing | null
+  debug?: ChatRouteSummaryDebug | null
 }
 
 export interface ChatContextWindow {
   used_tokens: number
   budget_tokens: number
   usage_percent: number
-  counting_mode: 'exact' | 'estimated' | string
+  counting_mode: 'exact' | 'estimated' | 'estimated_fallback' | string
   compression_status: 'idle' | 'queued' | 'running' | 'failed' | string
   strategy: 'dynamic_budget' | 'legacy_count' | string
   updated_at?: string | null
+  memory_hint?: string | null
+  memory_hint_level?: 'info' | 'warn' | string | null
+  // FIX-5: structured budget info
+  model_window_tokens?: number
+  working_budget_tokens?: number
+  reserved_output_tokens?: number
+  budget_status?: 'healthy' | 'moderate' | 'high' | 'critical' | string
 }
 
 export interface ChatSession {
@@ -94,6 +173,8 @@ export interface ChatSession {
   mode: string
   title?: string
   running_summary?: string
+  running_summary_state?: Record<string, any> | null
+  running_summary_mode?: string | null
   context_window?: ChatContextWindow | null
   created_at: string
   updated_at: string
@@ -106,6 +187,39 @@ export interface ChatMessage {
   content: string
   is_compressed: boolean
   created_at: string
+  route_summary?: ChatRouteSummary | null
+  plan_artifact?: Record<string, any> | null
+  skill_artifact?: Record<string, any> | null
+  verification?: Record<string, any> | null
+  allowed_claim_level?: string | null
+  plan_preview?: PlanPreviewItem[]
+  step_statuses?: StepStatusItem[]
+  verification_summary?: VerificationSummary | null
+}
+
+export interface PlanPreviewItem {
+  step_id: string
+  title: string
+  description?: string | null
+  required?: boolean
+  estimated_evidence?: string
+  status?: string
+  args_summary?: Record<string, string>
+}
+
+export interface StepStatusItem {
+  plan_id?: string
+  step_id: string
+  tool_name?: string
+  status: string
+}
+
+export interface VerificationSummary {
+  plan_id?: string
+  status: string
+  evidence_score?: number
+  allowed_claim_level?: string
+  missing_dimensions?: string[]
 }
 
 export interface ChatTemplate {
@@ -114,19 +228,22 @@ export interface ChatTemplate {
   content: string
 }
 
+export interface SopSkillListItem {
+  name: string
+  official_name: string
+  description: string
+  execution_mode: string
+}
+
 export interface ChatSummaryItem {
   id: number
   session_id: string
   summary: string
+  summary_payload?: Record<string, any> | null
+  summary_mode?: string | null
+  summary_trigger?: string | null
   compressed_message_count: number
   total_message_count: number
-  // Phase 2.1：更直观的压缩快照展示（后端兼容旧数据，前端用可选字段）
-  compressed_user_count?: number | null
-  compressed_assistant_count?: number | null
-  start_message_id?: number | null
-  end_message_id?: number | null
-  start_created_at?: string | null
-  end_created_at?: string | null
   created_at: string
 }
 
@@ -138,6 +255,9 @@ export interface ChatSessionSummaries {
 export interface ChatSessionMessagesResponse {
   session_id: string
   messages: ChatMessage[]
+  running_summary?: string | null
+  running_summary_state?: Record<string, any> | null
+  running_summary_mode?: string | null
   context_window?: ChatContextWindow | null
 }
 
@@ -186,6 +306,7 @@ export interface MemoryProfile {
 
 export interface MemoryItem {
   id: string
+  mem0_id?: string
   content: string
   category: string
   source: string
@@ -237,12 +358,13 @@ export const reportApi = {
 // 对话 API
 // ─────────────────────────────────────────────────────────────
 export const chatApi = {
-  sendMessage: (userId: string, message: string, sessionId?: string) =>
+  sendMessage: (userId: string, message: string, sessionId?: string, sopSkillId?: string) =>
     http.post<ChatMessageResponse>('/chat/message', {
       user_id: userId,
       message,
       session_id: sessionId,
-    }),
+      sop_skill_id: sopSkillId,
+    } as ChatMessageRequest),
 
   listSessions: (userId: string, q?: string) =>
     http.get<ChatSession[]>('/chat/sessions', { params: { user_id: userId, q } }),
@@ -263,6 +385,14 @@ export const chatApi = {
     http.get<ChatSessionSummaries>(`/chat/sessions/${sessionId}/summaries`, { params: { user_id: userId } }),
 
   getTemplates: () => http.get<ChatTemplate[]>('/chat/templates'),
+
+  fetchSopSkills: () => http.get<SopSkillListItem[]>('/chat/sop-skills'),
+
+  confirmSkill: (sessionId: string, userId: string, userChoice: string) =>
+    http.post<ChatMessageResponse>(`/chat/sessions/${sessionId}/confirm-skill`, {
+      user_id: userId,
+      user_choice: userChoice,
+    }),
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -370,17 +500,44 @@ export interface WsStreamPayload {
   session_id?: string
 }
 
+// FIX-6: unified event protocol constants
+export const WS_EVENT = {
+  SESSION_ID: 'session_id',
+  CONTEXT_UPDATE: 'context_update',
+  TASK_STATUS_QUEUED: 'task_status_queued',
+  TASK_STATUS_RUNNING: 'task_status_running',
+  TASK_STATUS_DONE: 'task_status_done',
+  TASK_STATUS_FAILED: 'task_status_failed',
+  TRACE_SUMMARY: 'trace_summary',
+  PLAN_PREVIEW: 'plan_preview',
+  STEP_STATUS: 'step_status',
+  VERIFICATION_SUMMARY: 'verification_summary',
+  DONE: 'done',
+  SKILL_CONFIRM: 'skill_confirm',
+  ERROR: 'error',
+} as const
+
 export type WsControlFrame =
   | { type: 'session_id'; session_id: string }
   | { type: 'context_update'; session_id: string; context_window: ChatContextWindow }
-  | { type: 'compaction_queued'; session_id: string; context_window: ChatContextWindow }
-  | { type: 'compaction_running'; session_id: string; context_window: ChatContextWindow }
-  | { type: 'compaction_done'; session_id: string; context_window: ChatContextWindow }
-  | { type: 'compaction_failed'; session_id: string; context_window: ChatContextWindow; message?: string }
-  | { type: 'done'; session_id: string }
-  | { type: 'compress_start'; session_id: string; progress: number; eta_seconds: number }
-  | { type: 'compress_done'; session_id: string; progress: number; eta_seconds: number; elapsed_seconds: number; snapshot_id?: number; compressed_message_count?: number; total_message_count?: number; percent?: number }
-  | { type: 'compress_skip'; session_id: string; progress: number; eta_seconds: number }
+  | { type: 'task_status_queued'; session_id: string; task_kind: string; context_window?: ChatContextWindow }
+  | { type: 'task_status_running'; session_id: string; task_kind: string; context_window?: ChatContextWindow; progress?: number; eta_seconds?: number }
+  | { type: 'task_status_done'; session_id: string; task_kind: string; context_window?: ChatContextWindow; progress?: number; elapsed_seconds?: number; snapshot_id?: number; compressed_message_count?: number; total_message_count?: number; percent?: number }
+  | { type: 'task_status_failed'; session_id: string; task_kind: string; context_window?: ChatContextWindow; message?: string }
+  | { type: 'trace_summary'; session_id: string; route_summary: ChatRouteSummary }
+  | { type: 'plan_preview'; session_id: string; plan_id: string; items: PlanPreviewItem[] }
+  | { type: 'step_status'; session_id: string; plan_id: string; step_id: string; tool_name?: string; status: string }
+  | { type: 'verification_summary'; session_id: string; plan_id: string; status: string; evidence_score?: number; allowed_claim_level?: string; missing_dimensions?: string[] }
+  | { type: 'skill_confirm'; session_id: string; options: SkillConfirmOption[]; reasoning?: string; resolved_query?: string; confidence?: number }
+  | {
+      type: 'done'
+      session_id: string
+      running_summary?: string
+      running_summary_mode?: string
+      context_window?: ChatContextWindow
+      route_summary?: ChatRouteSummary
+      awaiting_skill_confirm?: boolean
+    }
   | { type: 'error'; message: string }
 
 /**

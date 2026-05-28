@@ -31,10 +31,6 @@ logger = setup_logger("backend.main", log_dir=str(_AGENT_ROOT / "logs"))
 
 _ltm_worker_task = None
 _ltm_worker_stop_event = None
-_stm_worker_task = None
-_stm_worker_stop_event = None
-
-
 def _load_project_env_files() -> None:
     """
     将 agent/backend 两侧 .env 注入到 os.environ。
@@ -61,7 +57,7 @@ async def lifespan(app: FastAPI):
     启动：初始化数据库 → 初始化 Mem0 → 启动 ltm_worker（ENABLE_MEMORY=true 时）
     关闭：停止 ltm_worker → 清理资源
     """
-    global _ltm_worker_task, _ltm_worker_stop_event, _stm_worker_task, _stm_worker_stop_event
+    global _ltm_worker_task, _ltm_worker_stop_event
 
     # 1. 初始化数据库（创建表 + 增量字段迁移）
     await init_db()
@@ -124,22 +120,11 @@ async def lifespan(app: FastAPI):
         logger.info("[backend] ENABLE_MEMORY=false，LTM 功能关闭")
 
     if settings.enable_stm:
-        try:
-            from backend.services.stm_compaction_worker import stm_compaction_worker_loop
-
-            _stm_worker_stop_event = asyncio.Event()
-            _stm_worker_task = asyncio.create_task(
-                stm_compaction_worker_loop(_stm_worker_stop_event),
-                name="stm_compaction_worker",
-            )
-            print("[backend] stm_compaction_worker 后台任务已启动 ✓")
-            logger.info("[backend] stm_compaction_worker 启动完成")
-        except Exception as exc:
-            print(f"[backend] stm_compaction_worker 启动失败（不影响主功能）: {exc}")
-            logger.warning(f"[backend] stm_compaction_worker 启动失败: {exc}")
+        print("[backend] ENABLE_STM=true，STM 仅保留 pre_compaction/fallback 主链路，已停用 stm_compaction_worker")
+        logger.info("[backend] ENABLE_STM=true，已停用旧 stm_compaction_worker")
     else:
-        print("[backend] ENABLE_STM=false，跳过 stm_compaction_worker")
-        logger.info("[backend] ENABLE_STM=false，STM worker 关闭")
+        print("[backend] ENABLE_STM=false，跳过 STM 初始化")
+        logger.info("[backend] ENABLE_STM=false，STM 关闭")
 
     print(f"[backend] {settings.app_name} v{settings.app_version} 启动完成 ✓")
     logger.info(f"[backend] 应用启动完成: {settings.app_name} v{settings.app_version}")
@@ -157,16 +142,6 @@ async def lifespan(app: FastAPI):
             pass
         print("[backend] ltm_worker 已停止")
         logger.info("[backend] ltm_worker 已停止")
-    if _stm_worker_task and not _stm_worker_task.done():
-        if _stm_worker_stop_event:
-            _stm_worker_stop_event.set()
-        _stm_worker_task.cancel()
-        try:
-            await _stm_worker_task
-        except asyncio.CancelledError:
-            pass
-        print("[backend] stm_compaction_worker 已停止")
-        logger.info("[backend] stm_compaction_worker 已停止")
     try:
         flush_trace_exporters()
     except Exception as exc:

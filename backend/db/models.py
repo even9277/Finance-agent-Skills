@@ -12,12 +12,14 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    BigInteger,
     Integer,
     JSON,
     String,
     Text,
     UniqueConstraint,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from backend.db.database import Base
@@ -29,6 +31,9 @@ def _uuid() -> str:
 
 def _now() -> datetime:
     return datetime.utcnow()
+
+
+_JSON_STORAGE = JSON().with_variant(JSONB, "postgresql")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -81,6 +86,11 @@ class Session(Base):
     mode: Mapped[str] = mapped_column(String(20), default="chat")  # 'report' | 'chat'
     title: Mapped[str | None] = mapped_column(String(200))         # 取首条消息前20字
     running_summary: Mapped[str | None] = mapped_column(Text)      # Phase 2 STM 压缩摘要
+    running_summary_state: Mapped[dict | None] = mapped_column(_JSON_STORAGE)
+    working_state: Mapped[dict | None] = mapped_column(_JSON_STORAGE)
+    working_state_version: Mapped[int] = mapped_column(Integer, default=0)
+    working_state_updated_at: Mapped[datetime | None] = mapped_column(DateTime)
+    running_summary_mode: Mapped[str | None] = mapped_column(String(32))
     turn_count: Mapped[int] = mapped_column(Integer, default=0)    # Phase 2 压缩阈值
     last_compress_at: Mapped[datetime | None] = mapped_column(DateTime)
     context_token_count: Mapped[int] = mapped_column(Integer, default=0)
@@ -99,6 +109,32 @@ class Session(Base):
         cascade="all, delete-orphan",  # 删除 Session 时级联删除 Message
         passive_deletes=True,          # 让 DB 的 ON DELETE CASCADE 生效，避免 ORM 尝试将 FK 置空
     )
+    working_state_events: Mapped[list["WorkingStateEvent"]] = relationship(
+        back_populates="session",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+
+class WorkingStateEvent(Base):
+    __tablename__ = "working_state_events"
+
+    id: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
+    session_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("sessions.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    message_id: Mapped[int | None] = mapped_column(Integer)
+    field_name: Mapped[str] = mapped_column(String(32), nullable=False)
+    old_value: Mapped[dict | list | str | None] = mapped_column(_JSON_STORAGE)
+    new_value: Mapped[dict | list | str | None] = mapped_column(_JSON_STORAGE)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    summary_version: Mapped[int] = mapped_column(Integer, default=0)
+    state_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    trace_id: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+    session: Mapped["Session"] = relationship(back_populates="working_state_events")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -118,9 +154,25 @@ class Message(Base):
     token_count: Mapped[int | None] = mapped_column(Integer)       # Phase 2 token 估算
     is_compressed: Mapped[bool] = mapped_column(Boolean, default=False)  # Phase 2 压缩标记
     used_for_ltm: Mapped[bool] = mapped_column(Boolean, default=False)   # Phase 3 LTM 抽取标记
+    route_summary_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # FIX-8: user-facing route summary
+    plan_artifact_json: Mapped[dict | None] = mapped_column(_JSON_STORAGE, nullable=True)
+    skill_artifact_json: Mapped[dict | None] = mapped_column(_JSON_STORAGE, nullable=True)
+    verification_json: Mapped[dict | None] = mapped_column(_JSON_STORAGE, nullable=True)
+    allowed_claim_level: Mapped[str | None] = mapped_column(String(20))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
     session: Mapped["Session"] = relationship(back_populates="messages")
+
+
+class WebSearchCache(Base):
+    """Web Search v2 缓存表：只保存摘要级结果，不保存网页正文。"""
+
+    __tablename__ = "web_search_cache"
+
+    key: Mapped[str] = mapped_column(String(512), primary_key=True)
+    payload: Mapped[dict] = mapped_column(_JSON_STORAGE, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -252,37 +304,38 @@ class SessionSummary(Base):
         String(36), ForeignKey("sessions.id", ondelete="CASCADE"), index=True
     )
     summary: Mapped[str] = mapped_column(Text, nullable=False)
+    summary_payload: Mapped[dict | None] = mapped_column(_JSON_STORAGE)
+    summary_mode: Mapped[str | None] = mapped_column(String(32))
+    summary_trigger: Mapped[str | None] = mapped_column(String(64))
 
     # 本次压缩统计（用于前端百分比进度展示）
     compressed_message_count: Mapped[int] = mapped_column(Integer, default=0)
     total_message_count: Mapped[int] = mapped_column(Integer, default=0)
 
-    # Phase 2.1：更直观的压缩范围展示（用户/助手条数 + 时间轴）
-    # 说明：为兼容历史数据与增量迁移，这些字段允许为空；新快照会写入完整信息
-    compressed_user_count: Mapped[int | None] = mapped_column(Integer, default=0)
-    compressed_assistant_count: Mapped[int | None] = mapped_column(Integer, default=0)
-    start_message_id: Mapped[int | None] = mapped_column(Integer)
-    end_message_id: Mapped[int | None] = mapped_column(Integer)
-    start_created_at: Mapped[datetime | None] = mapped_column(DateTime)
-    end_created_at: Mapped[datetime | None] = mapped_column(DateTime)
-
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
-class StmCompactionTask(Base):
-    __tablename__ = "stm_compaction_tasks"
+class SummaryAuditLog(Base):
+    __tablename__ = "summary_audit_logs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     session_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("sessions.id", ondelete="CASCADE"), index=True
     )
-    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
-    retry_count: Mapped[int] = mapped_column(Integer, default=0)
-    cutoff_message_id: Mapped[int | None] = mapped_column(Integer)
-    summary_version_before: Mapped[int] = mapped_column(Integer, default=0)
-    estimated_tokens_before: Mapped[int] = mapped_column(Integer, default=0)
-    error_msg: Mapped[str | None] = mapped_column(Text)
+    task_kind: Mapped[str] = mapped_column(String(32), index=True)
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    trigger: Mapped[str | None] = mapped_column(String(64))
+    reason: Mapped[str | None] = mapped_column(String(128))
+    source_start_message_id: Mapped[int | None] = mapped_column(Integer)
+    source_end_message_id: Mapped[int | None] = mapped_column(Integer)
+    source_start_created_at: Mapped[datetime | None] = mapped_column(DateTime)
+    source_end_created_at: Mapped[datetime | None] = mapped_column(DateTime)
+    input_message_count: Mapped[int] = mapped_column(Integer, default=0)
+    input_token_estimate: Mapped[int | None] = mapped_column(Integer)
+    output_summary_id: Mapped[int | None] = mapped_column(Integer)
+    output_summary_version: Mapped[int | None] = mapped_column(Integer)
+    output_summary_mode: Mapped[str | None] = mapped_column(String(32))
+    audit_reasons_json: Mapped[list | None] = mapped_column(_JSON_STORAGE)
+    model_name: Mapped[str | None] = mapped_column(String(128))
+    counting_mode: Mapped[str | None] = mapped_column(String(32))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
-    started_at: Mapped[datetime | None] = mapped_column(DateTime)
-    finished_at: Mapped[datetime | None] = mapped_column(DateTime)
-

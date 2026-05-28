@@ -4,7 +4,6 @@ description: 通用 ETF 筛选与推荐 skill，面向宽基、行业、主题�
 execution_mode: deterministic
 allowed_tools:
   - get_fund_basic_info
-  - get_etf_basic_info
   - get_fund_nav
   - get_fund_market_bars
   - get_fund_share
@@ -12,19 +11,30 @@ allowed_tools:
 
 # ETF Screen
 
+## Purpose
+
+围绕用户给出的主题、指数、资产类别或风险约束，筛出一组可继续研究的 ETF / 场内基金 shortlist。这个 skill 不直接承诺“最优 ETF”，而是把候选发现、候选扩展、证据补全、筛选逻辑和风险边界串成一个稳定流程。
+
 ## When to Use
 
 - 用户希望筛选、推荐、初步 shortlist 某类 ETF 或场内基金，例如宽基 ETF、黄金 ETF、红利 ETF、科创 ETF、半导体 ETF。
 - 用户给出了风险偏好、持有周期、主题偏好、是否看重流动性等约束，希望得到更适合的候选。
 - 用户需要“先找候选，再补证据”的真实筛选流程，而不是只比较两个已知产品。
 
-## Inputs
+## When Not to Use
+
+- 用户已经指定两只或多只基金做比较，应交给 `fund-compare`。
+- 用户问的是某只 ETF 为什么异动，应交给 `market-move-explain`。
+- 用户问单只股票或板块热点，不应强行转成 ETF 筛选。
+- 用户没有给出任何主题、指数、资产类别或筛选条件时，应先追问。
+
+## Required Inputs
 
 - 用户原始问题。
 - 主题、指数、行业、资产类别等筛选意图。
 - 用户画像摘要，主要用于风险偏好、持有周期和回答偏好。
 
-## Decision Rules
+## Workflow
 
 1. 先用基础信息发现候选 ETF/基金，再补净值、份额、场内行情做二次筛选。
 2. 输出优先是 shortlist 和筛选逻辑，不是唯一推荐答案。
@@ -32,13 +42,28 @@ allowed_tools:
 4. 如果候选很多，优先保留 2 到 3 只最像用户需求的产品。
 5. 若证据不足，只能给方向性 shortlist，不编造确定性排序。
 
-## Fallbacks
+## Tool Use Guide
+
+- `get_fund_basic_info` 用于候选发现和候选扩展，优先根据主题、指数、资产类别召回。
+- `get_fund_nav` 用于净值和阶段表现证据。
+- `get_fund_market_bars` 用于 ETF 场内行情、波动和近期交易表现。
+- `get_fund_share` 用于份额、规模和流动性辅助判断。
+- 不调用私有脚本或网页搜索；新闻催化不是 ETF 筛选的主证据。
+
+## Evidence Rules
+
+- `fund_basic` 是候选进入 shortlist 的必要证据。
+- `fund_nav`、`fund_daily`、`fund_share` 至少命中一类，才允许给候选排序理由。
+- 规模、流动性、跟踪质量、主题风险要作为筛选维度，不要只看近期涨跌。
+- 候选过多时，优先输出 shortlist 和排除逻辑，不要铺满长列表。
+
+## Degrade Policy
 
 - 主题过于宽泛：先给高相关 ETF 方向，再提醒用户补充持有周期或风险偏好。
 - 只有基础信息，没有表现或规模数据：只做候选归纳，不做强推荐。
 - 工具结果冲突或为空：说明当前 shortlist 可靠性有限。
 
-## Output Template
+## Output Contract
 
 - 默认结构：
   - 先给 shortlist 结论，再给筛选逻辑、候选差异、主要风险、适配建议、数据来源。
@@ -47,3 +72,7 @@ allowed_tools:
 - `response_pref=concise`：
   - 保留 shortlist、2 到 3 个筛选理由、风险提示、数据来源。
 - 始终标注：数据来源为 Tushare，并尽量给出数据日期。
+
+## References
+
+- `references/ETF筛选规则.md`：候选筛选维度、规模流动性、跟踪质量和主题风险。

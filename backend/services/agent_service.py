@@ -237,7 +237,7 @@ async def _build_initial_state(user_query: str, user_id: str = "") -> AgentState
     if company_name:
         data["company_name"] = company_name
     if stock_code:
-        data["stock_code"] = stock_code  # resolve_stock 已包含 sh./sz. 前缀
+        data["stock_code"] = stock_code  # canonical format: XXXXXX.SH/SZ
 
     # 合并 STM + LTM 默认字段
     stm_defaults = make_stm_defaults()

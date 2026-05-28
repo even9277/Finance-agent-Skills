@@ -1,0 +1,16 @@
+allowed_domains:
+  - cninfo.com.cn
+  - sse.com.cn
+  - szse.cn
+  - cs.com.cn
+  - stcn.com
+  - cls.cn
+  - eastmoney.com
+  - finance.sina.com.cn
+  - 10jqka.com.cn
+official_domains:
+  - cninfo.com.cn
+  - sse.com.cn
+  - szse.cn
+blocked_domains:
+  - example.com
