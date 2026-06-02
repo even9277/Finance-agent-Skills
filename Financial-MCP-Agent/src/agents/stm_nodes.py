@@ -21,6 +21,10 @@ import time
 from datetime import datetime
 from typing import Any, Dict
 
+from src.prompts.memory import (
+    SUMMARIZE_CONVERSATION_PROMPT,
+    TOOL_DIGEST_PROMPT,
+)
 from src.utils.logging_config import setup_logger, WAIT_ICON, SUCCESS_ICON, ERROR_ICON
 from src.utils.state_definition import AgentState
 
@@ -34,32 +38,6 @@ STM_TOKEN_THRESHOLD = 6000    # token 估算阈值
 STM_KEEP_RECENT = 4           # 压缩后保留最近 N 条原始消息
 
 # ─────────────────────────────────────────────────────────────
-# STM 压缩 Prompt（金融专版）
-# ─────────────────────────────────────────────────────────────
-SUMMARIZE_CONVERSATION_PROMPT = """
-你是一个金融对话摘要助手。请将以下对话历史压缩成精炼摘要，
-严格保留以下关键信息，不得遗漏：
-
-必须保留：
-- 用户提到的所有股票代码/公司名称
-- 用户明确表达的投资偏好（风险偏好、持有期限、关注板块）
-- 用户提出的具体投资问题和关键约束
-- 已生成报告的核心结论（股票代码、买入/持有/卖出建议、关键数值）
-
-可以省略：
-- 打招呼、寒暄等无实质内容的对话
-- 重复表达同一意思的内容
-- analyst 分析过程的中间步骤（只保留最终结论）
-
-输出格式：纯文字段落，300字以内，使用中文。
-"""
-
-TOOL_DIGEST_PROMPT = """
-请将以下 analyst 工具输出提炼为摘要，严格控制在 200 字以内。
-保留：最终投资结论、关键财务数值（PE/PB/ROE/营收增速等）、明确的风险提示。
-删除：完整新闻正文、逐行财务表格、图表描述。
-附上对应的 log 引用 ID 供审计追溯。
-"""
 
 
 def _estimate_tokens(text: str) -> int:

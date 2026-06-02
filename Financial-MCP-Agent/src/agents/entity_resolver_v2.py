@@ -7,6 +7,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from src.tools.skill_trace import trace_span
+
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
@@ -62,82 +64,87 @@ async def resolve_authoritative_entity(
     summary_active_symbols: list[str] | None = None,
     source_message_id: int | None = None,
 ) -> EntityResolutionResultV2:
-    from backend.services.entity_resolver import gather_candidates
+    with trace_span(
+        "entity_resolve",
+        stage="entity",
+        data={"input_preview": (user_message or "")[:100], "has_previous_entity": bool(previous_active_entity)},
+    ):
+        from backend.services.entity_resolver import gather_candidates
 
-    allowed = set(allowed_asset_types or {"stock", "fund", "sector", "index"})
-    candidates_raw = await gather_candidates(
-        user_message,
-        allowed_asset_types=allowed,  # type: ignore[arg-type]
-        session_symbols=session_symbols,
-        summary_active_symbols=summary_active_symbols,
-    )
-    candidates = [_candidate_from_raw(item) for item in candidates_raw if _candidate_from_raw(item) is not None]
-    candidates.sort(key=lambda item: item.score, reverse=True)
-
-    if candidates:
-        top = candidates[0]
-        second = candidates[1] if len(candidates) > 1 else None
-        if second and (top.score - second.score) < 0.15:
-            return _clarify(
-                candidates,
-                status="competing_candidates",
-                failure_code="competing_candidates",
-                source_message_id=source_message_id,
-            )
-        if top.score < 0.75:
-            return _clarify(
-                candidates,
-                status="ambiguous",
-                failure_code=candidates_raw[0].get("failure_code") or "entity_unresolved",
-                source_message_id=source_message_id,
-            )
-        return EntityResolutionResultV2(
-            entity_found=True,
-            entity_type=top.entity_type,
-            primary_entity=PrimaryEntity(
-                entity_type=top.entity_type,
-                canonical_id=top.canonical_id,
-                display_name=top.display_name,
-                market=str(candidates_raw[0].get("market") or ""),
-                resolver_path=top.source or "catalog",
-            ),
-            candidate_entities=candidates,
-            confidence=top.score,
-            source_message_id=source_message_id,
-            resolution_status="resolved",
-            audit={"candidate_count": len(candidates)},
+        allowed = set(allowed_asset_types or {"stock", "fund", "sector", "index"})
+        candidates_raw = await gather_candidates(
+            user_message,
+            allowed_asset_types=allowed,  # type: ignore[arg-type]
+            session_symbols=session_symbols,
+            summary_active_symbols=summary_active_symbols,
         )
+        candidates = [_candidate_from_raw(item) for item in candidates_raw if _candidate_from_raw(item) is not None]
+        candidates.sort(key=lambda item: item.score, reverse=True)
 
-    if previous_active_entity and _FOLLOWUP_RE.search(user_message or "") and not _SWITCH_RE.search(user_message or ""):
-        entity_type = str(previous_active_entity.get("entity_type") or previous_active_entity.get("asset_type") or "none")
-        if entity_type in allowed:
-            canonical_id = str(previous_active_entity.get("canonical_id") or previous_active_entity.get("symbol") or "")
-            display_name = str(previous_active_entity.get("display_name") or canonical_id)
+        if candidates:
+            top = candidates[0]
+            second = candidates[1] if len(candidates) > 1 else None
+            if second and (top.score - second.score) < 0.15:
+                return _clarify(
+                    candidates,
+                    status="competing_candidates",
+                    failure_code="competing_candidates",
+                    source_message_id=source_message_id,
+                )
+            if top.score < 0.75:
+                return _clarify(
+                    candidates,
+                    status="ambiguous",
+                    failure_code=candidates_raw[0].get("failure_code") or "entity_unresolved",
+                    source_message_id=source_message_id,
+                )
             return EntityResolutionResultV2(
-                entity_found=bool(canonical_id or display_name),
-                entity_type=entity_type if entity_type in {"stock", "fund", "sector", "index"} else "none",
+                entity_found=True,
+                entity_type=top.entity_type,
                 primary_entity=PrimaryEntity(
-                    entity_type=entity_type if entity_type in {"stock", "fund", "sector", "index"} else "none",
-                    canonical_id=canonical_id,
-                    display_name=display_name,
-                    resolver_path="session_inherit",
+                    entity_type=top.entity_type,
+                    canonical_id=top.canonical_id,
+                    display_name=top.display_name,
+                    market=str(candidates_raw[0].get("market") or ""),
+                    resolver_path=top.source or "catalog",
                 ),
-                should_inherit=True,
-                inherit_from_previous=True,
-                confidence=0.82,
+                candidate_entities=candidates,
+                confidence=top.score,
                 source_message_id=source_message_id,
                 resolution_status="resolved",
-                audit={"resolver_path": "session_inherit"},
+                audit={"candidate_count": len(candidates), "top_entity": top.canonical_id},
             )
 
-    return EntityResolutionResultV2(
-        entity_found=False,
-        entity_type="none",
-        should_inherit=False,
-        failure_code="no_entity_detected",
-        source_message_id=source_message_id,
-        resolution_status="no_entity",
-    )
+        if previous_active_entity and _FOLLOWUP_RE.search(user_message or "") and not _SWITCH_RE.search(user_message or ""):
+            entity_type = str(previous_active_entity.get("entity_type") or previous_active_entity.get("asset_type") or "none")
+            if entity_type in allowed:
+                canonical_id = str(previous_active_entity.get("canonical_id") or previous_active_entity.get("symbol") or "")
+                display_name = str(previous_active_entity.get("display_name") or canonical_id)
+                return EntityResolutionResultV2(
+                    entity_found=bool(canonical_id or display_name),
+                    entity_type=entity_type if entity_type in {"stock", "fund", "sector", "index"} else "none",
+                    primary_entity=PrimaryEntity(
+                        entity_type=entity_type if entity_type in {"stock", "fund", "sector", "index"} else "none",
+                        canonical_id=canonical_id,
+                        display_name=display_name,
+                        resolver_path="session_inherit",
+                    ),
+                    should_inherit=True,
+                    inherit_from_previous=True,
+                    confidence=0.82,
+                    source_message_id=source_message_id,
+                    resolution_status="resolved",
+                    audit={"resolver_path": "session_inherit", "inherited_entity": canonical_id},
+                )
+
+        return EntityResolutionResultV2(
+            entity_found=False,
+            entity_type="none",
+            should_inherit=False,
+            failure_code="no_entity_detected",
+            source_message_id=source_message_id,
+            resolution_status="no_entity",
+        )
 
 
 def _candidate_from_raw(item: dict[str, Any]) -> CandidateEntity | None:

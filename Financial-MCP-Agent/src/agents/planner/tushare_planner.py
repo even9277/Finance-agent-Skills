@@ -9,6 +9,7 @@ from src.agents.tool_discovery.executable_registry import (
     ExecutableToolSpec,
     build_default_registry,
 )
+from src.tools.skill_trace import trace_span
 
 _REQUIREMENT_TO_TOOLS = {
     "stock_basic": ("get_stock_basic_info",),
@@ -106,34 +107,40 @@ class TusharePlanner:
         trace_id: str = "",
         constraints: list[str] | None = None,
     ) -> ToolPlanV2:
-        rewrite = _model_dump(rewrite_result)
-        discovery = _model_dump(discovery_result)
-        available_tools = set(discovery.get("available_tools") or [])
-        entity = _first_entity(rewrite, active_entity)
-        effective_query = str(rewrite.get("effective_query") or "").strip()
-        selected_tools = self._select_tools(rewrite=rewrite, available_tools=available_tools)
-        steps = [
-            self._build_step(
-                index=index,
-                tool_name=tool_name,
-                spec=self.registry.spec(tool_name),
-                effective_query=effective_query,
+        with trace_span(
+            "plan_generate",
+            stage="planner",
+            data={"planner_type": "tushare", "prompt_version": self.prompt_version},
+        ):
+            rewrite = _model_dump(rewrite_result)
+            discovery = _model_dump(discovery_result)
+            available_tools = set(discovery.get("available_tools") or [])
+            entity = _first_entity(rewrite, active_entity)
+            effective_query = str(rewrite.get("effective_query") or "").strip()
+            selected_tools = self._select_tools(rewrite=rewrite, available_tools=available_tools)
+            steps = [
+                self._build_step(
+                    index=index,
+                    tool_name=tool_name,
+                    spec=self.registry.spec(tool_name),
+                    effective_query=effective_query,
+                    entity=entity,
+                )
+                for index, tool_name in enumerate(selected_tools, start=1)
+            ]
+            result = ToolPlanV2(
+                plan_id=_new_plan_id(),
+                trace_id=trace_id,
+                discovery_trace_id=str(discovery.get("discovery_trace_id") or ""),
+                route="tushare-data",
+                objective=effective_query or "tushare data retrieval",
                 entity=entity,
+                time_scope=dict(rewrite.get("time_scope") or {}),
+                steps=steps,
+                planner_model="deterministic",
+                prompt_version=self.prompt_version,
             )
-            for index, tool_name in enumerate(selected_tools, start=1)
-        ]
-        return ToolPlanV2(
-            plan_id=_new_plan_id(),
-            trace_id=trace_id,
-            discovery_trace_id=str(discovery.get("discovery_trace_id") or ""),
-            route="tushare-data",
-            objective=effective_query or "tushare data retrieval",
-            entity=entity,
-            time_scope=dict(rewrite.get("time_scope") or {}),
-            steps=steps,
-            planner_model="deterministic",
-            prompt_version=self.prompt_version,
-        )
+            return result
 
     def _select_tools(self, *, rewrite: dict[str, Any], available_tools: set[str]) -> list[str]:
         hinted = [

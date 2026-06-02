@@ -7,7 +7,6 @@ lifespan 新增：
 """
 
 import asyncio
-import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -17,16 +16,18 @@ from dotenv import load_dotenv
 
 from backend.config import settings
 from backend.db.database import AsyncSessionFactory, init_db
+from backend.integrations.agent_runtime.app_runtime import (
+    agent_root,
+    flush_trace_exporters,
+    init_mem0_client_runtime,
+    initialize_trace_runtime,
+    ltm_worker_loop_runtime,
+    setup_logger,
+)
 from backend.middleware.auth import AuthMiddleware
 from backend.routers import auth, chat, memory, portfolio, report, user
 
-_AGENT_ROOT = Path(__file__).resolve().parent.parent / "Financial-MCP-Agent"
-if str(_AGENT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_AGENT_ROOT))
-
-from src.utils.logging_config import setup_logger
-from src.tools.skill_trace import flush_trace_exporters, initialize_trace_runtime
-
+_AGENT_ROOT = agent_root()
 logger = setup_logger("backend.main", log_dir=str(_AGENT_ROOT / "logs"))
 
 _ltm_worker_task = None
@@ -96,15 +97,14 @@ async def lifespan(app: FastAPI):
         logger.info("[backend] ENABLE_MEMORY=true，初始化 Mem0")
 
         try:
-            from src.memory.mem0_client import init_mem0_client
-            await init_mem0_client()
+            await init_mem0_client_runtime()
         except Exception as exc:
             print(f"[backend] Mem0 初始化异常（不影响启动）: {exc}")
             logger.warning(f"[backend] Mem0 初始化异常: {exc}")
 
         # 启动 ltm_worker 后台任务
         try:
-            from src.memory.ltm_worker import ltm_worker_loop
+            ltm_worker_loop = ltm_worker_loop_runtime()
             _ltm_worker_stop_event = asyncio.Event()
             _ltm_worker_task = asyncio.create_task(
                 ltm_worker_loop(_ltm_worker_stop_event),

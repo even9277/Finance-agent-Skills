@@ -12,6 +12,7 @@ from src.agents.tool_discovery.executable_registry import (
     ExecutableToolRegistry,
     build_default_registry,
 )
+from src.tools.skill_trace import trace_span
 
 
 class ReplanContext(BaseModel):
@@ -54,50 +55,59 @@ class TushareReplanner:
         discovery_result: Any,
         active_entity: Any = None,
     ) -> ReplanResult:
-        if context.attempt >= self.budget.max_replans:
-            return ReplanResult(skipped=True, reason="max_replans_exhausted")
-        if context.budget_remaining_ms <= 0:
-            return ReplanResult(skipped=True, reason="budget_exhausted")
-        if not context.missing_dimensions:
-            return ReplanResult(skipped=True, reason="no_missing_dimensions")
+        with trace_span(
+            "replan",
+            stage="replanner",
+            data={
+                "attempt": context.attempt,
+                "missing_dimensions": list(context.missing_dimensions),
+                "failed_step_count": len(context.failed_steps),
+            },
+        ):
+            if context.attempt >= self.budget.max_replans:
+                return ReplanResult(skipped=True, reason="max_replans_exhausted")
+            if context.budget_remaining_ms <= 0:
+                return ReplanResult(skipped=True, reason="budget_exhausted")
+            if not context.missing_dimensions:
+                return ReplanResult(skipped=True, reason="no_missing_dimensions")
 
-        rewrite = {
-            "effective_query": context.user_intent_summary,
-            "data_requirements": list(context.missing_dimensions),
-            "candidate_tool_hints": [],
-            "time_scope": {},
-        }
-        candidate_plan = self.planner.plan(
-            rewrite_result=rewrite,
-            discovery_result=discovery_result,
-            active_entity=active_entity,
-            trace_id=context.trace_id,
-            constraints=context.constraints_snapshot,
-        )
-        existing = set(context.action_fingerprints)
-        filtered_steps: list[ToolPlanStepV2] = []
-        for step in candidate_plan.steps:
-            fp = action_fingerprint(step.tool_name, step.arguments)
-            if fp in existing:
-                continue
-            filtered_steps.append(
-                ToolPlanStepV2(
-                    step_id=f"r{context.attempt + 1}_s{len(filtered_steps) + 1}",
-                    goal=step.goal,
-                    tool_name=step.tool_name,
-                    arguments=step.arguments,
-                    depends_on=[],
-                    expected_observation=step.expected_observation,
-                    required=step.required,
-                    evidence_type=step.evidence_type,
-                )
+            rewrite = {
+                "effective_query": context.user_intent_summary,
+                "data_requirements": list(context.missing_dimensions),
+                "candidate_tool_hints": [],
+                "time_scope": {},
+            }
+            candidate_plan = self.planner.plan(
+                rewrite_result=rewrite,
+                discovery_result=discovery_result,
+                active_entity=active_entity,
+                trace_id=context.trace_id,
+                constraints=context.constraints_snapshot,
             )
-        if not filtered_steps:
-            return ReplanResult(skipped=True, reason="duplicate_action_fingerprint")
+            existing = set(context.action_fingerprints)
+            filtered_steps: list[ToolPlanStepV2] = []
+            for step in candidate_plan.steps:
+                fp = action_fingerprint(step.tool_name, step.arguments)
+                if fp in existing:
+                    continue
+                filtered_steps.append(
+                    ToolPlanStepV2(
+                        step_id=f"r{context.attempt + 1}_s{len(filtered_steps) + 1}",
+                        goal=step.goal,
+                        tool_name=step.tool_name,
+                        arguments=step.arguments,
+                        depends_on=[],
+                        expected_observation=step.expected_observation,
+                        required=step.required,
+                        evidence_type=step.evidence_type,
+                    )
+                )
+            if not filtered_steps:
+                return ReplanResult(skipped=True, reason="duplicate_action_fingerprint")
 
-        candidate_plan.plan_id = f"{context.plan_id}_replan_{context.attempt + 1}"
-        candidate_plan.steps = filtered_steps
-        return ReplanResult(added_plan=candidate_plan, skipped=False, reason="missing_dimensions")
+            candidate_plan.plan_id = f"{context.plan_id}_replan_{context.attempt + 1}"
+            candidate_plan.steps = filtered_steps
+            return ReplanResult(added_plan=candidate_plan, skipped=False, reason="missing_dimensions")
 
 
 __all__ = ["ReplanContext", "ReplanResult", "TushareReplanner"]

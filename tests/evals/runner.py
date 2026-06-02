@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
+import subprocess
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -40,13 +43,42 @@ def compute_metrics(target: str, records: list[dict[str, Any]]) -> dict[str, Any
     return metrics
 
 
+def _git_commit_short() -> str:
+    try:
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+        return commit or "unknown"
+    except Exception:
+        return "unknown"
+
+
 def write_report(target: str, records: list[dict[str, Any]], output_dir: Path) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / f"{target}_metrics.json"
+    now = datetime.now()
+    timestamp_iso = now.isoformat()
+    timestamp_for_file = now.strftime("%Y%m%dT%H%M%S")
     path.write_text(
-        json.dumps({"target": target, "count": len(records), "metrics": compute_metrics(target, records)}, ensure_ascii=False, indent=2),
+        json.dumps(
+            {
+                "target": target,
+                "count": len(records),
+                "timestamp": timestamp_iso,
+                "git_commit": _git_commit_short(),
+                "metrics": compute_metrics(target, records),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
         encoding="utf-8",
     )
+    history_dir = Path("tests/evals/history") / target
+    history_dir.mkdir(parents=True, exist_ok=True)
+    history_path = history_dir / f"{timestamp_for_file}_{target}_metrics.json"
+    shutil.copy2(path, history_path)
     return path
 
 

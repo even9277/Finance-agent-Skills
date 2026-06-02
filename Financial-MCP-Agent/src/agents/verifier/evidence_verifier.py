@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 from src.agents.executor.execution_scheduler import StepResult
 from src.agents.planner.plan_validator import ToolPlanV2
 from src.agents.verifier.scoring import score_evidence, score_total
+from src.tools.skill_trace import trace_span
 
 EvidenceStatus = Literal["sufficient", "partial", "insufficient"]
 ClaimLevel = Literal["advisory", "analytical", "descriptive", "refuse"]
@@ -34,51 +35,60 @@ class EvidenceVerifier:
         self.partial_threshold = partial_threshold
 
     def verify(self, *, plan: ToolPlanV2, step_results: list[StepResult]) -> VerificationResult:
-        accepted = [item for item in step_results if item.status == "succeeded" and item.evidence and item.evidence.ok]
-        rejected = [item for item in step_results if item not in accepted]
-        hard_gate_failures = self._hard_gate_failures(plan=plan, accepted=accepted, step_results=step_results)
-        missing_dimensions = self._missing_dimensions(plan=plan, accepted=accepted)
-        breakdown = score_evidence(plan, accepted)
-        total = score_total(breakdown)
+        with trace_span(
+            "evidence_verify",
+            stage="verifier",
+            data={
+                "total_steps": len(step_results),
+                "plan_required_steps": sum(1 for s in plan.steps if s.required),
+            },
+        ):
+            accepted = [item for item in step_results if item.status == "succeeded" and item.evidence and item.evidence.ok]
+            rejected = [item for item in step_results if item not in accepted]
+            hard_gate_failures = self._hard_gate_failures(plan=plan, accepted=accepted, step_results=step_results)
+            missing_dimensions = self._missing_dimensions(plan=plan, accepted=accepted)
+            breakdown = score_evidence(plan, accepted)
+            total = score_total(breakdown)
 
-        if hard_gate_failures:
-            status: EvidenceStatus = "insufficient"
-            allowed: ClaimLevel = "refuse"
-        elif total >= self.sufficient_threshold and not missing_dimensions:
-            status = "sufficient"
-            allowed = "analytical"
-        elif total >= self.partial_threshold:
-            status = "partial"
-            allowed = "descriptive"
-        else:
-            status = "insufficient"
-            allowed = "refuse"
+            if hard_gate_failures:
+                status: EvidenceStatus = "insufficient"
+                allowed: ClaimLevel = "refuse"
+            elif total >= self.sufficient_threshold and not missing_dimensions:
+                status = "sufficient"
+                allowed = "analytical"
+            elif total >= self.partial_threshold:
+                status = "partial"
+                allowed = "descriptive"
+            else:
+                status = "insufficient"
+                allowed = "refuse"
 
-        retryable_steps = [
-            item.step_id
-            for item in rejected
-            if item.is_retryable or item.error_type in {"timeout", "rate_limited", "http_5xx", "empty_payload"}
-        ]
-        suggested = self._suggest_action(
-            status=status,
-            hard_gate_failures=hard_gate_failures,
-            retryable_steps=retryable_steps,
-            missing_dimensions=missing_dimensions,
-        )
-        return VerificationResult(
-            status=status,
-            evidence_score=total,
-            score_breakdown=breakdown,
-            accepted_evidences=[self._evidence_ref(item) for item in accepted],
-            rejected_evidences=[self._rejected_ref(item) for item in rejected],
-            missing_dimensions=missing_dimensions,
-            allowed_claim_level=allowed,
-            confidence=min(1.0, max(0.0, total / 100)),
-            failure_reason=";".join(hard_gate_failures),
-            retryable_steps=retryable_steps,
-            suggested_next_action=suggested,
-            hard_gate_failures=hard_gate_failures,
-        )
+            retryable_steps = [
+                item.step_id
+                for item in rejected
+                if item.is_retryable or item.error_type in {"timeout", "rate_limited", "http_5xx", "empty_payload"}
+            ]
+            suggested = self._suggest_action(
+                status=status,
+                hard_gate_failures=hard_gate_failures,
+                retryable_steps=retryable_steps,
+                missing_dimensions=missing_dimensions,
+            )
+            result = VerificationResult(
+                status=status,
+                evidence_score=total,
+                score_breakdown=breakdown,
+                accepted_evidences=[self._evidence_ref(item) for item in accepted],
+                rejected_evidences=[self._rejected_ref(item) for item in rejected],
+                missing_dimensions=missing_dimensions,
+                allowed_claim_level=allowed,
+                confidence=min(1.0, max(0.0, total / 100)),
+                failure_reason=";".join(hard_gate_failures),
+                retryable_steps=retryable_steps,
+                suggested_next_action=suggested,
+                hard_gate_failures=hard_gate_failures,
+            )
+            return result
 
     @staticmethod
     def _hard_gate_failures(*, plan: ToolPlanV2, accepted: list[StepResult], step_results: list[StepResult]) -> list[str]:

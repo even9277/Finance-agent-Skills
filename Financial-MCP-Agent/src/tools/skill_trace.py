@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import contextvars
 import json
 from datetime import datetime, timezone
@@ -44,6 +45,18 @@ _SPAN_STACK: contextvars.ContextVar[tuple[dict[str, Any], ...]] = contextvars.Co
     "skill_trace_span_stack",
     default=(),
 )
+# 当前轮次内收集到的 span 记录列表（只在 skill_trace_context 内有效）
+# 每个元素是 {"name", "duration_ms", "status", "data"} 的 dict
+_TURN_SPANS: contextvars.ContextVar[list[dict[str, Any]] | None] = contextvars.ContextVar(
+    "skill_trace_turn_spans",
+    default=None,
+)
+
+# 全局线程池，用于异步写报告，避免阻塞主流程
+_REPORT_EXECUTOR: concurrent.futures.ThreadPoolExecutor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="session_reporter",
+)
 
 
 def _bool_env(name: str, default: bool) -> bool:
@@ -51,6 +64,11 @@ def _bool_env(name: str, default: bool) -> bool:
     if raw is None:
         return default
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+# 观测系统全局总开关：设置 ENABLE_SKILL_TRACE=false 可一键关闭所有埋点写入
+# 默认开启，生产环境如需完全关闭追踪可通过环境变量控制
+_TRACE_MASTER_ENABLED: bool = _bool_env("ENABLE_SKILL_TRACE", True)
 
 
 def _sanitize_value(value: Any) -> Any:
@@ -213,6 +231,15 @@ def initialize_trace_runtime(*, force: bool = False) -> None:
             except Exception as exc:
                 logger.warning("chat.trace.langfuse_init_failed %s", {"error": _sanitize_value(exc)})
 
+        if _bool_env("ENABLE_TRACE_DB_SINK", False):
+            try:
+                from src.tools.trace_db_sink import is_trace_db_sink_enabled
+
+                if is_trace_db_sink_enabled():
+                    logger.info("chat.trace.db_sink_enabled")
+            except Exception as exc:
+                logger.warning("chat.trace.db_sink_init_failed %s", {"error": _sanitize_value(exc)})
+
         _TRACE_RUNTIME_INITIALIZED = True
 
 
@@ -231,6 +258,9 @@ def _emit_record(
     level: str = "info",
     exc_info: bool = False,
 ) -> None:
+    # 总开关：关闭时跳过所有写入，不影响主流程
+    if not _TRACE_MASTER_ENABLED:
+        return
     record = _record_envelope(
         record_type=record_type,
         name=name,
@@ -245,6 +275,12 @@ def _emit_record(
     )
     _write_jsonl_record(record)
     _dispatch_exporters(record)
+    try:
+        from src.tools.trace_db_sink import enqueue_trace_record
+
+        enqueue_trace_record(record)
+    except Exception as exc:
+        logger.warning("chat.trace.db_sink_enqueue_failed %s", {"error": _sanitize_value(exc)})
     log_payload = _log_record_payload(record)
     if level == "error":
         logger.error("%s %s", name, log_payload, exc_info=exc_info)
@@ -253,16 +289,110 @@ def _emit_record(
     else:
         logger.info("%s %s", name, log_payload)
 
+    # 如果当前在 skill_trace_context 内部，且是 span 类型，把关键字段暂存到本轮列表
+    if record_type == "span":
+        turn_spans = _TURN_SPANS.get()
+        if turn_spans is not None:
+            turn_spans.append(
+                {
+                    "name": name,
+                    "stage": stage,
+                    "status": status or "ok",
+                    "duration_ms": duration_ms,
+                    "data": dict(data or {}),
+                }
+            )
+
+
+def _trigger_session_report(
+    session_id: str,
+    turn_index: int,
+    user_message: str,
+    reply_summary: str,
+    span_records: list[dict[str, Any]],
+) -> None:
+    """在独立线程中生成会话 Markdown 报告，不阻塞主流程。"""
+    if not _bool_env("ENABLE_SESSION_REPORT", True):
+        return
+    try:
+        from src.tools.session_reporter import append_turn_to_session_report
+
+        append_turn_to_session_report(
+            session_id=session_id,
+            turn_index=turn_index,
+            user_message=user_message,
+            reply_summary=reply_summary,
+            span_records=span_records,
+        )
+    except Exception as exc:
+        logger.warning("skill_trace.report_trigger_failed %s", {"error": _sanitize_value(exc)})
+
 
 @contextmanager
 def skill_trace_context(**kwargs: Any) -> Iterator[None]:
+    """
+    每次对话的顶层上下文管理器。
+
+    使用方式：
+        with skill_trace_context(session_id="xxx", turn_index=1, user_message="..."):
+            ...（业务处理）...
+            # 处理完成后可通过 set_turn_reply() 传入回答摘要
+
+    退出时（无论成功或异常）：
+    - 如果 ENABLE_SESSION_REPORT=true，异步写会话 Markdown 报告
+    """
     current = dict(_TRACE_CONTEXT.get() or {})
     current.update({k: v for k, v in kwargs.items() if v is not None})
-    token = _TRACE_CONTEXT.set(current)
+    ctx_token = _TRACE_CONTEXT.set(current)
+
+    # 初始化本轮 span 收集列表
+    span_list: list[dict[str, Any]] = []
+    spans_token = _TURN_SPANS.set(span_list)
+
     try:
         yield
     finally:
-        _TRACE_CONTEXT.reset(token)
+        # 在 reset 前先读取最新的 context（业务侧可能通过 set_turn_reply 更新了 reply_summary）
+        live_context = dict(_TRACE_CONTEXT.get() or {})
+
+        _TRACE_CONTEXT.reset(ctx_token)
+        _TURN_SPANS.reset(spans_token)
+
+        # 收集当前上下文的关键字段，用于生成报告
+        if _TRACE_MASTER_ENABLED and _bool_env("ENABLE_SESSION_REPORT", True):
+            session_id = str(live_context.get("session_id") or current.get("session_id") or "unknown")
+            turn_index = int(live_context.get("turn_index") or current.get("turn_index") or 0)
+            user_message = str(live_context.get("user_message") or current.get("user_message") or "")
+            # reply_summary 由业务侧通过 set_turn_reply() 写入 context
+            reply_summary = str(live_context.get("reply_summary") or "")
+            spans_snapshot = list(span_list)  # 已 reset，取副本
+
+            try:
+                _REPORT_EXECUTOR.submit(
+                    _trigger_session_report,
+                    session_id,
+                    turn_index,
+                    user_message,
+                    reply_summary,
+                    spans_snapshot,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "skill_trace.report_submit_failed %s", {"error": _sanitize_value(exc)}
+                )
+
+
+def set_turn_reply(reply_summary: str) -> None:
+    """
+    在 skill_trace_context 内部调用，将本轮回答摘要写入当前上下文。
+    用于报告生成时填写"系统回答"一列。
+
+    参数：
+      reply_summary - 回答的前200字左右的摘要（传入全文也可，报告生成器会自动截断）
+    """
+    current = dict(_TRACE_CONTEXT.get() or {})
+    current["reply_summary"] = reply_summary
+    _TRACE_CONTEXT.set(current)
 
 
 def new_trace_id() -> str:
@@ -346,6 +476,10 @@ def trace_span(
     refs: dict[str, Any] | None = None,
     status_on_error: str = "error",
 ) -> Iterator[str]:
+    # 总开关：关闭时直接生成一个占位 span_id 并 yield，不做任何记录
+    if not _TRACE_MASTER_ENABLED:
+        yield new_span_id()
+        return
     stack = _SPAN_STACK.get() or ()
     parent_span_id = stack[-1]["span_id"] if stack else None
     span = {
