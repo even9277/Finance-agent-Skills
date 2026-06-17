@@ -4,6 +4,7 @@ import { computed } from 'vue'
 const props = defineProps<{
   progress: number  // 0-100
   status: string    // pending | running | completed | failed
+  stageLabel?: string | null
 }>()
 
 const steps = [
@@ -73,7 +74,7 @@ const stepState = computed(() => {
       />
     </div>
     <div class="flex justify-between mt-1 text-xs text-slate-500">
-      <span>{{ status === 'failed' ? '生成失败' : status === 'completed' ? '已完成' : '分析中...' }}</span>
+      <span>{{ status === 'failed' ? '生成失败' : status === 'completed' ? '已完成' : (stageLabel || '分析中...') }}</span>
       <span>{{ progress }}%</span>
     </div>
   </div>

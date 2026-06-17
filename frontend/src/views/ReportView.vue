@@ -12,7 +12,7 @@ import { useReport } from '@/composables/useReport'
 
 const route = useRoute()
 const {
-  status, progress, report, errorMsg, isGenerating,
+  status, progress, currentStageLabel, report, errorMsg, isGenerating,
   history, previewOpen,
   generateReport, loadHistory, loadReport,
   downloadMarkdown, openPreview, closePreview, deleteReport,
@@ -105,7 +105,7 @@ async function handleSelectHistory(id: string) {
       <div class="flex-1 overflow-y-auto">
         <!-- 生成中：进度条 -->
         <div v-if="isGenerating" class="px-6 pt-6 pb-2">
-          <ReportProgress :progress="progress" :status="status" />
+          <ReportProgress :progress="progress" :status="status" :stage-label="currentStageLabel" />
           <div class="mt-4 text-center text-xs text-slate-500 animate-pulse">
             正在调用多智能体分析工作流，通常需要 2-5 分钟...
           </div>

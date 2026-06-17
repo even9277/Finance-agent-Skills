@@ -32,6 +32,20 @@ class Settings(BaseSettings):
     database_url: str = (
         f"sqlite+aiosqlite:///{_PROJECT_ROOT / 'backend' / 'finance.db'}"
     )
+    # ── Redis（Phase 1.5 基础设施）─────────────────────────
+    redis_enabled: bool = False
+    redis_url: str = "redis://localhost:6379/0"
+    redis_password: str = ""
+    redis_namespace_env: str = "dev"
+    redis_socket_timeout_ms: int = 500
+    redis_connect_timeout_ms: int = 500
+    redis_max_connections: int = 20
+    redis_health_check_interval_sec: int = 30
+    redis_default_ttl_sec: int = 1800
+    redis_ttl_jitter_ratio: float = 0.1
+    redis_debug_endpoints_enabled: bool = False
+    redis_metrics_endpoint_enabled: bool = True
+    redis_unavailable_recheck_sec: int = 30
 
     # ── CORS ──────────────────────────────────────────────
     cors_origins: List[str] = [

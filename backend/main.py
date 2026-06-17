@@ -24,8 +24,13 @@ from backend.integrations.agent_runtime.app_runtime import (
     ltm_worker_loop_runtime,
     setup_logger,
 )
+from backend.integrations.redis.runtime import (
+    close_redis_runtime,
+    get_redis_health_dict,
+    init_redis_runtime,
+)
 from backend.middleware.auth import AuthMiddleware
-from backend.routers import auth, chat, memory, portfolio, report, user
+from backend.routers import auth, chat, memory, portfolio, redis_admin, report, user
 
 _AGENT_ROOT = agent_root()
 logger = setup_logger("backend.main", log_dir=str(_AGENT_ROOT / "logs"))
@@ -126,6 +131,13 @@ async def lifespan(app: FastAPI):
         print("[backend] ENABLE_STM=false，跳过 STM 初始化")
         logger.info("[backend] ENABLE_STM=false，STM 关闭")
 
+    # Redis 基础设施（REDIS_ENABLED=true 时连接；失败仅降级）
+    try:
+        await init_redis_runtime()
+    except Exception as exc:
+        print(f"[backend] Redis runtime 初始化失败（不影响启动）: {exc}")
+        logger.warning("[backend] Redis runtime 初始化失败", exc_info=True)
+
     print(f"[backend] {settings.app_name} v{settings.app_version} 启动完成 ✓")
     logger.info(f"[backend] 应用启动完成: {settings.app_name} v{settings.app_version}")
 
@@ -142,6 +154,10 @@ async def lifespan(app: FastAPI):
             pass
         print("[backend] ltm_worker 已停止")
         logger.info("[backend] ltm_worker 已停止")
+    try:
+        await close_redis_runtime()
+    except Exception as exc:
+        logger.warning(f"[backend] Redis runtime 关闭失败: {exc}", exc_info=True)
     try:
         flush_trace_exporters()
     except Exception as exc:
@@ -172,8 +188,18 @@ app.include_router(chat.router, prefix="/api/chat", tags=["对话"])
 app.include_router(memory.router, prefix="/api/memory", tags=["记忆画像"])
 app.include_router(user.router, prefix="/api/user", tags=["用户"])
 app.include_router(portfolio.router, prefix="/api/portfolio", tags=["持仓管理"])
+app.include_router(
+    redis_admin.build_redis_admin_router(),
+    prefix="/api/redis",
+    tags=["Redis管理"],
+)
 
 
 @app.get("/api/health")
 async def health_check():
-    return {"status": "ok", "version": settings.app_version}
+    redis_info = await get_redis_health_dict()
+    return {
+        "status": "ok",
+        "version": settings.app_version,
+        "redis": redis_info,
+    }

@@ -1,9 +1,61 @@
+from datetime import datetime
+from typing import Optional
+
 from sqlalchemy import select
 
 from backend.config import settings
 from backend.db.database import AsyncSessionFactory
 from backend.db.models import Report
+from backend.integrations.redis.runtime import get_cache_service
+from backend.services.report.sse_manager import publish_status
 from backend.services.report.workflow_factory import logger
+
+
+STAGE_LABELS = {
+    "pending": "等待开始",
+    "running": "报告生成中",
+    "fundamental_analyst": "基本面分析中",
+    "technical_analyst": "技术面分析中",
+    "value_analyst": "估值分析中",
+    "news_analyst": "新闻与舆情分析中",
+    "memory_read_node": "读取历史记忆",
+    "summarizer": "报告汇总中",
+    "memory_write_node": "保存记忆",
+    "completed": "生成完成",
+    "failed": "生成失败",
+}
+
+
+async def _sync_status_to_redis(
+    report: Report,
+    *,
+    current_stage: Optional[str] = None,
+    current_stage_label: Optional[str] = None,
+) -> None:
+    """写入轻量任务状态；Redis 失败不能影响报告主流程。"""
+    status_data = {
+        "task_id": report.task_id,
+        "report_id": report.id,
+        "user_id": report.user_id,
+        "status": report.status,
+        "progress": report.progress,
+        "current_stage": current_stage,
+        "current_stage_label": current_stage_label,
+        "error_msg": report.error_msg,
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+    cache_service = get_cache_service()
+    if cache_service is not None:
+        try:
+            await cache_service.set(
+                cache_service.key_builder.report_status(report.task_id),
+                status_data,
+                ttl_seconds=600,
+                source="workflow_runner",
+            )
+        except Exception:
+            logger.warning("Redis 状态双写失败 task=%s", report.task_id, exc_info=True)
+    await publish_status(report.task_id, status_data)
 
 
 def _agent_service_facade():
@@ -32,7 +84,16 @@ async def run_report_task(
         f"log_dir={exec_logger.execution_dir}"
     )
 
+    current_stage: Optional[str] = "pending"
+    current_stage_label: Optional[str] = STAGE_LABELS["pending"]
+
     async def _update_report(**kwargs):
+        nonlocal current_stage, current_stage_label
+        stage = kwargs.pop("current_stage", None)
+        stage_label = kwargs.pop("current_stage_label", None)
+        if stage:
+            current_stage = stage
+            current_stage_label = stage_label or STAGE_LABELS.get(stage, stage)
         async with AsyncSessionFactory() as db:
             result = await db.execute(select(Report).where(Report.task_id == task_id))
             rpt = result.scalar_one_or_none()
@@ -40,6 +101,11 @@ async def run_report_task(
                 for k, v in kwargs.items():
                     setattr(rpt, k, v)
                 await db.commit()
+                await _sync_status_to_redis(
+                    rpt,
+                    current_stage=current_stage,
+                    current_stage_label=current_stage_label,
+                )
 
     try:
         await _update_report(status="running", progress=10)
@@ -95,7 +161,11 @@ async def run_report_task(
                 if event.get("event") in {"on_chain_end", "on_chain_complete"} and node in node_progress:
                     if node not in finished_nodes:
                         finished_nodes.add(node)
-                        await _update_report(progress=node_progress[node])
+                        await _update_report(
+                            progress=node_progress[node],
+                            current_stage=node,
+                            current_stage_label=STAGE_LABELS.get(node, node),
+                        )
 
                 # 最终结果：on_chain_end 时 output 里会带最终 state（不同版本字段名略有差异）
                 if event.get("event") == "on_chain_end" and node in {"__end__", "langgraph"}:
@@ -128,6 +198,8 @@ async def run_report_task(
             status="completed",
             progress=100,
             content=report_content,
+            current_stage="completed",
+            current_stage_label=STAGE_LABELS["completed"],
         )
         logger.info(f"[task:{task_id}] 报告生成成功，长度={len(report_content)}")
 
@@ -135,4 +207,10 @@ async def run_report_task(
         error_msg = str(exc)
         logger.error(f"[task:{task_id}] 报告生成失败: {error_msg}", exc_info=True)
         agent_service.finalize_execution_logger(success=False, error=error_msg)
-        await _update_report(status="failed", progress=0, error_msg=error_msg)
+        await _update_report(
+            status="failed",
+            progress=0,
+            error_msg=error_msg,
+            current_stage="failed",
+            current_stage_label=STAGE_LABELS["failed"],
+        )

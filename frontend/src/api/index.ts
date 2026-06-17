@@ -40,7 +40,7 @@ http.interceptors.response.use(
 export interface ReportTaskResponse {
   task_id: string
   report_id: string
-  status: string
+  status: 'pending' | 'running' | 'completed' | 'failed'
 }
 
 export interface ReportStatusResponse {
@@ -49,6 +49,9 @@ export interface ReportStatusResponse {
   progress: number
   report_id?: string
   error_msg?: string
+  current_stage?: string
+  current_stage_label?: string
+  updated_at?: string
 }
 
 export interface ReportDetail {
@@ -352,6 +355,13 @@ export const reportApi = {
 
   deleteReport: (reportId: string) =>
     http.delete(`/report/${reportId}`),
+}
+
+export function buildReportEventUrl(taskId: string): string {
+  const url = new URL(`/api/report/events/${taskId}`, window.location.origin)
+  const token = localStorage.getItem(ACCESS_TOKEN_KEY)
+  if (token) url.searchParams.set('token', token)
+  return url.toString()
 }
 
 // ─────────────────────────────────────────────────────────────

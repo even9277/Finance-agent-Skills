@@ -23,6 +23,9 @@ class ReportStatusResponse(BaseModel):
     progress: int         # 0-100
     report_id: Optional[str] = None
     error_msg: Optional[str] = None
+    current_stage: Optional[str] = None
+    current_stage_label: Optional[str] = None
+    updated_at: Optional[str] = None
 
 
 class ReportDetail(BaseModel):

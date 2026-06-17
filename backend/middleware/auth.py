@@ -16,6 +16,9 @@ _PUBLIC_PATH_PREFIXES = (
     "/api/auth/login",
     "/api/docs",
     "/api/openapi.json",
+    "/api/redis/health",
+    "/api/redis/metrics",
+    "/api/report/events",
 )
 
 

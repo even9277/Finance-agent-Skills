@@ -23,6 +23,33 @@ services:
       retries: 5
 
   # ─────────────────────────────────────────
+  # Redis（Phase 1.5 基础设施）
+  # ─────────────────────────────────────────
+  redis:
+    image: redis:7.2-alpine
+    container_name: finance_redis
+    restart: unless-stopped
+    command:
+      [
+        "redis-server",
+        "--requirepass",
+        "${REDIS_PASSWORD:-finance_redis_123}",
+        "--maxmemory",
+        "256mb",
+        "--maxmemory-policy",
+        "allkeys-lru"
+      ]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-finance_redis_123}", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ─────────────────────────────────────────
   # FastAPI 后端
   # ─────────────────────────────────────────
   backend:
@@ -56,6 +83,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_started
 
   # ─────────────────────────────────────────
   # Vue 3 前端（生产构建）
@@ -86,3 +115,4 @@ services:
 
 volumes:
   postgres_data:
+  redis_data:
