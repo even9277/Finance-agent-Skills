@@ -1,0 +1,70 @@
+{
+  "stock_600519_snapshot": {
+    "get_stock_basic_info": {
+      "ok": true,
+      "source": "fixture",
+      "source_api": "stock_basic",
+      "evidence_type": "stock_basic",
+      "symbol": "600519.SH",
+      "data_time": "2026-05-20T09:30:00+08:00",
+      "payload": {"name": "贵州茅台", "industry": "白酒", "market": "主板"}
+    },
+    "get_daily_bars": {
+      "ok": true,
+      "source": "fixture",
+      "source_api": "daily",
+      "evidence_type": "stock_daily",
+      "symbol": "600519.SH",
+      "trade_date": "20260519",
+      "data_time": "2026-05-19T15:00:00+08:00",
+      "payload": [{"close": 1688.0, "pct_chg": 0.8, "vol": 21800}]
+    },
+    "get_fina_indicator": {
+      "ok": true,
+      "source": "fixture",
+      "source_api": "fina_indicator",
+      "evidence_type": "financial_indicator",
+      "symbol": "600519.SH",
+      "data_time": "2026-03-31T00:00:00+08:00",
+      "payload": [{"pe_ttm": 28.4, "roe": 31.2}]
+    }
+  },
+  "stock_600519_partial": {
+    "get_stock_basic_info": {
+      "ok": true,
+      "source": "fixture",
+      "source_api": "stock_basic",
+      "evidence_type": "stock_basic",
+      "symbol": "600519.SH",
+      "data_time": "2026-05-20T09:30:00+08:00",
+      "payload": {"name": "贵州茅台", "industry": "白酒"}
+    },
+    "get_daily_bars": {
+      "ok": false,
+      "source": "fixture",
+      "source_api": "daily",
+      "evidence_type": "stock_daily",
+      "symbol": "600519.SH",
+      "error_type": "timeout",
+      "error": "fixture timeout"
+    }
+  },
+  "sector_new_energy_snapshot": {
+    "get_sector_snapshot": {
+      "ok": true,
+      "source": "fixture",
+      "source_api": "sector_snapshot",
+      "evidence_type": "sector_snapshot",
+      "data_time": "2026-05-20T10:00:00+08:00",
+      "payload": {"sector_name": "新能源", "pct_chg": 2.1, "turnover_rank": 3}
+    },
+    "get_sector_constituents": {
+      "ok": true,
+      "source": "fixture",
+      "source_api": "sector_constituents",
+      "evidence_type": "sector_constituents",
+      "data_time": "2026-05-20T10:00:00+08:00",
+      "payload": [{"name": "宁德时代", "pct_chg": 3.2}, {"name": "隆基绿能", "pct_chg": 1.8}]
+    }
+  }
+}

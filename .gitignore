@@ -121,8 +121,13 @@ docs/*.md
 !docs/部署指南-Langfuse-本机开发联调.md
 !docs/安装.md
 !docs/部署指南-PostgreSQL-Docker.md
+!docs/eval-baseline.md
 !docs/images/
 !docs/images/**
 
 # 与当前公开仓库关系较弱的 MCP 子项目本地测试文件
 a-share-mcp-is-just-i-need/test_*.py
+
+# 离线评测生成产物（运行结果与历史，不入库）
+tests/evals/_runs/
+tests/evals/history/

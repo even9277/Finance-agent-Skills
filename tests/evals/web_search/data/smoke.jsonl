@@ -1,0 +1,2 @@
+{"case_id":"web_search_001","schema_pass":true,"gold":{"required_evidence":["web_news"],"should_accept":true},"prediction":{"planned_evidence":["web_news"],"latency_ms":9,"search_trigger_decision":"optional","query_rewrite_pass":true,"authority_source_rate":1.0}}
+{"case_id":"web_search_002","schema_pass":true,"gold":{"required_evidence":["stock_market"],"should_accept":true},"prediction":{"planned_evidence":["stock_market"],"latency_ms":7,"search_trigger_decision":"skip","query_rewrite_pass":true}}
