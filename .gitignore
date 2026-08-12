@@ -96,6 +96,7 @@ docs/resume.tex
 
 # 根目录实验/训练脚本与研究记录（与当前开源主项目无关）
 requirements.txt
+!backend/requirements.txt
 data_process.py
 download.py
 deep-research-report.md
@@ -108,6 +109,8 @@ train_qwen_sentiment.py
 package.json
 package-lock.json
 node_modules/
+!frontend/package.json
+!frontend/package-lock.json
 
 # docs 目录仅保留对公开读者有帮助的文档，其余内部记录默认忽略
 docs/*.md

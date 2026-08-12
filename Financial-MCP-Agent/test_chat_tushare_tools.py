@@ -6,7 +6,7 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.tools.chat_tushare_tools import _to_tushare_ts_code
+from src.tools.chat_tushare_tools import _to_tushare_ts_code, get_tushare_toolkit
 
 
 class ChatTushareToolsTests(unittest.TestCase):
@@ -20,6 +20,22 @@ class ChatTushareToolsTests(unittest.TestCase):
 
     def test_keeps_existing_tushare_ts_code(self):
         self.assertEqual(_to_tushare_ts_code("600519.SH"), "600519.SH")
+
+    def test_toolkit_exposes_named_langchain_tools(self):
+        """工具注册表必须保留业务名称，供 Skill Executor 按名称调用。"""
+        expected = {
+            "get_stock_basic_info",
+            "get_market_bars",
+            "get_fina_indicator",
+            "get_income",
+            "get_balance_sheet",
+            "get_cashflow",
+        }
+        toolkit = get_tushare_toolkit()
+        names = {getattr(tool, "name", "") for tool in toolkit}
+
+        self.assertTrue(expected.issubset(names))
+        self.assertTrue(all(callable(getattr(tool, "ainvoke", None)) for tool in toolkit))
 
 
 if __name__ == "__main__":
