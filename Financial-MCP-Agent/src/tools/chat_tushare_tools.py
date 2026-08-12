@@ -7,11 +7,17 @@ from typing import Any
 import uuid
 
 try:
-    from langchain.tools import tool
-except Exception:  # pragma: no cover - optional import path
-    def tool(*args, **kwargs):
-        def _decorator(func):
+    # 本项目仅依赖 langchain-core；从稳定的核心入口导入，避免要求安装完整 langchain。
+    from langchain_core.tools import tool
+except Exception:  # pragma: no cover - 仅供未安装 LangChain 的轻量环境
+    def tool(func=None, *args, **kwargs):
+        """在可选依赖缺失时保留被装饰函数，兼容 ``@tool`` 与 ``@tool()``。"""
+        if callable(func):
             return func
+
+        def _decorator(inner_func):
+            return inner_func
+
         return _decorator
 
 from src.tools.tushare_client import TushareClientError, get_tushare_client

@@ -58,6 +58,28 @@ logger = setup_logger("agent_service", log_dir=str(_AGENT_ROOT / "logs"))
 _COMPILED_WORKFLOW = None
 
 
+def _extract_final_state_from_event(event: dict[str, Any]) -> dict[str, Any] | None:
+    """从 LangGraph 根图结束事件中提取最终状态。
+
+    Args:
+        event: ``astream_events`` 返回的单条事件。不同 LangGraph 版本可能把
+            根图命名为 ``LangGraph``、``langgraph`` 或 ``__end__``。
+
+    Returns:
+        根图输出状态；非根图结束事件或输出结构不合法时返回 ``None``。
+    """
+    if event.get("event") != "on_chain_end":
+        return None
+
+    metadata = event.get("metadata") or {}
+    event_name = event.get("name") or metadata.get("langgraph_node") or metadata.get("node")
+    if str(event_name or "").lower() not in {"__end__", "langgraph"}:
+        return None
+
+    output = (event.get("data") or {}).get("output")
+    return output if isinstance(output, dict) else None
+
+
 def _get_workflow():
     """
     编译 LangGraph 工作流（全局复用）。
@@ -342,8 +364,9 @@ async def run_report_task(
                         await _update_report(progress=node_progress[node])
 
                 # 最终结果：on_chain_end 时 output 里会带最终 state（不同版本字段名略有差异）
-                if event.get("event") == "on_chain_end" and node in {"__end__", "langgraph"}:
-                    final_state = event.get("data", {}).get("output") or final_state
+                root_state = _extract_final_state_from_event(event)
+                if root_state is not None:
+                    final_state = root_state
 
             if final_state is None:
                 # 兜底：某些版本不会在 events 中返回 output，回退到 ainvoke 拿最终 state

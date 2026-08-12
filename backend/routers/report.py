@@ -2,6 +2,7 @@
 
 import uuid
 from typing import Optional
+from urllib.parse import quote
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from fastapi.responses import Response
@@ -22,6 +23,29 @@ from backend.schemas.report import (
 from backend.services.agent_service import run_report_task
 
 router = APIRouter()
+
+
+def _build_content_disposition(filename: str) -> str:
+    """构造兼容中文文件名且可安全写入 HTTP 响应头的下载声明。
+
+    Args:
+        filename: 期望展示给用户的 UTF-8 文件名。
+
+    Returns:
+        同时包含 ASCII 回退名和 RFC 5987 UTF-8 文件名的响应头值。
+    """
+    normalized = filename.replace("\r", "").replace("\n", "")
+    ascii_fallback = "".join(
+        character if character.isascii() and (character.isalnum() or character in "._-") else "_"
+        for character in normalized
+    ).strip("_")
+    if not ascii_fallback:
+        ascii_fallback = "report.md"
+    encoded_filename = quote(normalized, safe="")
+    return (
+        f'attachment; filename="{ascii_fallback}"; '
+        f"filename*=UTF-8''{encoded_filename}"
+    )
 
 
 async def _ensure_user(db: AsyncSession, user_id: str) -> User:
@@ -189,7 +213,7 @@ async def download_report(
     return Response(
         content=report.content.encode("utf-8"),
         media_type="text/markdown",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": _build_content_disposition(filename)},
     )
 
 

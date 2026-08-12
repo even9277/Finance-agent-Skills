@@ -1,0 +1,28 @@
+# Web API and configuration
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+pydantic>=2.10,<3
+pydantic-settings>=2.6,<3
+python-dotenv>=1.0,<2
+
+# Persistence and authentication
+SQLAlchemy>=2.0,<3
+aiosqlite>=0.20,<1
+asyncpg>=0.30,<1
+PyJWT>=2.9,<3
+
+# Agent, model, and MCP integrations
+langgraph>=0.4,<2
+langchain-core>=0.3,<2
+langchain-openai>=0.3,<2
+langchain-mcp-adapters>=0.1,<1
+openai>=1.58,<3
+google-genai>=1.0,<2
+
+# Runtime utilities and optional feature adapters imported by the application
+backoff>=2.2,<3
+cachetools>=5.5,<7
+tenacity>=9.0,<10
+PyYAML>=6.0,<7
+tushare>=1.4,<2
+langfuse>=2.57,<3
