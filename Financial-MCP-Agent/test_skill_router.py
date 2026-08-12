@@ -2,6 +2,7 @@ import sys
 import unittest
 from pathlib import Path
 import asyncio
+import pytest
 
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
@@ -11,6 +12,7 @@ from src.agents.skill_router_node import route_chat_skill
 
 
 class SkillRouterTests(unittest.TestCase):
+    @pytest.mark.live
     def test_routes_stock_research_question_to_financial_sop(self):
         result = asyncio.run(route_chat_skill("帮我看一下贵州茅台最新财务指标"))
         self.assertEqual(result.selected_skill, "financial-sop")
@@ -24,6 +26,7 @@ class SkillRouterTests(unittest.TestCase):
         self.assertEqual(result.selected_skill, "fallback")
         self.assertEqual(result.analysis_mode, "general_chat")
 
+    @pytest.mark.live
     def test_follow_up_inherits_prior_finance_context(self):
         result = asyncio.run(
             route_chat_skill(

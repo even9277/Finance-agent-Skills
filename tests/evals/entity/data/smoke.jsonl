@@ -1,0 +1,2 @@
+{"case_id":"entity_smoke_001","turns":[{"role":"user","content":"贵州茅台今天怎么样"}],"gold":{"active_entity":{"entity_type":"stock","canonical_id":"600519.SH","resolution_status":"resolved"}},"labels":["stock_resolved"]}
+{"case_id":"entity_smoke_002","turns":[{"role":"user","content":"ETF 和 LOF 有什么区别"}],"gold":{"active_entity":{"entity_type":"none","resolution_status":"no_entity"}},"labels":["no_entity"]}

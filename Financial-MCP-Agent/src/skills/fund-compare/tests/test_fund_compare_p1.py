@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import pytest
 
 from src.agents.skill_evidence import validate_evidence
 from src.agents.skill_router_node import route_chat_skill
@@ -10,6 +11,7 @@ from src.skills.skill_registry import get_skill_registry
 from src.tools.chat_tushare_tools import _fund_semantic_tokens, _score_fund_row
 
 
+@pytest.mark.live
 def test_fund_compare_route_hits_financial_sop() -> None:
     route = asyncio.run(
         route_chat_skill("对比华安黄金ETF和博时黄金ETF，哪个更适合我这种偏保守投资者？")
@@ -21,6 +23,7 @@ def test_fund_compare_route_hits_financial_sop() -> None:
     assert route.analysis_mode == "fund_compare"
 
 
+@pytest.mark.live
 def test_fund_compare_follow_up_reuses_previous_context() -> None:
     route = asyncio.run(
         route_chat_skill(

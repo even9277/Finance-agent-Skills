@@ -1,0 +1,1 @@
+{"case_id":"rewrite_smoke_001","turns":[{"role":"user","content":"新能源板块今天为什么突然拉了，简单讲"}],"gold":{"final_route":"tushare-data","data_requirements":["sector_snapshot"],"reply_preference_hint":"回答简洁"},"labels":["tushare_rewrite","preference"]}
