@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
+from typing import cast
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from sqlalchemy import event, func, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 AGENT_ROOT = PROJECT_ROOT / "Financial-MCP-Agent"
@@ -19,6 +21,12 @@ for path in (PROJECT_ROOT, AGENT_ROOT):
 
 from backend.application.chat.contracts import ChatCommand  # noqa: E402
 from backend.application.chat.use_case import ControlledChatUseCase  # noqa: E402
+from backend.application.memory.cache import (  # noqa: E402
+    CacheLookup,
+    CacheLookupStatus,
+    MemoryCacheConfig,
+    MemoryHotCache,
+)
 from backend.db.database import Base  # noqa: E402
 from backend.db.models import (  # noqa: E402
     MemoryOutboxTaskRow,
@@ -288,10 +296,10 @@ def test_committed_turn_enqueues_one_summary_task_before_protected_tail(
 
 @pytest.mark.integration
 def test_commit_failure_rolls_back_messages_state_and_outbox(tmp_path: Path) -> None:
-    """确认提交失败不会留下半轮消息、状态快照或孤儿任务。"""
+    """确认提交失败不会留下权威数据，也不会发布未提交缓存快照。"""
 
-    class FailingCommitRepository(SqlAlchemyConversationRepository):
-        """在所有对象 flush 后、真实 commit 前注入故障。"""
+    class FailingCommitSession(AsyncSession):
+        """只在事务提交边界注入故障，保留生产 Repository 的排序逻辑。"""
 
         async def commit(self) -> None:
             """模拟数据库提交前的故障。"""
@@ -301,10 +309,34 @@ def test_commit_failure_rolls_back_messages_state_and_outbox(tmp_path: Path) -> 
         engine, session_factory = await _create_session_factory(tmp_path / "atomic-rollback.db")
         try:
             await _seed_user(session_factory, "fixture-user-memory")
-            async with session_factory() as db:
+            failing_session_factory = async_sessionmaker(
+                engine,
+                class_=FailingCommitSession,
+                expire_on_commit=False,
+            )
+            cache = Mock()
+            cache.config = MemoryCacheConfig()
+            cache.get_context = AsyncMock(
+                return_value=CacheLookup(status=CacheLookupStatus.MISS)
+            )
+            cache.get_working_state = AsyncMock(
+                return_value=CacheLookup(status=CacheLookupStatus.MISS)
+            )
+            cache.get_profile = AsyncMock(
+                return_value=CacheLookup(status=CacheLookupStatus.MISS)
+            )
+            cache.acquire_fill_lease = AsyncMock(return_value=None)
+            cache.release_fill_lease = AsyncMock()
+            cache.set_context = AsyncMock()
+            cache.set_working_state = AsyncMock()
+            cache.set_profile = AsyncMock()
+            async with failing_session_factory() as db:
                 use_case = ControlledChatUseCase(
                     workflow=_workflow(),
-                    repository=FailingCommitRepository(db),
+                    repository=SqlAlchemyConversationRepository(
+                        db,
+                        cache=cast(MemoryHotCache, cache),
+                    ),
                 )
                 with pytest.raises(RuntimeError, match="fixture commit failure"):
                     await use_case.execute(
@@ -326,6 +358,9 @@ def test_commit_failure_rolls_back_messages_state_and_outbox(tmp_path: Path) -> 
                     ),
                 }
             assert counts == {"sessions": 0, "messages": 0, "states": 0, "outbox": 0}
+            cache.set_context.assert_not_awaited()
+            cache.set_working_state.assert_not_awaited()
+            cache.set_profile.assert_not_awaited()
         finally:
             await engine.dispose()
 

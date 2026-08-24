@@ -6,6 +6,7 @@ import asyncio
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import cast
 
 import pytest
 from sqlalchemy import event, func, select
@@ -23,6 +24,7 @@ from backend.application.memory.summary import (  # noqa: E402
     SummaryDraft,
     SummaryRequest,
 )
+from backend.application.memory.cache import MemoryHotCache  # noqa: E402
 from backend.db.database import Base  # noqa: E402
 from backend.db.models import (  # noqa: E402
     MemoryOutboxTaskRow,
@@ -41,6 +43,7 @@ from backend.infrastructure.chat.testing import (  # noqa: E402
     FakeToolProvider,
     InMemoryTraceSink,
 )
+from backend.infrastructure.memory.runtime import set_memory_cache_for_testing  # noqa: E402
 from backend.services.stm_compaction_worker import SummaryCompactionWorker  # noqa: E402
 from src.conversation.workflow import ControlledConversationWorkflow  # noqa: E402
 from src.memory.contracts import (  # noqa: E402
@@ -114,6 +117,19 @@ class _HoldingSummaryModel:
         )
 
 
+class _InvalidationSpy:
+    """记录摘要成功后的缓存失效，并可模拟适配器实现异常。"""
+
+    def __init__(self, *, fail: bool = False) -> None:
+        self.calls: list[tuple[str, str]] = []
+        self._fail = fail
+
+    async def invalidate_context(self, user_id: str, session_id: str) -> None:
+        self.calls.append((user_id, session_id))
+        if self._fail:
+            raise RuntimeError("fixture cache failure")
+
+
 async def _create_session_factory(database_path: Path):
     engine = create_async_engine(f"sqlite+aiosqlite:///{database_path.as_posix()}")
 
@@ -185,6 +201,8 @@ def test_summary_worker_applies_valid_draft_and_preserves_raw_tail(
         engine, session_factory = await _create_session_factory(tmp_path / "summary-success.db")
         try:
             session_id = await _seed_summary_task(session_factory, monkeypatch)
+            cache_spy = _InvalidationSpy(fail=True)
+            set_memory_cache_for_testing(cast(MemoryHotCache, cache_spy))
             model = _DeterministicSummaryModel()
             worker = SummaryCompactionWorker(
                 session_factory=session_factory,
@@ -246,7 +264,9 @@ def test_summary_worker_applies_valid_draft_and_preserves_raw_tail(
             assert task is not None
             assert task.status == OutboxTaskStatus.SUCCEEDED.value
             assert legacy_tasks == []
+            assert cache_spy.calls == [("fixture-user-summary", session_id)]
         finally:
+            set_memory_cache_for_testing(None)
             await engine.dispose()
 
     asyncio.run(run_case())

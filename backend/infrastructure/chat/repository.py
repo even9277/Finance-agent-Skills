@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from datetime import UTC, datetime
 
 from sqlalchemy import func, select, update
@@ -17,6 +19,12 @@ from backend.application.chat.contracts import (
     PreparedChatTurn,
 )
 from backend.application.memory.context import ContextBudgetPolicy, ContextTextItem
+from backend.application.memory.cache import (
+    CacheLookupStatus,
+    CachedCompactProfile,
+    CachedConversationContext,
+    MemoryHotCache,
+)
 from backend.application.memory.ports import TransactionalMemoryRepository
 from backend.config import settings
 from backend.application.memory.summary import SUMMARY_PROMPT_VERSION
@@ -45,6 +53,8 @@ from src.memory.contracts import (
     build_turn_outbox_key,
 )
 
+logger = logging.getLogger(__name__)
+
 
 def _context_data(session: Session, *, counting_mode: str | None = None) -> ChatContextWindowData:
     """把现有 Pydantic 上下文快照转换为 Application 数据。"""
@@ -59,12 +69,16 @@ class SqlAlchemyConversationRepository:
         self,
         db: AsyncSession,
         memory_repository: TransactionalMemoryRepository | None = None,
+        cache: MemoryHotCache | None = None,
     ) -> None:
         self._db = db
+        self._cache = cache
         self._prepared_sessions: dict[str, Session] = {}
+        self._prepared_user_ids: dict[str, str] = {}
         self._prepared_user_message_ids: dict[str, int] = {}
         self._prepared_working_states: dict[str, WorkingState] = {}
-        self._memory = memory_repository or SqlAlchemyMemoryRepository(db)
+        self._prepared_contexts: dict[str, CachedConversationContext] = {}
+        self._memory = memory_repository or SqlAlchemyMemoryRepository(db, cache=cache)
 
     async def prepare_turn(self, command: ChatCommand) -> PreparedChatTurn:
         """隔离用户会话、读取尾窗并暂存当前用户消息。
@@ -86,13 +100,10 @@ class SqlAlchemyConversationRepository:
             self._db.add(session)
             await self._db.flush()
 
-        history_result = await self._db.execute(
-            select(Message)
-            .where(Message.session_id == session.id, Message.is_compressed.is_(False))
-            .order_by(Message.id.desc())
-            .limit(max(1, int(settings.stm_keep_recent)))
+        context_snapshot = await self._load_context_snapshot(
+            user_id=command.user_id,
+            session=session,
         )
-        recent = list(reversed(list(history_result.scalars().all())))
         packed = ContextBudgetPolicy(
             model_window_tokens=max(1, int(settings.stm_context_budget_tokens)),
             output_reserve_tokens=max(0, int(settings.stm_response_reserve_tokens)),
@@ -105,12 +116,12 @@ class SqlAlchemyConversationRepository:
             current_message=command.message,
             recent_messages=tuple(
                 ContextTextItem(
-                    message_id=item.id,
-                    text=f"{item.role}: {item.content}",
+                    message_id=index,
+                    text=text,
                 )
-                for item in recent
+                for index, text in enumerate(context_snapshot.recent_messages, start=1)
             ),
-            running_summary=session.running_summary,
+            running_summary=context_snapshot.running_summary,
         )
         token_count, _ = count_message_tokens("user", command.message)
         user_message = Message(
@@ -129,8 +140,17 @@ class SqlAlchemyConversationRepository:
             source_message_id=user_message.id,
         )
         self._prepared_sessions[session.id] = session
+        self._prepared_user_ids[session.id] = command.user_id
         self._prepared_user_message_ids[session.id] = user_message.id
         self._prepared_working_states[session.id] = working_state
+        self._prepared_contexts[session.id] = CachedConversationContext(
+            turn_count=context_snapshot.turn_count,
+            summary_version=context_snapshot.summary_version,
+            running_summary=context_snapshot.running_summary,
+            recent_messages=self._trim_context_messages(
+                (*context_snapshot.recent_messages, f"user: {command.message}")
+            ),
+        )
 
         return PreparedChatTurn(
             session_id=session.id,
@@ -194,6 +214,16 @@ class SqlAlchemyConversationRepository:
                 trace_id=result.context.trace_id,
             )
         )
+        prepared_context = self._prepared_contexts.get(session.id)
+        if prepared_context is not None:
+            self._prepared_contexts[session.id] = CachedConversationContext(
+                turn_count=int(session.turn_count or 0),
+                summary_version=int(session.summary_version or 0),
+                running_summary=session.running_summary,
+                recent_messages=self._trim_context_messages(
+                    (*prepared_context.recent_messages, f"assistant: {result.reply}")
+                ),
+            )
         return ChatContextWindowData(**context.model_dump())
 
     async def apply_working_state(
@@ -318,12 +348,37 @@ class SqlAlchemyConversationRepository:
         return projected >= int(round(budget * float(settings.stm_context_target_ratio)))
 
     async def commit(self) -> None:
-        """提交完整一轮事务。"""
+        """提交完整一轮事务，并在成功后发布可丢弃缓存快照。"""
         await self._db.commit()
+        if self._cache is None:
+            return
+        try:
+            for session_id, user_id in tuple(self._prepared_user_ids.items()):
+                context = self._prepared_contexts.get(session_id)
+                state = self._prepared_working_states.get(session_id)
+                if context is not None:
+                    await self._cache.set_context(user_id, session_id, context)
+                if state is not None:
+                    await self._cache.set_working_state(user_id, session_id, state)
+        except Exception as exc:
+            # 权威事务已经提交；缓存实现缺陷也不能把成功轮次伪装成失败。
+            logger.warning(
+                "memory_cache_publish_failed stage=%s status=%s error_code=%s "
+                "error_type=%s",
+                "memory.cache.publish",
+                "DEGRADED",
+                "UNAVAILABLE",
+                type(exc).__name__,
+            )
+        finally:
+            self._prepared_user_ids.clear()
+            self._prepared_contexts.clear()
 
     async def rollback(self) -> None:
         """回滚完整一轮事务。"""
         await self._db.rollback()
+        self._prepared_user_ids.clear()
+        self._prepared_contexts.clear()
 
     async def list_sessions(self, user_id: str) -> list[ChatSessionRecord]:
         """返回用户自己的聊天会话，按最近更新时间排序。"""
@@ -428,21 +483,102 @@ class SqlAlchemyConversationRepository:
     async def _load_memory_profile(self, user_id: str) -> dict[str, object] | None:
         if not settings.enable_memory:
             return None
+        profile_version = await self._db.scalar(
+            select(UserInvestProfile.updated_at).where(UserInvestProfile.user_id == user_id)
+        )
+        if profile_version is None:
+            return None
+        version = profile_version.isoformat(timespec="microseconds")
+        if self._cache is not None:
+            cached = await self._cache.get_profile(
+                user_id,
+                expected_profile_version=version,
+            )
+            if cached.status is CacheLookupStatus.HIT and cached.value is not None:
+                return cached.value.as_chat_mapping()
         result = await self._db.execute(
             select(UserInvestProfile).where(UserInvestProfile.user_id == user_id)
         )
         profile = result.scalar_one_or_none()
         if profile is None:
             return None
-        return {
-            "risk_level": profile.risk_level,
-            "investment_horizon": profile.investment_horizon,
-            "expected_return_min": profile.expected_return_min,
-            "expected_return_max": profile.expected_return_max,
-            "sectors": list(profile.sectors or []),
-            "constraints": list(profile.constraints or []),
-            "response_pref": profile.response_pref,
-        }
+        cached_profile = CachedCompactProfile(
+            profile_version=version,
+            risk_level=profile.risk_level,
+            investment_horizon=profile.investment_horizon,
+            expected_return_min=profile.expected_return_min,
+            expected_return_max=profile.expected_return_max,
+            sectors=tuple(profile.sectors or []),
+            constraints=tuple(profile.constraints or []),
+            response_pref=profile.response_pref,
+        )
+        if self._cache is not None:
+            await self._cache.set_profile(user_id, cached_profile)
+        return cached_profile.as_chat_mapping()
+
+    async def _load_context_snapshot(
+        self,
+        *,
+        user_id: str,
+        session: Session,
+    ) -> CachedConversationContext:
+        """按权威会话版本 cache-aside 读取未压缩尾窗和摘要。"""
+        expected_turn_count = int(session.turn_count or 0)
+        expected_summary_version = int(session.summary_version or 0)
+        lease_token: str | None = None
+        if self._cache is not None:
+            cached = await self._cache.get_context(
+                user_id,
+                session.id,
+                expected_turn_count=expected_turn_count,
+                expected_summary_version=expected_summary_version,
+            )
+            if cached.status is CacheLookupStatus.HIT and cached.value is not None:
+                return cached.value
+            if cached.status is not CacheLookupStatus.DEGRADED:
+                lease_token = await self._cache.acquire_fill_lease(
+                    "context", user_id, session.id
+                )
+                if lease_token is None:
+                    # 只等待一个极短、配置化窗口；超时后各自回源以保证前台可用。
+                    await asyncio.sleep(self._cache.config.singleflight_wait_ms / 1000)
+                    retry = await self._cache.get_context(
+                        user_id,
+                        session.id,
+                        expected_turn_count=expected_turn_count,
+                        expected_summary_version=expected_summary_version,
+                    )
+                    if retry.status is CacheLookupStatus.HIT and retry.value is not None:
+                        return retry.value
+
+        try:
+            history_result = await self._db.execute(
+                select(Message)
+                .where(Message.session_id == session.id, Message.is_compressed.is_(False))
+                .order_by(Message.id.desc())
+                .limit(max(1, int(settings.stm_keep_recent)))
+            )
+            recent = list(reversed(list(history_result.scalars().all())))
+            snapshot = CachedConversationContext(
+                turn_count=expected_turn_count,
+                summary_version=expected_summary_version,
+                running_summary=session.running_summary,
+                recent_messages=tuple(f"{item.role}: {item.content}" for item in recent),
+            )
+            if self._cache is not None and session.id and expected_turn_count > 0:
+                await self._cache.set_context(user_id, session.id, snapshot)
+            return snapshot
+        finally:
+            if self._cache is not None and lease_token is not None:
+                await self._cache.release_fill_lease(
+                    "context", user_id, session.id, lease_token
+                )
+
+    @staticmethod
+    def _trim_context_messages(messages: tuple[str, ...]) -> tuple[str, ...]:
+        """保持与数据库读取相同的 protected-tail 条数上限。"""
+        keep_recent = max(1, int(settings.stm_keep_recent))
+        return messages[-keep_recent:]
 
     @staticmethod
     def _session_record(session: Session) -> ChatSessionRecord:

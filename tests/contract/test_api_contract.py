@@ -23,7 +23,18 @@ def test_health_contract_is_public_and_versioned() -> None:
     response = TestClient(app).get("/api/health")
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ok", "version": settings.app_version}
+    assert response.json() == {
+        "status": "ok",
+        "version": settings.app_version,
+        "components": {
+            "memory_cache": {
+                "enabled": False,
+                "status": "DISABLED",
+                "error_code": None,
+                "metrics": {},
+            }
+        },
+    }
 
 
 @pytest.mark.contract

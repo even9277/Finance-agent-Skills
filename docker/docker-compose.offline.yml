@@ -5,6 +5,15 @@ x-e2e-python-image: &e2e-python-image
     dockerfile: docker/Dockerfile.e2e
 
 services:
+  redis-e2e:
+    image: redis:7.4.10-alpine@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
   postgres-e2e:
     image: postgres:16-alpine
     environment:
@@ -41,6 +50,9 @@ services:
       LANGFUSE_PUBLIC_KEY: ""
       LANGFUSE_SECRET_KEY: ""
       ENABLE_MEMORY: "false"
+      ENABLE_REDIS_CACHE: "true"
+      REDIS_URL: redis://redis-e2e:6379/0
+      REDIS_CACHE_NAMESPACE: finance-offline-e2e
       ENABLE_STM: "true"
       STM_SUMMARY_PROVIDER: deterministic
       STM_COMPRESSION_STRATEGY: legacy_count
@@ -84,6 +96,7 @@ services:
     <<: *e2e-python-image
     environment:
       TEST_DATABASE_URL: postgresql+asyncpg://e2e:e2e@postgres-e2e:5432/e2e
+      TEST_REDIS_URL: redis://redis-e2e:6379/15
       OFFLINE_STACK_BASE_URL: http://frontend
       AUTH_ENABLED: "false"
       OPENAI_API_KEY: ""
@@ -93,6 +106,7 @@ services:
       LANGFUSE_PUBLIC_KEY: ""
       LANGFUSE_SECRET_KEY: ""
       ENABLE_MEMORY: "false"
+      ENABLE_REDIS_CACHE: "true"
       ENABLE_STM: "true"
       STM_SUMMARY_PROVIDER: deterministic
       STM_COMPRESSION_STRATEGY: legacy_count
@@ -103,6 +117,8 @@ services:
       - trace-e2e:/test-artifacts:ro
     depends_on:
       postgres-e2e:
+        condition: service_healthy
+      redis-e2e:
         condition: service_healthy
       backend:
         condition: service_healthy

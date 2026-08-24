@@ -46,6 +46,7 @@ class Settings(BaseSettings):
     # ── Feature Flags ─────────────────────────────────────
     enable_stm: bool = False    # Phase 2 激活
     enable_memory: bool = False  # Phase 3 激活
+    enable_redis_cache: bool = False  # 可丢弃的记忆热缓存；PostgreSQL 始终权威
     enable_chat_skills: bool = False  # Phase 1 skill-first chat
     enable_tushare_skills: bool = False  # Phase 1 tushare skill bundle
     enable_tushare_planner: bool = False
@@ -83,6 +84,15 @@ class Settings(BaseSettings):
     stm_summary_timeout_sec: int = 30
     # 必须覆盖一次模型调用及提交尾延迟，避免合法调用被过早回收并重复计费。
     stm_worker_lease_sec: int = 60
+    # Redis 仅用于加速；连接失败不得影响应用启动或对话正确性。
+    redis_url: str = "redis://localhost:6379/0"
+    redis_cache_namespace: str = "finance-agent"
+    redis_cache_ttl_sec: int = 300
+    redis_cache_lease_sec: int = 5
+    redis_singleflight_wait_ms: int = 40
+    redis_connect_timeout_sec: float = 0.25
+    redis_socket_timeout_sec: float = 0.50
+    redis_max_connections: int = 20
 
     # ── Mem0 / pgvector 配置（Phase 3）────────────────────
     # PostgreSQL 连接（Mem0 向量库使用，SQLite 环境下这些配置被忽略）
@@ -164,6 +174,10 @@ class Settings(BaseSettings):
         "stm_worker_max_retries",
         "stm_summary_timeout_sec",
         "stm_worker_lease_sec",
+        "redis_cache_ttl_sec",
+        "redis_cache_lease_sec",
+        "redis_singleflight_wait_ms",
+        "redis_max_connections",
     )
     @classmethod
     def _validate_positive_stm_integer(cls, value: int) -> int:
@@ -171,6 +185,32 @@ class Settings(BaseSettings):
         if value < 1:
             raise ValueError("STM integer settings must be positive")
         return value
+
+    @field_validator("redis_connect_timeout_sec", "redis_socket_timeout_sec")
+    @classmethod
+    def _validate_positive_redis_timeout(cls, value: float) -> float:
+        """拒绝让缓存连接无限等待或立即无效的超时配置。"""
+        if value <= 0:
+            raise ValueError("Redis timeout settings must be positive")
+        return value
+
+    @field_validator("redis_url")
+    @classmethod
+    def _validate_redis_url(cls, value: str) -> str:
+        """只接受 redis-py 支持的 Redis URL，不在日志中输出其内容。"""
+        normalized = value.strip()
+        if not normalized.startswith(("redis://", "rediss://")):
+            raise ValueError("redis_url must use redis:// or rediss://")
+        return normalized
+
+    @field_validator("redis_cache_namespace")
+    @classmethod
+    def _validate_redis_namespace(cls, value: str) -> str:
+        """限制键空间前缀为可读且无空白的稳定标识。"""
+        normalized = value.strip()
+        if not normalized or any(character.isspace() for character in normalized):
+            raise ValueError("redis_cache_namespace must not be blank or contain spaces")
+        return normalized
 
     @model_validator(mode="after")
     def _validate_stm_worker_timing(self) -> Self:

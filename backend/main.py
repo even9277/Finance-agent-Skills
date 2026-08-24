@@ -21,8 +21,8 @@ from backend.routers import auth, chat, memory, portfolio, report, user
 
 _AGENT_ROOT = settings.agent_root
 
-from src.utils.logging_config import setup_logger
-from src.tools.skill_trace import flush_trace_exporters, initialize_trace_runtime
+from src.utils.logging_config import setup_logger  # noqa: E402
+from src.tools.skill_trace import flush_trace_exporters, initialize_trace_runtime  # noqa: E402
 
 logger = setup_logger("backend.main", log_dir=str(_AGENT_ROOT / "logs"))
 
@@ -67,6 +67,22 @@ async def lifespan(app: FastAPI):
 
     _load_project_env_files()
 
+    # Redis 是可选加速层：初始化失败只记录 DEGRADED，权威 PostgreSQL 仍可服务。
+    try:
+        from backend.infrastructure.memory.runtime import initialize_memory_cache
+
+        cache = await initialize_memory_cache()
+        if cache is None:
+            logger.info("memory_cache_disabled stage=%s status=%s", "memory.cache.bootstrap", "SKIPPED")
+    except Exception as exc:
+        logger.warning(
+            "memory_cache_bootstrap_failed stage=%s status=%s error_code=%s error_type=%s",
+            "memory.cache.bootstrap",
+            "DEGRADED",
+            "UNAVAILABLE",
+            type(exc).__name__,
+        )
+
     try:
         initialize_trace_runtime()
         print("[backend] trace runtime 初始化完成 ✓")
@@ -93,7 +109,7 @@ async def lifespan(app: FastAPI):
         # 因此这里沿用统一的 env 注入逻辑，保证 backend/.env 与 Agent/.env 都进入进程环境。
         _load_project_env_files()
 
-        print(f"[backend] ENABLE_MEMORY=true，正在初始化 Mem0...")  # env reload safe
+        print("[backend] ENABLE_MEMORY=true，正在初始化 Mem0...")  # env reload safe
         logger.info("[backend] ENABLE_MEMORY=true，初始化 Mem0")
 
         try:
@@ -170,6 +186,18 @@ async def lifespan(app: FastAPI):
         print("[backend] stm_compaction_worker 已停止")
         logger.info("[backend] stm_compaction_worker 已停止")
     try:
+        from backend.infrastructure.memory.runtime import close_memory_cache
+
+        await close_memory_cache()
+    except Exception as exc:
+        logger.warning(
+            "memory_cache_close_failed stage=%s status=%s error_code=%s error_type=%s",
+            "memory.cache.close",
+            "DEGRADED",
+            "UNAVAILABLE",
+            type(exc).__name__,
+        )
+    try:
         flush_trace_exporters()
     except Exception as exc:
         logger.warning(f"[backend] flush trace exporters 失败: {exc}")
@@ -203,4 +231,17 @@ app.include_router(portfolio.router, prefix="/api/portfolio", tags=["持仓管�
 
 @app.get("/api/health")
 async def health_check():
-    return {"status": "ok", "version": settings.app_version}
+    """返回应用与可选记忆缓存的安全健康摘要。"""
+    from backend.infrastructure.memory.runtime import get_memory_cache
+
+    cache = get_memory_cache()
+    cache_health = (
+        await cache.health()
+        if cache is not None
+        else {"enabled": False, "status": "DISABLED", "error_code": None, "metrics": {}}
+    )
+    return {
+        "status": "ok",
+        "version": settings.app_version,
+        "components": {"memory_cache": cache_health},
+    }

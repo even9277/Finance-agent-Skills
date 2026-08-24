@@ -27,3 +27,4 @@ tenacity>=9.0,<10
 PyYAML>=6.0,<7
 tushare>=1.4,<2
 langfuse>=2.57,<3
+redis>=8.1,<9
