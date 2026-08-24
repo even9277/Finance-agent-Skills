@@ -1,0 +1,99 @@
+x-e2e-python-image: &e2e-python-image
+  image: finance-agent-offline-e2e:local
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile.e2e
+
+services:
+  postgres-e2e:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: e2e
+      POSTGRES_PASSWORD: e2e
+      POSTGRES_DB: e2e
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U e2e -d e2e"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  backend:
+    <<: *e2e-python-image
+    command:
+      - uv
+      - run
+      - --locked
+      - uvicorn
+      - tests.e2e.offline_app:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://e2e:e2e@postgres-e2e:5432/e2e
+      AUTH_ENABLED: "false"
+      OPENAI_API_KEY: ""
+      OPENAI_COMPATIBLE_API_KEY: ""
+      TUSHARE_TOKEN: ""
+      ENABLE_LANGFUSE: "false"
+      LANGFUSE_PUBLIC_KEY: ""
+      LANGFUSE_SECRET_KEY: ""
+      ENABLE_MEMORY: "false"
+      ENABLE_STM: "false"
+      ENABLE_TRACE: "false"
+    depends_on:
+      postgres-e2e:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - uv
+        - run
+        - --locked
+        - python
+        - -c
+        - "from urllib.request import urlopen; urlopen('http://localhost:8000/api/health', timeout=3)"
+      interval: 2s
+      timeout: 5s
+      retries: 20
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.frontend
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1/"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+
+  offline-e2e:
+    <<: *e2e-python-image
+    environment:
+      TEST_DATABASE_URL: postgresql+asyncpg://e2e:e2e@postgres-e2e:5432/e2e
+      OFFLINE_STACK_BASE_URL: http://frontend
+      AUTH_ENABLED: "false"
+      OPENAI_API_KEY: ""
+      OPENAI_COMPATIBLE_API_KEY: ""
+      TUSHARE_TOKEN: ""
+      ENABLE_LANGFUSE: "false"
+      LANGFUSE_PUBLIC_KEY: ""
+      LANGFUSE_SECRET_KEY: ""
+      ENABLE_MEMORY: "false"
+      ENABLE_STM: "false"
+    depends_on:
+      postgres-e2e:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+
+networks:
+  default:
+    internal: true

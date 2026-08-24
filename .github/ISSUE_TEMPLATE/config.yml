@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 开发流程与测试规范
+    url: https://github.com/even9277/Finance-agent-Skills/blob/main/CONTRIBUTING.md
+    about: 先阅读从 Issue 到 merge 的完整流程

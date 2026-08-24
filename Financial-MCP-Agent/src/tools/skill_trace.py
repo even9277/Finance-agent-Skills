@@ -35,6 +35,22 @@ _LOG_TOP_LEVEL_KEYS = {
     "user_id",
     "turn_index",
 }
+_SENSITIVE_KEYS = {
+    "authorization",
+    "api_key",
+    "apikey",
+    "access_token",
+    "refresh_token",
+    "cookie",
+    "password",
+    "passwd",
+    "secret",
+    "secret_key",
+    "connection_string",
+    "database_url",
+    "tushare_token",
+}
+_REDACTED_VALUE = "[REDACTED]"
 
 _TRACE_CONTEXT: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar(
     "skill_trace_context",
@@ -53,13 +69,28 @@ def _bool_env(name: str, default: bool) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _is_sensitive_key(key: object) -> bool:
+    """判断字段名是否可能包含凭证或连接信息。"""
+    normalized = str(key).strip().lower().replace("-", "_")
+    if normalized in _SENSITIVE_KEYS:
+        return True
+    return any(
+        marker in normalized
+        for marker in ("api_key", "access_token", "refresh_token", "password", "secret")
+    )
+
+
 def _sanitize_value(value: Any) -> Any:
+    """递归截断值并按字段名移除敏感信息。"""
     if value is None:
         return None
     if isinstance(value, (int, float, bool)):
         return value
     if isinstance(value, dict):
-        return {str(key): _sanitize_value(val) for key, val in value.items()}
+        return {
+            str(key): _REDACTED_VALUE if _is_sensitive_key(key) else _sanitize_value(val)
+            for key, val in value.items()
+        }
     if isinstance(value, (list, tuple, set)):
         return [_sanitize_value(item) for item in value]
     text = str(value)
@@ -155,7 +186,7 @@ def _write_jsonl_record(record: dict[str, Any]) -> None:
         _JSONL_PATH.parent.mkdir(parents=True, exist_ok=True)
         with _JSONL_LOCK:
             with _JSONL_PATH.open("a", encoding="utf-8") as fp:
-                fp.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+                fp.write(json.dumps(_sanitize_value(record), ensure_ascii=False, default=str) + "\n")
     except Exception as exc:
         logger.warning("chat.trace.jsonl_write_failed %s", {"error": _sanitize_value(exc)})
 
@@ -175,7 +206,8 @@ def _dispatch_exporters(record: dict[str, Any]) -> None:
         exporters = list(_TRACE_EXPORTERS)
     for exporter in exporters:
         try:
-            exporter(dict(record))
+            # Exporter 与本地 JSONL 一样只能接触脱敏后的 Trace，避免可选观测出口绕过安全边界。
+            exporter(_sanitize_value(record))
         except Exception as exc:
             logger.warning("chat.trace.export_failed %s", {"error": _sanitize_value(exc)})
 

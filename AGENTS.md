@@ -1,126 +1,112 @@
-# Finance Agent 开发流程规约（个人项目轻量版）
+# Finance Agent 工程协作合同
 
-## 1. 这个文件是干什么的
+本文件是仓库级开发规则。它面向项目维护者和编码 Agent，规定从需求到 merge 的最小完整链路。更具体的子目录规则可以补充本文件，但不得降低安全、测试和回滚要求。
 
-本文件定义本仓库从需求、开发、测试、合并到上线的轻量流程，目标是让每次改动都可验证、可回滚、可追踪，同时避免个人项目被团队级重型流程拖垮。
+## 1. 项目边界
 
-- 主仓库：`Finance-agent-Skills`。`main` 是唯一主线，不在 `main` 上直接开发、提交或强推。
-- 更近目录的 `AGENTS.md` / `AGENTS.override.md` 可以补充细节，但不能降低本文件的安全底线。
-- 未获用户明确授权，不执行 `commit`、`push`、创建/合并 PR、部署或破坏性操作。
+- `Finance-agent-Skills` 是唯一主仓库，`main` 是唯一主线。
+- `Finance` 是历史行为、失败案例、Prompt 和评测证据来源，不是运行时依赖，不得加入 `PYTHONPATH`、包依赖或生产镜像。
+- 本项目采用模块化单体。后端 API、应用服务、Agent 主链、Provider 和基础设施有明确边界。
+- 受控主链采用直接模块重构：先锁定契约，再在唯一目标目录替换实现；同一 PR 同步修改内部调用方并删除旧实现、旧导入、重复 Prompt 和过期开关。
+- 禁止为新旧 Runtime 增加长期兼容 Adapter、转发模块、双写或永久双轨实现。
 
-## 2. 两条流程，够用就行
+## 2. 何时使用完整 SOP
 
-**普通改动**（大多数新功能、Bug、UI、文档）：走第 3 节轻量链路。
+以下工作必须先建立 `docs/specs/<feature>/` 下的需求、代码勘察、方案权衡和冻结计划：跨模块重构、Agent 主链迁移、Provider/工具契约、Prompt 或评测数据变更、数据库/API/鉴权、安全、依赖、Docker/部署和生产行为变更。
 
-**高风险改动**（鉴权/权限、安全、数据库迁移、破坏性操作、生产部署、新增生产依赖、跨模块重构）：在轻量链路前先写一页以内的设计说明，包含影响面、方案选择、测试与回滚；只有设计确实复杂时才启用完整 Spec Coding 链（`requirement-definition` → `codebase-reconnaissance` → `clarification` → `solution-tradeoff` → `plan-freezing` → `small-step-implementation`）。
+低风险的单文件文档或明确缺陷可以走轻量路径，但仍必须检查 Git 状态、审查 diff、运行相关验证，并在 PR 中说明未运行的检查。
 
-不确定时按高风险处理；在实施中发现隐藏风险，立即停下升级流程，不要闷头写完。
+完整链路：
 
-## 3. 一次功能从 0 到 merge 的轻量链路
-
-1. **记需求**：在 Issue 或 PR 描述里写清目标、非目标、验收标准（验收标准必须能通过真实请求或测试判断）。
-2. **看调用链**：确认改动应放哪一层（API/服务/领域/集成适配器，前端 `api`/`stores`/`components`）；能复用就复用。从 `Finance` 迁移时只提炼已验证的逻辑，不整目录复制历史代码。
-3. **建短分支**：从最新 `origin/main` 创建，命名如 `feat/xxx`、`fix/xxx`、`docs/xxx`、`refactor/xxx`。
-4. **测试先行**：新功能先写最小测试或契约测试；修 Bug 先写能稳定复现且修复前失败的测试。
-5. **小步实现**：一次只做一件事，保持 diff 小；不顺手重构、不格式化无关文件、不引入无关依赖。
-6. **本地检查**：运行与改动相关的 `pytest` 和前端 `type-check`/`build`；合入前至少完整跑一遍相关目录。
-7. **端到端验收（必做）**：见第 4 节。这是判断功能“真完成了”的硬标准。
-8. **开 PR**：写清改动内容、测试证据、E2E 结果、风险与回滚方式。
-9. **自审 diff**：检查密钥、日志、无关改动、接口兼容性；有同伴就让同伴审一眼，没有就留下自审记录。
-10. **合并**：使用 Squash Merge 进入 `main`，删除功能分支，让每个 PR 对应一个可回滚提交。
-
-## 4. 端到端验收：判断功能“真完成了”的硬标准
-
-单测全绿不等于功能完成。**每个功能验收时，必须启动完整链路，构造虚拟请求真实跑一遍**；本规约明确授权：验收 E2E 可以调用真实模型和生产服务（如 OpenAI、Tushare、MCP），并按实际需要修复、迭代。
-
-步骤：
-
-1. 启动完整链路：优先 `docker compose -f docker/docker-compose.yml up -d --build`（包含 PostgreSQL、后端、前端）。本机没有 Docker 时，按 README 手动启动后端与前端也算完整链路，但要在 PR 中注明环境差异。
-2. 健康检查：后端 `/api/health` 正常、数据库连接正常、前端页面可访问。
-3. 构造虚拟请求：用 `curl`、脚本或前端页面真实调用，至少覆盖主路径和一个错误/边界路径（空输入、超时、无权限、模型失败等）。
-4. 真实依赖：在本地 `.env` 配好密钥后，按需求调用真实模型与生产服务；这是验收环节的明确授权，不属于默认 CI。
-5. 记录证据：保存请求、响应、日志、Trace、耗时和是否报错，作为 PR 的验收依据。
-6. 有报错就修复并重新跑，直到关键链路通过；前端问题用页面/浏览器复现，后端问题看日志和 Trace。
-
-注意：真实调用会产生费用并受外部波动影响，因此验收 E2E 只在本地/发布前手动执行，不放进每次 push 的默认 CI；CI 只跑快、稳、不花钱的检查。
-
-## 5. 测试做什么（最低成本版）
-
-- **单元测试**：只测业务函数、服务、工具解析等，不打真实网络；行为一改就同步更新。
-- **接口/契约测试**：用 `TestClient` 和固定 fixture 覆盖 API 契约、错误码和边界。
-- **验收 E2E**：第 4 节，每个功能验收必做，用真实模型/服务验证前后端完整链路。
-- **Agent 改动**（Prompt、工具、工作流、Memory）：除单测外，至少用固定案例跑一遍真实链路，记录成功率、报错和耗时；暂不引入完整 Eval 平台。
-- **测试数据**：固定日期、来源和容差，不用“今天的实时值”当稳定期望。
-- **覆盖率**：不为追百分比堆测试，核心路径和错误路径优先。
-
-默认 `pytest` 已通过根目录 `pyproject.toml` 配置为跳过带 `live` 标记的测试；需要真实模型/外部服务的验收测试必须加 `@pytest.mark.live`。离线评测冒烟命令：`python -m pytest tests/evals -m eval_smoke`。CI 使用与本地一致的命令。
-
-## 6. 当前可用命令
-
-```bash
-# Python（在装好依赖的虚拟环境中；默认跳过 live 测试）
-python -m pytest backend -q
-python -m pytest Financial-MCP-Agent -q
-python -m pytest tests/evals -m eval_smoke -q
-
-# 只跑相关文件，加速迭代
-python -m pytest backend/test_xxx.py -q
-
-# 生成/查看某模块离线评测基线
-python -m tests.evals.runner --target entity --mode smoke
-
-# 前端（在 frontend 目录；Windows PowerShell 请用 npm.cmd）
-npm ci
-npm run type-check
-npm run build
-
-# 完整链路验收（含真实模型调用，见第 4 节）
-docker compose -f docker/docker-compose.yml up -d --build
-
-# Compose 静态校验（需要本机有 Docker CLI）
-docker compose -f docker/docker-compose.yml config
+```text
+Issue -> Requirement Spec -> Codebase Recon -> Clarification
+      -> Solution Tradeoff -> Plan -> one milestone
+      -> tests first -> implementation -> offline checks
+      -> Compose offline E2E -> protected live E2E
+      -> self-review -> independent review -> CI -> squash merge
+      -> release observation -> rollback/retrospective
 ```
 
-没跑的命令必须在 PR 中写明“命令、原因、剩余风险”，不允许假装通过。
+## 3. 分支、Issue 和 PR
 
-## 7. 个人项目版 CI/CD（先最小，后按需加）
+- 一个可交付里程碑对应一个 Issue、一个短分支、一个 PR 和一个 Squash Commit。
+- 分支名：`feat/<issue>-<slug>`、`fix/<issue>-<slug>`、`refactor/<issue>-<slug>`、`docs/<issue>-<slug>`、`chore/<issue>-<slug>`。
+- 不在 `main` 直接开发、commit 或 force-push。PR 必须填写变更、非目标、测试、E2E、风险和回滚。
+- 个人项目采用自审 + 独立 Agent Review + CI + 用户确认的 Review 闭环；不伪造第二位人工审批者。
+- 默认使用 Squash Merge。合并后的一个提交必须能单独 `git revert`。
+- 未经明确授权，不执行 commit、push、创建/合并 PR、分支保护、release 或部署。
 
-- **CI 最小集**（GitHub Actions）：一个 job 跑离线 `pytest`，一个 job 跑前端 `type-check` + `build`；容器改动再加 `docker compose config`。之后按需补充 lint、覆盖率、依赖漏洞扫描。
-- **现阶段不做**：merge queue、CODEOWNERS、多人强制审批、Staging/Production 环境审批矩阵。
-- **main 保护**：在 GitHub 开启至少“需要 PR 后才能合并”和“禁止绕过保护”。个人项目允许自审，但 PR 中必须留下自审记录；CI 稳定后把必需检查设为 required status check。
-- **CD 简化**：不搭建自动 Staging/Production 多环境。验收和发布都走本地完整链路（第 4 节）；`main` 合并后按 README 部署。
-- **版本与回滚**：部署前保留上一个可用镜像 tag（不使用漂移的 `latest`）；出问题优先关 feature flag，其次 revert PR 或切回旧镜像。
-- **数据库**：迁移前备份，破坏性操作先在副本或本地验证；禁止把不可逆删除和功能发布绑在同一步。
+## 4. 目录和依赖方向
 
-## 8. 安全底线（不能省的部分）
+目标方向：
 
-- 真实 `.env`、Token、Cookie、账号、持仓和私有连接串一律不入库，只提交 `.env.example`；发现密钥入库要轮换密钥，只删文件不够。
-- 日志、Trace、截图、fixture 和 CI 产物不得输出敏感信息。
-- 金融输出注明数据时间和来源，禁止把估算、过期或空数据伪装成实时确定结论。
-- 输入边界校验、参数化查询；鉴权与授权改动单独测试。
+```text
+frontend -> backend/api -> backend/services/workflows
+         -> finance_agent/contracts/workflows/domain
+         -> finance_agent/providers (ports)
+         -> infrastructure implementations
+```
 
-## 9. Definition of Done（功能真正完成的条件）
+- Router/CLI 只负责协议适配、边界校验、认证上下文和响应映射。
+- Application service/workflow 负责用例编排、事务边界、重试预算和状态转换。
+- Agent/domain 模块负责业务决策、Typed State、工具治理和终止条件。
+- Provider/infrastructure 负责模型、Tushare、MCP、数据库、记忆和 Langfuse 等外部系统。
+- Provider 不得反向依赖 Router；路由不得直接拼 Prompt、执行工具或持有 Provider 私有字段。
+- 新增 Python 包优先采用 `src/` 布局；新增边界必须有类型、中文 Google-style docstring 和测试。
 
-- 验收标准有证据（测试结果或 E2E 记录）。
-- 相关单测通过；关键链路 E2E 跑通，真实模型/服务按需已调用并记录结果。
-- 没有无关改动、调试代码、密钥或大文件。
-- PR 写清：改了哪些文件、如何验证、风险是什么、如何回滚。
-- 已 Squash Merge 进 `main`，功能分支已删除。
+## 5. Python、Agent 和接口规范
 
-## 10. 紧急修复
+- 公共类、函数、路由、服务、Agent 节点和工具必须写中文 Google-style docstring，说明责任、参数、返回、失败和副作用。
+- 跨模块接口、配置、工具 Schema、Agent State、持久化模型和外部输入必须显式类型化。
+- 不用 `dict[str, Any]` 作为核心状态；使用 Pydantic/dataclass/TypedDict/Enum 等表达业务含义。
+- Prompt、工具 Schema、公共 API、持久化字段和评测数据是版本化契约；变更必须写兼容性和验证方式。
+- 只对瞬时错误进行有限次数、总时间预算内的重试；有副作用的工具必须具备幂等或明确禁止重试。
+- 不把异常悄悄转换成空结果或成功布尔值；使用稳定 `error_code`、`status` 和可解释降级。
+- 复杂初始化、外部调用、重试、脱敏、状态写入和终止条件前添加简短意图注释。
 
-生产或演示环境出问题时：从最新 `main` 创建 `hotfix/xxx` 分支，只做最小修复，先写复现测试，跑相关测试和关键链路 E2E，再合并部署。恢复后 1～2 个工作日内补一条根因记录：为什么没被测试发现、如何防止再次发生。
+## 6. 配置、秘密和 Prompt
 
-## 11. Agent 每次接到功能任务时的响应协议
+- 真实 Token、Cookie、密码、连接串和生产设置只能来自环境变量或 Secret；提交安全 `.env.example`，不得提交真实 `.env`。
+- 配置通过一个 typed Settings 入口加载并校验，业务代码不得到处调用 `os.getenv()`。
+- 业务常量、枚举、协议版本和稳定规则留在代码中，不把所有常量塞进环境变量。
+- 日志、Trace、fixture、截图、报告和 CI artifact 不得包含 Token、Authorization、Cookie、个人资料或完整敏感 Prompt/响应。
 
-1. 复述目标并说明走轻量流程还是高风险流程。
-2. 先读取本文件、README、相关调用链和 Git 状态，保护用户已有改动。
-3. 编辑前给出执行契约：目标、范围、不做什么、如何验证。
-4. 小步实现，超过 60 秒的工作持续提供简短进度。
-5. 编辑后先审 diff，再运行相关检查；跑不了的检查必须如实报告原因。
-6. 最终回答先说结果，再列改动文件、测试证据、未验证项和风险。
-7. 未获授权不 `commit`、不 `push`、不开/合 PR、不部署。
+## 7. 日志、Trace 和终端输出
 
-## 12. 什么时候升级流程
+- 终端只输出阶段摘要；长 Prompt、响应、Verifier 诊断和报告写入安全、脱敏、可定位的 artifact。
+- Python 使用 `logging.getLogger(__name__)` 和参数化消息，不使用散落的 `print` 作为运行日志。
+- 重要阶段至少记录 `stage`、`run_id`/`trace_id`、`status`、`elapsed_ms`、`error_code`。
+- 一次聊天轮次对应一个 Trace，一次会话用 `session_id` 聚合；模型调用标记为 generation，工具调用标记为 tool。
+- Trace/span 名称使用稳定低基数名称；动态 ID 放属性，不放名称。
+- 日志与 Trace 通过 `trace_id`/`span_id` 关联；所有敏感字段先做 key-based redaction。
+- Langfuse 是可选 exporter，不得成为业务主链的硬依赖；关闭或失败时本地日志/Trace 仍可用。
 
-出现多人协作、正式产品部署、审计或合规要求时，再逐步补充：完整 Spec Coding、强制评审、Staging 环境、完整 CI 矩阵、merge queue。个人项目阶段不提前上重型流程。
+## 8. 测试门禁
+
+- 默认测试不调用付费模型、生产服务或真实写接口。`live` 必须显式 marker 和显式环境开关。
+- 测试层级：unit、contract、integration、offline eval、Compose offline E2E、protected live E2E。
+- 每个 Agent 功能验收必须启动完整链路，构造固定虚拟请求，并验证后端、数据库、前端事件和错误路径。
+- Live E2E 允许真实读取；写入只能到隔离测试库/租户；生产写永远禁止。
+- 测试先行：行为变更先加入 characterization/contract/regression case，再替换实现。
+- Python 命令优先使用 `.venv/Scripts/python.exe`（Windows）或 `.venv/bin/python`（Unix）；默认执行 `python -m pytest` 会跳过 `live`。
+- 测试失败时先看最窄日志，只修复具体失败；同一里程碑连续两次修复仍失败就停止并报告。
+
+## 9. Git、交付和回滚
+
+- 提交遵循 Conventional Commits，如 `refactor(router): split route contract`。
+- 修改前运行 `git status --short`；不覆盖、清理或还原用户未提交改动。
+- 修改后先看 `git diff --check` 和 diff，再从窄到宽运行检查。
+- 普通模块重构禁止数据库 Schema 和破坏性 API 变更；需要时单独制定迁移和恢复计划。
+- 合并前可放弃分支；合并后通过 revert PR；部署异常切回上一个已验证的不可变镜像或提交。
+- Feature Flag 只用于独立能力启停或短期切流，稳定后删除 Flag 和死代码，不用于养两套同义 Runtime。
+
+## 10. Definition of Done
+
+- 需求、范围、风险、回滚和验收标准已记录在 Issue/Plan。
+- 代码只位于正确分层；接口有类型、文档和错误语义。
+- 相关 unit/contract/integration/eval 测试通过；完整链路 E2E 已执行并保存脱敏证据。
+- 默认 CI 离线通过；Live E2E 的真实调用、费用、副作用和环境已明确记录。
+- 日志/Trace 可按 `trace_id` 关联且没有秘密泄露。
+- PR diff 无无关格式化、生成物、凭证或未解释的 skip。
+- Review conversation 已处理，PR 说明了剩余风险和回滚方式。
+- 合并后可以通过一个 revert 提交恢复上一已验证行为。

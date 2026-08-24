@@ -6,54 +6,91 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_CACHE_DIR: ${{ github.workspace }}/.uv-cache
+
 jobs:
-  backend-tests:
-    name: Backend offline tests
+  python-quality:
+    name: Python quality and offline tests
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r backend/requirements.txt pytest
-      - name: Backend tests
-        run: python -m pytest backend -q
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.3"
+      - uses: actions/cache@v4
+        with:
+          path: ${{ env.UV_CACHE_DIR }}
+          key: uv-${{ runner.os }}-${{ hashFiles('pyproject.toml', 'uv.lock') }}
+          restore-keys: uv-${{ runner.os }}-
+      - name: Install locked Python environment
+        run: uv sync --locked --no-install-project --group dev
+      - name: Ruff lint
+        run: uv run --locked ruff check tests Financial-MCP-Agent/src/tools/skill_trace.py
+      - name: Pyright boundary check
+        run: uv run --locked pyright tests Financial-MCP-Agent/src/tools/skill_trace.py
+      - name: Backend offline tests
+        run: uv run --locked pytest backend -q
       - name: Agent offline tests
-        run: python -m pytest Financial-MCP-Agent -q -m "not live"
+        run: uv run --locked pytest Financial-MCP-Agent -q -m "not live"
+      - name: Offline eval smoke
+        run: uv run --locked pytest tests/evals -q -m "eval_smoke and not live"
+      - name: Root regression
+        run: uv run --locked pytest -q
 
-  eval-smoke:
-    name: Offline eval smoke
+  frontend-quality:
+    name: Frontend lint, type-check and build
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r backend/requirements.txt pytest
-      - name: Eval smoke
-        run: python -m pytest tests/evals -q -m "eval_smoke and not live"
-
-  frontend:
-    name: Frontend type-check and build
-    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-      - name: Install frontend dependencies
-        working-directory: frontend
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install locked frontend environment
         run: npm ci
+      - name: ESLint
+        run: npm run lint
       - name: Type check
-        working-directory: frontend
         run: npm run type-check
-      - name: Build
-        working-directory: frontend
+      - name: Production build
         run: npm run build
 
+  compose-config:
+    name: Docker Compose configuration
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Compose file
+        run: docker compose -f docker/docker-compose.yml config --quiet
+
+  offline-compose-e2e:
+    name: Offline Compose E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run isolated PostgreSQL and offline E2E container
+        run: >-
+          docker compose -f docker/docker-compose.offline.yml
+          up --build --abort-on-container-exit --exit-code-from offline-e2e
+      - name: Collect and remove E2E resources
+        if: always()
+        run: docker compose -f docker/docker-compose.offline.yml down -v --remove-orphans
