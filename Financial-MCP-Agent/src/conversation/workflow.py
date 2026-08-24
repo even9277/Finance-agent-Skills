@@ -1,17 +1,19 @@
-"""编排 M2 全部确定性阶段并产生唯一终态。"""
+"""编排受控对话阶段和唯一的有界补证反馈环。"""
 
 from __future__ import annotations
 
 import logging
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import date
 
 from .context import ContextBuilder
 from .contracts import (
     AnswerContextPack,
     ControllerAction,
     ControllerDecision,
+    ControllerRuntimeState,
     ConversationRequest,
     ConversationResult,
     ConversationRunContext,
@@ -19,6 +21,7 @@ from .contracts import (
     Entity,
     ErrorCode,
     EventAttribute,
+    ExecutedPlanStep,
     RouteDecision,
     RouteFamily,
     RunBudget,
@@ -28,6 +31,7 @@ from .contracts import (
     SkillCatalogSnapshot,
     TerminalStatus,
     ToolPlan,
+    ToolObservation,
     VerificationResult,
     WorkflowEvent,
 )
@@ -38,6 +42,7 @@ from .execution import ControlledExecutor
 from .permissions import ControlledPermissionResolver
 from .planning import ControlledPlanner
 from .ports import ModelPort, ToolPort, TraceSink
+from .replanning import BoundedEvidenceReplanner
 from .rewriting import RouteAwareRewriter
 from .routing import TwoStageRouter
 from .synthesis import ControlledSynthesizer
@@ -62,6 +67,7 @@ class _WorkflowServices:
     executor: ControlledExecutor
     verifier: EvidenceVerifier
     controller: RuleController
+    replanner: BoundedEvidenceReplanner
     synthesizer: ControlledSynthesizer
 
 
@@ -95,6 +101,7 @@ class ControlledConversationWorkflow:
             executor=ControlledExecutor(tool),
             verifier=EvidenceVerifier(),
             controller=RuleController(),
+            replanner=BoundedEvidenceReplanner(catalog=tool_catalog),
             synthesizer=ControlledSynthesizer(model),
         )
 
@@ -377,102 +384,187 @@ class ControlledConversationWorkflow:
                     plan=plan,
                 )
 
-            started = time.perf_counter()
-            state.transition(RunPhase.EXECUTING)
-            execution = await self._services.executor.execute(validation.validated_plan, context)
-            execute_status = (
-                StageStatus.PARTIAL
-                if any(item.error_code is not None for item in execution.observations)
-                else StageStatus.SUCCEEDED
-            )
-            self._emit(
-                events,
-                context,
-                StageName.EXECUTE,
-                execute_status,
-                started,
-                attributes=(
-                    EventAttribute(key="tool_call_count", value=execution.tool_call_count),
-                    EventAttribute(key="batch_count", value=execution.batch_count),
-                    EventAttribute(key="failed_count", value=execution.failed_count),
-                    EventAttribute(
-                        key="deduplicated_count",
-                        value=execution.deduplicated_count,
-                    ),
-                ),
-            )
+            current_validated = validation.validated_plan
+            combined_plan = plan
+            all_observations: tuple[ToolObservation, ...] = ()
+            executed_steps: list[ExecutedPlanStep] = []
+            total_tool_calls = 0
+            attempted_fingerprints = {step.idempotency_key for step in plan.steps}
+            runtime = ControllerRuntimeState()
 
-            if rewrite.entity is None:
+            while True:
+                started = time.perf_counter()
+                state.transition(RunPhase.EXECUTING)
+                execution = await self._services.executor.execute(current_validated, context)
+                total_tool_calls += execution.tool_call_count
+                all_observations += execution.observations
+                is_replanned = runtime.replan_count > 0
+                executed_steps.extend(
+                    ExecutedPlanStep(
+                        plan_id=current_validated.plan.plan_id,
+                        step_id=item.step_id,
+                        tool_name=item.tool_name,
+                        status=item.status,
+                        evidence_dimension=item.evidence_dimension,
+                        replanned=is_replanned,
+                    )
+                    for item in execution.observations
+                )
+                execute_status = (
+                    StageStatus.PARTIAL
+                    if any(item.error_code is not None for item in execution.observations)
+                    else StageStatus.SUCCEEDED
+                )
+                self._emit(
+                    events,
+                    context,
+                    StageName.EXECUTE,
+                    execute_status,
+                    started,
+                    attributes=(
+                        EventAttribute(key="tool_call_count", value=execution.tool_call_count),
+                        EventAttribute(key="batch_count", value=execution.batch_count),
+                        EventAttribute(key="failed_count", value=execution.failed_count),
+                        EventAttribute(
+                            key="deduplicated_count",
+                            value=execution.deduplicated_count,
+                        ),
+                        EventAttribute(key="replan_count", value=runtime.replan_count),
+                    ),
+                )
+
+                started = time.perf_counter()
                 state.transition(RunPhase.VERIFIED)
+                verification = self._services.verifier.verify(
+                    plan=combined_plan,
+                    observations=all_observations,
+                    as_of=date.today(),
+                )
                 self._emit(
                     events,
                     context,
                     StageName.VERIFY,
-                    StageStatus.SKIPPED,
-                    time.perf_counter(),
-                    attributes=(EventAttribute(key="reason", value="entityless_m5_pending"),),
+                    StageStatus.PARTIAL
+                    if verification.missing_dimensions
+                    else StageStatus.SUCCEEDED,
+                    started,
+                    error_code=(
+                        ErrorCode.EVIDENCE_MISSING
+                        if verification.missing_dimensions
+                        else None
+                    ),
+                    attributes=(
+                        EventAttribute(key="accepted_count", value=len(verification.accepted)),
+                        EventAttribute(key="rejected_count", value=len(verification.rejected)),
+                        EventAttribute(key="missing_count", value=len(verification.missing_requirements)),
+                        EventAttribute(key="claim_level", value=verification.claim_level.value),
+                        EventAttribute(key="evidence_score", value=verification.score.total),
+                    ),
                 )
-                state.transition(RunPhase.SYNTHESIZING)
+
+                started = time.perf_counter()
+                decision = self._services.controller.decide(
+                    verification,
+                    budget=context.budget,
+                    runtime=runtime,
+                )
+                self._emit_controller(events, context, decision, started)
+                if decision.action is not ControllerAction.REPLAN:
+                    break
+
+                state.transition(RunPhase.REPLANNING)
+                replan_started = time.perf_counter()
+                attempt = runtime.replan_count + 1
+                replan = self._services.replanner.replan(
+                    root_plan=plan,
+                    permissions=permissions,
+                    verification=verification,
+                    attempt=attempt,
+                    attempted_fingerprints=frozenset(attempted_fingerprints),
+                )
                 self._emit(
                     events,
                     context,
-                    StageName.SYNTHESIS,
-                    StageStatus.SKIPPED,
-                    time.perf_counter(),
+                    StageName.REPLAN,
+                    StageStatus.SUCCEEDED if replan.plan is not None else StageStatus.SKIPPED,
+                    replan_started,
+                    attributes=(
+                        EventAttribute(key="attempt", value=attempt),
+                        EventAttribute(key="reason", value=replan.reason),
+                        EventAttribute(
+                            key="added_step_count",
+                            value=len(replan.plan.steps) if replan.plan is not None else 0,
+                        ),
+                    ),
                 )
-                state.terminate(TerminalStatus.UNSUPPORTED)
-                self._emit_terminal(events, context, TerminalStatus.UNSUPPORTED, None)
-                return ConversationResult(
-                    status=TerminalStatus.UNSUPPORTED,
-                    reply="工具计划已受控执行；无主实体证据的验收与总结将在后续里程碑接入。",
-                    context=context,
-                    events=tuple(events),
-                    route=route,
-                    plan=plan,
-                    tool_call_count=execution.tool_call_count,
+                if replan.plan is None:
+                    runtime = ControllerRuntimeState(
+                        replan_count=context.budget.max_replans,
+                        previous_missing_requirements=verification.missing_requirements,
+                    )
+                    decision = self._services.controller.decide(
+                        verification,
+                        budget=context.budget,
+                        runtime=runtime,
+                    )
+                    self._emit_controller(
+                        events,
+                        context,
+                        decision,
+                        time.perf_counter(),
+                    )
+                    break
+
+                replan_validation_started = time.perf_counter()
+                replan_validation = self._services.validator.validate(
+                    replan.plan,
+                    permissions,
+                    budget=context.budget,
                 )
+                state.transition(RunPhase.VALIDATED)
+                self._emit(
+                    events,
+                    context,
+                    StageName.VALIDATE,
+                    StageStatus.SUCCEEDED
+                    if replan_validation.is_valid
+                    else StageStatus.FAILED,
+                    replan_validation_started,
+                    error_code=(
+                        None if replan_validation.is_valid else ErrorCode.PLAN_INVALID
+                    ),
+                    attributes=(
+                        EventAttribute(key="issue_count", value=len(replan_validation.issues)),
+                        EventAttribute(key="replan_count", value=attempt),
+                    ),
+                )
+                if replan_validation.validated_plan is None:
+                    return self._failed_result(
+                        state=state,
+                        events=events,
+                        context=context,
+                        error_code=ErrorCode.PLAN_INVALID,
+                        reply="补证计划未通过安全校验。",
+                        entity=rewrite.entity,
+                        route=route,
+                        plan=combined_plan,
+                        verification=verification,
+                        controller=decision,
+                        tool_call_count=total_tool_calls,
+                    )
+                combined_plan = replace(
+                    combined_plan,
+                    steps=combined_plan.steps + replan.plan.steps,
+                )
+                attempted_fingerprints.update(
+                    item.idempotency_key for item in replan.plan.steps
+                )
+                runtime = ControllerRuntimeState(
+                    replan_count=attempt,
+                    previous_missing_requirements=verification.missing_requirements,
+                )
+                current_validated = replan_validation.validated_plan
 
-            started = time.perf_counter()
-            state.transition(RunPhase.VERIFIED)
-            verification = self._services.verifier.verify(
-                entity=rewrite.entity,
-                observations=execution.observations,
-                required_dimensions=tuple(
-                    item.dimension for item in plan.requirements if item.required
-                ),
-            )
-            self._emit(
-                events,
-                context,
-                StageName.VERIFY,
-                StageStatus.PARTIAL
-                if verification.missing_dimensions
-                else StageStatus.SUCCEEDED,
-                started,
-                error_code=(
-                    ErrorCode.EVIDENCE_MISSING if verification.missing_dimensions else None
-                ),
-                attributes=(
-                    EventAttribute(key="accepted_count", value=len(verification.accepted)),
-                    EventAttribute(key="rejected_count", value=len(verification.rejected)),
-                    EventAttribute(key="claim_level", value=verification.claim_level.value),
-                ),
-            )
-
-            started = time.perf_counter()
-            decision = self._services.controller.decide(verification, context)
-            self._emit(
-                events,
-                context,
-                StageName.CONTROLLER,
-                StageStatus.SUCCEEDED,
-                started,
-                attributes=(
-                    EventAttribute(key="action", value=decision.action.value),
-                    EventAttribute(key="reason", value=decision.reason),
-                    EventAttribute(key="replans_remaining", value=decision.replans_remaining),
-                ),
-            )
             if decision.terminal_status is TerminalStatus.FAILED:
                 return self._failed_result(
                     state=state,
@@ -485,18 +577,23 @@ class ControlledConversationWorkflow:
                     plan=plan,
                     verification=verification,
                     controller=decision,
-                    tool_call_count=execution.tool_call_count,
+                    tool_call_count=total_tool_calls,
                 )
 
             started = time.perf_counter()
             state.transition(RunPhase.SYNTHESIZING)
-            pack = AnswerContextPack(
+            if decision.terminal_status is None:
+                raise RuntimeError("controller returned a non-terminal decision after evidence loop")
+            pack = AnswerContextPack.create(
                 question=request.message,
-                entity=rewrite.entity,
-                accepted_evidence=verification.accepted,
-                missing_dimensions=verification.missing_dimensions,
-                claim_level=verification.claim_level,
+                effective_query=rewrite.effective_query,
+                entities=rewrite.entities,
+                executed_plan=tuple(executed_steps),
+                verification=verification,
                 terminal_status=decision.terminal_status,
+                constraints=rewrite.constraints.items,
+                reply_preference=rewrite.reply_preference.hint,
+                selected_skill=rewrite.skill_name,
             )
             reply = await self._services.synthesizer.synthesize(pack)
             self._emit(
@@ -518,14 +615,14 @@ class ControlledConversationWorkflow:
                 events=tuple(events),
                 entity=rewrite.entity,
                 route=route,
-                plan=plan,
+                plan=combined_plan,
                 verification=verification,
                 controller=decision,
                 error_code=error_code,
                 missing_dimensions=tuple(
                     item.value for item in verification.missing_dimensions
                 ),
-                tool_call_count=execution.tool_call_count,
+                tool_call_count=total_tool_calls,
             )
         except StepBudgetExceededError:
             return self._failed_result(
@@ -556,9 +653,33 @@ class ControlledConversationWorkflow:
     def _result_error_code(verification: VerificationResult) -> ErrorCode | None:
         if not verification.missing_dimensions:
             return None
-        if any(item.rejection_reason == ErrorCode.TOOL_TIMEOUT.value for item in verification.rejected):
+        if any(
+            item.source_error_code is ErrorCode.TOOL_TIMEOUT
+            for item in verification.rejected
+        ):
             return ErrorCode.TOOL_TIMEOUT
         return ErrorCode.EVIDENCE_MISSING
+
+    def _emit_controller(
+        self,
+        events: list[WorkflowEvent],
+        context: ConversationRunContext,
+        decision: ControllerDecision,
+        started: float,
+    ) -> None:
+        """记录不含证据载荷的稳定 Controller 决策事件。"""
+        self._emit(
+            events,
+            context,
+            StageName.CONTROLLER,
+            StageStatus.SUCCEEDED,
+            started,
+            attributes=(
+                EventAttribute(key="action", value=decision.action.value),
+                EventAttribute(key="reason", value=decision.reason),
+                EventAttribute(key="replans_remaining", value=decision.replans_remaining),
+            ),
+        )
 
     def _failed_result(
         self,

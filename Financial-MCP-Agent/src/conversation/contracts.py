@@ -37,6 +37,7 @@ class RunPhase(StrEnum):
     VALIDATED = "VALIDATED"
     EXECUTING = "EXECUTING"
     VERIFIED = "VERIFIED"
+    REPLANNING = "REPLANNING"
     SYNTHESIZING = "SYNTHESIZING"
     SUCCEEDED = TerminalStatus.SUCCEEDED
     PARTIAL = TerminalStatus.PARTIAL
@@ -65,6 +66,7 @@ class StageName(StrEnum):
     EXECUTE = "execute"
     VERIFY = "verify"
     CONTROLLER = "controller"
+    REPLAN = "replan"
     SYNTHESIS = "synthesis"
     TERMINATION = "termination"
 
@@ -216,18 +218,41 @@ class EvidenceStatus(StrEnum):
     REJECTED = "REJECTED"
 
 
+class EvidenceRole(StrEnum):
+    """计划赋予证据的业务角色。"""
+
+    REQUIRED = "REQUIRED"
+    OPTIONAL = "OPTIONAL"
+
+
+class EvidenceRejectionCode(StrEnum):
+    """Verifier 拒绝单条证据时使用的稳定原因。"""
+
+    STEP_FAILED = "STEP_FAILED"
+    UNKNOWN_STEP = "UNKNOWN_STEP"
+    CONTRACT_MISMATCH = "CONTRACT_MISMATCH"
+    ENTITY_MISMATCH = "ENTITY_MISMATCH"
+    EMPTY_FACTS = "EMPTY_FACTS"
+    INVALID_FACT = "INVALID_FACT"
+    SOURCE_MISSING = "SOURCE_MISSING"
+    STALE = "STALE"
+    FUTURE_DATED = "FUTURE_DATED"
+    CONFLICT = "CONFLICT"
+
+
 class ClaimLevel(StrEnum):
     """当前证据允许回答的最高结论强度。"""
 
-    CURRENT_FACT = "CURRENT_FACT"
-    PARTIAL = "PARTIAL"
-    NONE = "NONE"
+    ANALYTICAL = "ANALYTICAL"
+    DESCRIPTIVE = "DESCRIPTIVE"
+    REFUSE = "REFUSE"
 
 
 class ControllerAction(StrEnum):
     """规则 Controller 可输出的有限动作。"""
 
     STOP = "STOP"
+    REPLAN = "REPLAN"
     RESPOND_PARTIAL = "RESPOND_PARTIAL"
     CLARIFY = "CLARIFY"
     FAIL = "FAIL"
@@ -259,7 +284,7 @@ class RunBudget:
     Attributes:
         max_steps: 一轮最多记录的业务阶段数，不含终止事件。
         max_tool_attempts: 单个只读工具发生瞬时超时时的总尝试次数。
-        max_replans: 后续里程碑可使用的最大重规划次数；M2 不执行重规划。
+        max_replans: 证据缺口允许的最大补证重规划次数。
         max_plan_steps: 单个工具 DAG 允许的最大节点数。
         max_concurrency: 同一 DAG 层允许的最大并发只读调用数。
         per_tool_timeout_ms: 单次工具调用的超时毫秒数。
@@ -740,6 +765,7 @@ class EvidenceRequirement:
 
     dimension: EvidenceDimension
     required: bool
+    entity_symbol: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -856,14 +882,32 @@ class EvidenceEnvelope:
     """Verifier 已验收或拒绝的证据信封。"""
 
     evidence_id: str
+    plan_id: str
     step_id: str
+    tool_name: str
     entity_symbol: str
     evidence_dimension: EvidenceDimension
+    role: EvidenceRole
     facts: tuple[EvidenceFact, ...]
     source: str
     observed_at: date
     status: EvidenceStatus
-    rejection_reason: str | None = None
+    quality_score: int
+    freshness_days: int
+    rejection_code: EvidenceRejectionCode | None = None
+    source_error_code: ErrorCode | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceScoreBreakdown:
+    """按主语、时效、覆盖、角色和质量计算的可解释评分。"""
+
+    entity: int
+    freshness: int
+    coverage: int
+    role: int
+    quality: int
+    total: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -873,8 +917,19 @@ class VerificationResult:
     accepted: tuple[EvidenceEnvelope, ...]
     rejected: tuple[EvidenceEnvelope, ...]
     missing_dimensions: tuple[EvidenceDimension, ...]
+    missing_requirements: tuple[EvidenceRequirement, ...]
     claim_level: ClaimLevel
     recoverable: bool
+    score: EvidenceScoreBreakdown
+    hard_gate_failures: tuple[EvidenceRejectionCode, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ControllerRuntimeState:
+    """Controller 决策所需的最小、有界循环状态。"""
+
+    replan_count: int = 0
+    previous_missing_requirements: tuple[EvidenceRequirement, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -883,9 +938,42 @@ class ControllerDecision:
 
     action: ControllerAction
     reason: str
-    terminal_status: TerminalStatus
+    terminal_status: TerminalStatus | None
     retries_remaining: int
     replans_remaining: int
+
+
+@dataclass(frozen=True, slots=True)
+class ReplanResult:
+    """一次补证规划的结构化结果；空计划表示不能安全补证。"""
+
+    plan: ToolPlan | None
+    reason: str
+    attempt: int
+    added_requirements: tuple[EvidenceRequirement, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutedPlanStep:
+    """提供给 Synthesis 的无参数执行摘要。"""
+
+    plan_id: str
+    step_id: str
+    tool_name: str
+    status: StepStatus
+    evidence_dimension: EvidenceDimension
+    replanned: bool
+
+
+@dataclass(frozen=True, slots=True)
+class RejectedEvidenceSummary:
+    """不包含事实值、仅用于解释回答限制的拒绝摘要。"""
+
+    step_id: str
+    tool_name: str
+    evidence_dimension: EvidenceDimension
+    rejection_code: EvidenceRejectionCode
+    facts: tuple[EvidenceFact, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -893,11 +981,78 @@ class AnswerContextPack:
     """Synthesis 唯一允许消费的、只含 accepted evidence 的上下文。"""
 
     question: str
-    entity: Entity
+    effective_query: str
+    entities: tuple[Entity, ...]
+    executed_plan: tuple[ExecutedPlanStep, ...]
     accepted_evidence: tuple[EvidenceEnvelope, ...]
+    rejected_evidence: tuple[EvidenceEnvelope, ...]
+    rejection_summaries: tuple[RejectedEvidenceSummary, ...]
     missing_dimensions: tuple[EvidenceDimension, ...]
     claim_level: ClaimLevel
     terminal_status: TerminalStatus
+    constraints: tuple[str, ...]
+    reply_preference: str
+    selected_skill: str | None
+
+    @property
+    def entity(self) -> Entity | None:
+        """返回主实体；无实体任务保持为空而不是伪造 symbol。"""
+        return self.entities[0] if self.entities else None
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        question: str,
+        effective_query: str,
+        entities: tuple[Entity, ...],
+        executed_plan: tuple[ExecutedPlanStep, ...],
+        verification: VerificationResult,
+        terminal_status: TerminalStatus,
+        constraints: tuple[str, ...],
+        reply_preference: str,
+        selected_skill: str | None,
+    ) -> AnswerContextPack:
+        """从 Verifier 结果构造不含 rejected facts 的回答包。
+
+        Args:
+            question: 用户当前轮原始问题。
+            effective_query: Rewrite 后的执行意图。
+            entities: 本轮权威实体集合。
+            executed_plan: 不暴露参数和载荷的执行摘要。
+            verification: 唯一证据验收结果。
+            terminal_status: Controller 裁定的最终回答状态。
+            constraints: 本轮已确认的业务约束摘要。
+            reply_preference: 本轮回答风格提示。
+            selected_skill: 可选的已确认 Skill 名称。
+
+        Returns:
+            仅含 accepted facts 和无事实拒绝摘要的不可变上下文。
+        """
+        summaries = tuple(
+            RejectedEvidenceSummary(
+                step_id=item.step_id,
+                tool_name=item.tool_name,
+                evidence_dimension=item.evidence_dimension,
+                rejection_code=item.rejection_code or EvidenceRejectionCode.CONTRACT_MISMATCH,
+            )
+            for item in verification.rejected
+        )
+        return cls(
+            question=question,
+            effective_query=effective_query,
+            entities=entities,
+            executed_plan=executed_plan,
+            accepted_evidence=verification.accepted,
+            rejected_evidence=(),
+            rejection_summaries=summaries,
+            missing_dimensions=verification.missing_dimensions,
+            claim_level=verification.claim_level,
+            terminal_status=terminal_status,
+            constraints=constraints,
+            reply_preference=reply_preference,
+            selected_skill=selected_skill,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -983,7 +1138,10 @@ _ALLOWED_TRANSITIONS: dict[RunPhase, frozenset[RunPhase]] = {
     RunPhase.PLANNED: frozenset({RunPhase.VALIDATED, RunPhase.FAILED}),
     RunPhase.VALIDATED: frozenset({RunPhase.EXECUTING, RunPhase.REJECTED, RunPhase.FAILED}),
     RunPhase.EXECUTING: frozenset({RunPhase.VERIFIED, RunPhase.CANCELLED, RunPhase.FAILED}),
-    RunPhase.VERIFIED: frozenset({RunPhase.SYNTHESIZING, RunPhase.FAILED}),
+    RunPhase.VERIFIED: frozenset(
+        {RunPhase.REPLANNING, RunPhase.SYNTHESIZING, RunPhase.FAILED}
+    ),
+    RunPhase.REPLANNING: frozenset({RunPhase.VALIDATED, RunPhase.SYNTHESIZING, RunPhase.FAILED}),
     RunPhase.SYNTHESIZING: frozenset(
         {RunPhase.SUCCEEDED, RunPhase.PARTIAL, RunPhase.FAILED, RunPhase.UNSUPPORTED}
     ),

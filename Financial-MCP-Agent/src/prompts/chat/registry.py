@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-SYNTHESIS_PROMPT_VERSION = "chat-synthesis-v1"
-_SYNTHESIS_PROMPT_PATH = Path(__file__).with_name("synthesis_v1.md")
+SYNTHESIS_PROMPT_VERSION = "chat-synthesis-v2"
+_SYNTHESIS_PROMPT_PATH = Path(__file__).with_name("synthesis_v2.md")
 
 
 def load_synthesis_prompt() -> str:
-    """读取 M2 Synthesis 的版本化系统 Prompt。
+    """读取 M5 Synthesis 的版本化系统 Prompt。
 
     Returns:
         非空 Prompt 文本；调用方将版本同时写入模型请求和 Trace。

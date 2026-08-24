@@ -58,6 +58,26 @@ def tools_for_requirements(rewrite: RewriteResult) -> tuple[str, ...]:
     return tuple(names)
 
 
+def permitted_tools_for_requirements(rewrite: RewriteResult) -> tuple[str, ...]:
+    """返回首选工具和仅用于有界补证的治理内备用工具。
+
+    Args:
+        rewrite: 已结构化的数据需求与权威实体。
+
+    Returns:
+        请求级权限可包含的最小候选集合；Planner 仍只选择首选工具。
+    """
+    names = list(tools_for_requirements(rewrite))
+    if (
+        rewrite.kind is RewriteKind.TUSHARE_DATA
+        and rewrite.entity is not None
+        and rewrite.entity.entity_type is EntityType.STOCK
+        and "get_market_bars" in names
+    ):
+        names.append("get_daily_bars")
+    return tuple(dict.fromkeys(names))
+
+
 class ControlledPermissionResolver:
     """将 Skill 声明和治理目录收敛成请求级只读权限快照。"""
 
@@ -89,7 +109,7 @@ class ControlledPermissionResolver:
             policies = self._catalog.select(execution_view.allowed_tools)
             source = f"skill:{execution_view.name}:{execution_view.version}"
         elif rewrite.kind is RewriteKind.TUSHARE_DATA:
-            tool_names = tools_for_requirements(rewrite)
+            tool_names = permitted_tools_for_requirements(rewrite)
             if not tool_names:
                 raise ContractViolationError("tushare rewrite has no governed tool mapping")
             policies = self._catalog.select(tool_names)

@@ -1,4 +1,4 @@
-"""从 Application Use Case 验证 M2 新受控工作流的离线纵向链。"""
+"""从 Application Use Case 验证受控工作流的离线纵向链。"""
 
 from __future__ import annotations
 
@@ -25,8 +25,10 @@ from backend.infrastructure.chat.testing import (  # noqa: E402
     InMemoryTraceSink,
 )
 from src.conversation.contracts import (  # noqa: E402
+    ClaimLevel,
     ConversationRequest,
     ErrorCode,
+    EvidenceStatus,
     RunBudget,
     TerminalStatus,
 )
@@ -37,7 +39,7 @@ CASES_PATH = ROOT / "tests" / "fixtures" / "conversation" / "vertical_slice_case
 
 
 def _load_cases() -> list[dict[str, Any]]:
-    """读取带版本的 M2 四路径验收案例。"""
+    """读取带版本的纵向验收案例。"""
     payload = json.loads(CASES_PATH.read_text(encoding="utf-8"))
     assert payload["fixture_version"] == "controlled-chat-vertical-slice-v1"
     return list(payload["cases"])
@@ -77,20 +79,26 @@ def test_controlled_chat_vertical_slice_reaches_expected_terminal(case: dict[str
         assert trace.events[-1].stage.value == "termination"
 
         if result.status is TerminalStatus.SUCCEEDED:
-            assert [event.stage.value for event in trace.events] == [
-                "context",
-                "entity_resolution",
-                "route",
-                "rewrite",
-                "permission",
-                "plan",
-                "validate",
-                "execute",
-                "verify",
-                "controller",
-                "synthesis",
-                "termination",
-            ]
+            stages = [event.stage.value for event in trace.events]
+            if case["tool_behavior"] == "success":
+                assert stages == [
+                    "context",
+                    "entity_resolution",
+                    "route",
+                    "rewrite",
+                    "permission",
+                    "plan",
+                    "validate",
+                    "execute",
+                    "verify",
+                    "controller",
+                    "synthesis",
+                    "termination",
+                ]
+            else:
+                assert stages.count("replan") == 1
+                assert stages.count("execute") == 2
+                assert stages.count("verify") == 2
             assert result.entity is not None and result.entity.symbol == "600519.SH"
             assert result.verification is not None
             assert len(result.verification.accepted) == 2
@@ -109,7 +117,7 @@ def test_controlled_chat_vertical_slice_reaches_expected_terminal(case: dict[str
         else:
             assert result.status is TerminalStatus.PARTIAL
             assert result.verification is not None
-            assert result.verification.claim_level.value == "PARTIAL"
+            assert result.verification.claim_level.value == "DESCRIPTIVE"
             assert len(model.calls) == 1
             assert "缺少" in result.reply
             assert model.calls[0].context.accepted_evidence == result.verification.accepted
@@ -121,7 +129,7 @@ def test_controlled_chat_vertical_slice_reaches_expected_terminal(case: dict[str
         if case["tool_behavior"] == "timeout_market":
             market_calls = [call for call in tool.calls if call.tool_name == "get_market_bars"]
             assert len(market_calls) == result.context.budget.max_tool_attempts
-            assert result.error_code is ErrorCode.TOOL_TIMEOUT
+            assert result.error_code is None
         elif case["tool_behavior"] == "missing_market":
             assert result.error_code is ErrorCode.EVIDENCE_MISSING
 
@@ -288,6 +296,77 @@ def test_m4_sop_runs_validated_tools_before_baseline_evidence_stages() -> None:
             "synthesis",
             "termination",
         ]
+
+    asyncio.run(run_case())
+
+
+@pytest.mark.e2e
+def test_m5_missing_market_uses_one_alternative_then_succeeds() -> None:
+    """确认主行情为空时只补证一次，并使用权限内的不同工具收口。"""
+
+    async def run_case() -> None:
+        model = FakeModelProvider()
+        tool = FakeToolProvider(behavior="recover_market_with_alternative")
+        trace = InMemoryTraceSink()
+        result = await ControlledChatUseCase(
+            workflow=ControlledConversationWorkflow(model=model, tool=tool, trace=trace),
+            repository=InMemoryConversationRepository(),
+        ).execute(
+            ConversationRequest(
+                user_id="user-m5",
+                session_id="session-m5-replan",
+                request_id="request-m5-replan",
+                message="查询贵州茅台 600519.SH 的基础信息和近期行情",
+            )
+        )
+
+        assert result.status is TerminalStatus.SUCCEEDED
+        assert [call.tool_name for call in tool.calls] == [
+            "get_stock_basic_info",
+            "get_market_bars",
+            "get_daily_bars",
+        ]
+        assert [event.stage.value for event in trace.events].count("replan") == 1
+        assert [event.stage.value for event in trace.events].count("verify") == 2
+        assert result.controller is not None and result.controller.replans_remaining == 0
+        assert len(model.calls) == 1
+
+    asyncio.run(run_case())
+
+
+@pytest.mark.e2e
+def test_m5_replan_without_new_evidence_terminates_partial() -> None:
+    """确认备用工具仍无事实时不会再次规划或强答。"""
+
+    async def run_case() -> None:
+        model = FakeModelProvider()
+        tool = FakeToolProvider(behavior="missing_market")
+        trace = InMemoryTraceSink()
+        result = await ControlledChatUseCase(
+            workflow=ControlledConversationWorkflow(model=model, tool=tool, trace=trace),
+            repository=InMemoryConversationRepository(),
+        ).execute(
+            ConversationRequest(
+                user_id="user-m5",
+                session_id="session-m5-bounded",
+                request_id="request-m5-bounded",
+                message="查询贵州茅台 600519.SH 的基础信息和近期行情",
+            )
+        )
+
+        assert result.status is TerminalStatus.PARTIAL
+        assert [event.stage.value for event in trace.events].count("replan") == 1
+        assert [call.tool_name for call in tool.calls] == [
+            "get_stock_basic_info",
+            "get_market_bars",
+            "get_daily_bars",
+        ]
+        assert result.verification is not None
+        assert result.verification.claim_level is ClaimLevel.DESCRIPTIVE
+        assert all(
+            item.status is EvidenceStatus.ACCEPTED
+            for item in model.calls[0].context.accepted_evidence
+        )
 
     asyncio.run(run_case())
 
