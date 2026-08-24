@@ -122,11 +122,16 @@ async def lifespan(app: FastAPI):
 
     if settings.enable_stm:
         try:
-            from backend.services.stm_compaction_worker import stm_compaction_worker_loop
+            from backend.services.stm_compaction_worker import (
+                build_stm_compaction_worker,
+                run_stm_compaction_worker,
+            )
 
             _stm_worker_stop_event = asyncio.Event()
+            # Provider 在 create_task 前构造，缺失配置必须由启动边界同步感知。
+            stm_worker = build_stm_compaction_worker()
             _stm_worker_task = asyncio.create_task(
-                stm_compaction_worker_loop(_stm_worker_stop_event),
+                run_stm_compaction_worker(stm_worker, _stm_worker_stop_event),
                 name="stm_compaction_worker",
             )
             print("[backend] stm_compaction_worker 后台任务已启动 ✓")

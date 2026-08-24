@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Protocol
 
 from src.conversation.contracts import ConversationRequest, ConversationResult
+from src.memory.contracts import WorkingState
 
 from .contracts import (
     ChatCommand,
@@ -29,6 +30,22 @@ class TransactionalConversationRepository(Protocol):
         result: ConversationResult,
     ) -> ChatContextWindowData:
         """暂存唯一终态和会话指标，不自行提交。"""
+        ...
+
+    async def apply_working_state(
+        self,
+        request: ConversationRequest,
+        result: ConversationResult,
+    ) -> WorkingState:
+        """暂存本轮确定性 Working State 变化和审计事件。"""
+        ...
+
+    async def maybe_enqueue_compaction(
+        self,
+        request: ConversationRequest,
+        result: ConversationResult,
+    ) -> bool:
+        """在前台已提交后按预算幂等排队摘要任务。"""
         ...
 
     async def commit(self) -> None:

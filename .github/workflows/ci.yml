@@ -41,13 +41,16 @@ jobs:
           uv run --locked ruff check
           backend/application/chat backend/infrastructure/chat
           backend/application/memory backend/infrastructure/memory
+          backend/config.py
           backend/db/database.py backend/db/migration_runner.py
           backend/db/models.py backend/migrations
           backend/routers/chat.py backend/schemas/chat.py
-          backend/services/stm_compaction_support.py
+          backend/services/stm_compaction_worker.py
+          backend/services/stm_context_service.py
           Financial-MCP-Agent/src/conversation
           Financial-MCP-Agent/src/memory/contracts.py
           Financial-MCP-Agent/src/memory/policy.py
+          Financial-MCP-Agent/src/memory/working_state.py
           Financial-MCP-Agent/src/prompts/chat/registry.py
           Financial-MCP-Agent/src/tools/skill_trace.py tests
       - name: Pyright boundary check
@@ -55,13 +58,16 @@ jobs:
           uv run --locked pyright
           backend/application/chat backend/infrastructure/chat
           backend/application/memory backend/infrastructure/memory
+          backend/config.py
           backend/db/database.py backend/db/migration_runner.py
           backend/db/models.py backend/migrations
           backend/routers/chat.py backend/schemas/chat.py
-          backend/services/stm_compaction_support.py
+          backend/services/stm_compaction_worker.py
+          backend/services/stm_context_service.py
           Financial-MCP-Agent/src/conversation
           Financial-MCP-Agent/src/memory/contracts.py
           Financial-MCP-Agent/src/memory/policy.py
+          Financial-MCP-Agent/src/memory/working_state.py
           Financial-MCP-Agent/src/prompts/chat/registry.py
           Financial-MCP-Agent/src/tools/skill_trace.py tests
       - name: Backend offline tests
@@ -111,7 +117,7 @@ jobs:
       - name: Verify production migration dependency
         run: >-
           docker run --rm --entrypoint python finance-agent-backend-ci:local
-          -c "import alembic; from backend.db.migration_runner import upgrade_database; print(alembic.__version__)"
+          -c "import alembic; from backend.db.migration_runner import upgrade_database; from backend.infrastructure.memory.summary import build_summary_model_provider; from backend.services.stm_compaction_worker import build_stm_compaction_worker; print(alembic.__version__)"
 
   offline-compose-e2e:
     name: Offline Compose E2E

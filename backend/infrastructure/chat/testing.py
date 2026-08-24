@@ -15,6 +15,8 @@ from src.conversation.contracts import (
     ToolObservation,
     WorkflowEvent,
 )
+from src.memory.contracts import WorkingState
+from src.memory.working_state import reduce_working_state
 from src.conversation.errors import ContractViolationError, ToolTimeoutError
 
 from backend.application.chat.contracts import (
@@ -104,6 +106,8 @@ class InMemoryConversationRepository:
     saved: list[SavedConversation] = field(default_factory=list)
     committed: bool = False
     rolled_back: bool = False
+    working_state: WorkingState = field(default_factory=WorkingState)
+    compaction_checks: int = 0
 
     async def prepare_turn(self, command: ChatCommand) -> PreparedChatTurn:
         """为离线案例返回固定或调用方指定的会话标识。"""
@@ -117,6 +121,34 @@ class InMemoryConversationRepository:
         """把一轮唯一终态保存到测试进程内。"""
         self.saved.append(SavedConversation(request=request, result=result))
         return ChatContextWindowData()
+
+    async def apply_working_state(
+        self,
+        request: ConversationRequest,
+        result: ConversationResult,
+    ) -> WorkingState:
+        """在内存中应用与生产相同的确定性状态归并。"""
+        if result.working_state_update is None:
+            return self.working_state
+        transition = reduce_working_state(
+            self.working_state,
+            result.working_state_update,
+            session_id=request.session_id,
+            source_message_id=max(1, self.working_state.state_version + 1),
+            trace_id=result.context.trace_id,
+        )
+        self.working_state = transition.state
+        return transition.state
+
+    async def maybe_enqueue_compaction(
+        self,
+        request: ConversationRequest,
+        result: ConversationResult,
+    ) -> bool:
+        """记录后台排队检查；纯内存案例默认不创建任务。"""
+        del request, result
+        self.compaction_checks += 1
+        return False
 
     async def commit(self) -> None:
         """记录 Application 已决定提交。"""

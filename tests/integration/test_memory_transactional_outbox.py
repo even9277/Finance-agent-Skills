@@ -22,6 +22,7 @@ from backend.application.chat.use_case import ControlledChatUseCase  # noqa: E40
 from backend.db.database import Base  # noqa: E402
 from backend.db.models import (  # noqa: E402
     MemoryOutboxTaskRow,
+    MemoryStateEventRow,
     MemoryWorkingStateRow,
     Message,
     Session,
@@ -161,7 +162,7 @@ def test_chat_turn_commits_messages_state_and_outbox_once(tmp_path: Path) -> Non
 
             assert [message.role for message in messages] == ["user", "assistant"]
             assert state is not None
-            assert state.state_version == 0
+            assert state.state_version == 1
             assert state.source_message_id == messages[0].id
             assert outcome.working_state.schema_version == MEMORY_SCHEMA_VERSION
             assert outbox is not None
@@ -170,12 +171,115 @@ def test_chat_turn_commits_messages_state_and_outbox_once(tmp_path: Path) -> Non
                 "session_id": outcome.session_id,
                 "user_message_id": messages[0].id,
                 "assistant_message_id": messages[1].id,
-                "state_version": 0,
+                "state_version": 1,
             }
             assert set(outbox.payload_json).isdisjoint(
                 {"message", "content", "profile", "prompt"}
             )
             assert outbox.trace_id == outcome.context.trace_id
+            async with session_factory() as verification:
+                events = list(
+                    (
+                        await verification.execute(
+                            select(MemoryStateEventRow).where(
+                                MemoryStateEventRow.session_id == outcome.session_id
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+            assert {event.field_name for event in events} == {
+                "active_entity",
+                "candidate_entities",
+            }
+            assert {event.state_version for event in events} == {1}
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run_case())
+
+
+@pytest.mark.integration
+def test_committed_turn_enqueues_one_summary_task_before_protected_tail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """达到阈值后只排队一个冻结边界的摘要任务，不压入最近原文。"""
+
+    async def run_case() -> None:
+        engine, session_factory = await _create_session_factory(tmp_path / "summary-queue.db")
+        try:
+            await _seed_user(session_factory, "fixture-user-memory")
+            monkeypatch.setattr("backend.infrastructure.chat.repository.settings.enable_stm", True)
+            monkeypatch.setattr(
+                "backend.infrastructure.chat.repository.settings.stm_compression_strategy",
+                "legacy_count",
+            )
+            monkeypatch.setattr(
+                "backend.infrastructure.chat.repository.settings.stm_legacy_count_threshold",
+                4,
+            )
+            monkeypatch.setattr(
+                "backend.infrastructure.chat.repository.settings.stm_keep_recent",
+                2,
+            )
+            session_id: str | None = None
+            for query in (
+                "查询贵州茅台 600519.SH 的近期走势",
+                "它的基础信息怎么样",
+            ):
+                async with session_factory() as db:
+                    outcome = await ControlledChatUseCase(
+                        workflow=_workflow(),
+                        repository=SqlAlchemyConversationRepository(db),
+                    ).execute(
+                        ChatCommand(
+                            user_id="fixture-user-memory",
+                            session_id=session_id,
+                            message=query,
+                        )
+                    )
+                    session_id = outcome.session_id
+
+            assert session_id is not None
+            async with session_factory() as verification:
+                tasks = list(
+                    (
+                        await verification.execute(
+                            select(MemoryOutboxTaskRow).where(
+                                MemoryOutboxTaskRow.session_id == session_id,
+                                MemoryOutboxTaskRow.task_kind
+                                == OutboxTaskKind.SUMMARY_COMPACT.value,
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                messages = list(
+                    (
+                        await verification.execute(
+                            select(Message)
+                            .where(Message.session_id == session_id)
+                            .order_by(Message.id)
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                session = await verification.get(Session, session_id)
+
+            assert len(tasks) == 1
+            payload = tasks[0].payload_json
+            protected_ids = [message.id for message in messages[-2:]]
+            source_end_message_id = payload["source_end_message_id"]
+            assert isinstance(source_end_message_id, int)
+            assert source_end_message_id < min(protected_ids)
+            assert payload["protected_tail_start_message_id"] == min(protected_ids)
+            assert payload["source_message_count"] == len(messages) - 2
+            assert session is not None
+            assert session.compression_status == "queued"
         finally:
             await engine.dispose()
 
@@ -333,9 +437,12 @@ def test_concurrent_chat_turns_keep_transaction_context_isolated(tmp_path: Path)
                 outbox_rows = list(
                     (
                         await verification.execute(
-                            select(MemoryOutboxTaskRow).order_by(
-                                MemoryOutboxTaskRow.user_id
+                            select(MemoryOutboxTaskRow)
+                            .where(
+                                MemoryOutboxTaskRow.task_kind
+                                == OutboxTaskKind.TURN_COMMITTED.value
                             )
+                            .order_by(MemoryOutboxTaskRow.user_id)
                         )
                     )
                     .scalars()
@@ -360,6 +467,10 @@ def test_concurrent_chat_turns_keep_transaction_context_isolated(tmp_path: Path)
             assert message_count == 4
             assert turn_count == 2
             assert len(outbox_rows) == 2
+            assert all(
+                row.task_kind == OutboxTaskKind.TURN_COMMITTED.value
+                for row in outbox_rows
+            )
             assert {
                 (row.user_id, row.session_id, row.payload_json["session_id"])
                 for row in outbox_rows

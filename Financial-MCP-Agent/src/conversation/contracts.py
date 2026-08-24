@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from datetime import date
 from enum import StrEnum
 
+from src.memory.contracts import WorkingStateUpdate
+
 from .errors import ContractViolationError, StateTransitionError
 
 CONTRACT_VERSION = "controlled-chat-v1"
@@ -361,6 +363,10 @@ class ContextPacket:
     recent_messages: tuple[str, ...] = ()
     running_summary: str | None = None
     confirmed_constraints: tuple[str, ...] = ()
+    reply_preference_hint: str = ""
+    working_entity: Entity | None = None
+    working_candidates: tuple[Entity, ...] = ()
+    reset_working_segment: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1104,6 +1110,7 @@ class ConversationResult:
     error_code: ErrorCode | None = None
     missing_dimensions: tuple[str, ...] = ()
     tool_call_count: int = 0
+    working_state_update: WorkingStateUpdate | None = None
 
 
 _ALLOWED_TRANSITIONS: dict[RunPhase, frozenset[RunPhase]] = {

@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import logging
+
 from src.conversation.contracts import ConversationRequest
 from src.conversation.workflow import ControlledConversationWorkflow
 
 from .contracts import ChatCommand, ChatOutcome
 from .ports import TransactionalConversationRepository
+
+logger = logging.getLogger(__name__)
 
 
 class ControlledChatUseCase:
@@ -46,7 +50,9 @@ class ControlledChatUseCase:
                 request,
                 recent_messages=prepared.recent_messages,
                 running_summary=prepared.running_summary,
+                working_state=prepared.working_state,
             )
+            working_state = await self._repository.apply_working_state(request, result)
             context_window = await self._repository.save_result(request, result)
             await self._repository.commit()
         except BaseException:
@@ -54,13 +60,30 @@ class ControlledChatUseCase:
             await self._repository.rollback()
             raise
 
+        # 摘要排队属于已提交轮次的后台增强；失败只能降级，不能反转前台回答。
+        try:
+            queued = await self._repository.maybe_enqueue_compaction(request, result)
+            if queued:
+                await self._repository.commit()
+        except Exception as exc:
+            await self._repository.rollback()
+            logger.warning(
+                "memory.compaction_enqueue_failed trace_id=%s stage=%s status=%s "
+                "error_code=%s error_type=%s",
+                result.context.trace_id,
+                "memory.compact",
+                "FAILED",
+                "INTERNAL_ERROR",
+                type(exc).__name__,
+            )
+
         return ChatOutcome(
             reply=result.reply,
             session_id=prepared.session_id,
             status=result.status,
             error_code=result.error_code,
             memory_profile=prepared.memory_profile,
-            working_state=prepared.working_state,
+            working_state=working_state,
             context_window=context_window,
             workflow_result=result,
         )

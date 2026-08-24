@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from src.memory.contracts import NewOutboxTask, OutboxTask, WorkingState
+from src.memory.contracts import (
+    NewOutboxTask,
+    OutboxTask,
+    WorkingState,
+    WorkingStateTransition,
+    WorkingStateUpdate,
+)
 
 
 class TransactionalMemoryRepository(Protocol):
@@ -22,4 +28,16 @@ class TransactionalMemoryRepository(Protocol):
 
     async def enqueue_outbox(self, intent: NewOutboxTask) -> OutboxTask:
         """暂存幂等 Outbox 任务，但不提交当前数据库事务。"""
+        ...
+
+    async def apply_working_state(
+        self,
+        *,
+        current: WorkingState,
+        update: WorkingStateUpdate,
+        session_id: str,
+        source_message_id: int,
+        trace_id: str | None,
+    ) -> WorkingStateTransition:
+        """以 CAS 写入一个状态版本及其字段级事件，不自行提交。"""
         ...

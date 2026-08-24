@@ -70,8 +70,8 @@ def test_memory_characterization_baseline_distinguishes_support_from_target_gaps
     supported = [case for case in cases if case["expected_current_status"] == "supported"]
     target_gaps = [case for case in cases if case["expected_current_status"] == "target_gap"]
 
-    assert len(supported) == 6
-    assert len(target_gaps) == 7
+    assert len(supported) == 7
+    assert len(target_gaps) == 6
     assert all(case.get("issue") == "#24" for case in target_gaps)
     assert all(case.get("target_milestone") in {"M2", "M3", "M5", "M6", "M7", "M8"} for case in target_gaps)
     assert all(case.get("evidence_level") == "tripwire" for case in target_gaps)

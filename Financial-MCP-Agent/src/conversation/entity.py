@@ -107,6 +107,25 @@ class AuthoritativeEntityResolver:
         if _FOLLOW_UP_PATTERN.search(packet.current_message) and not _SWITCH_PATTERN.search(
             packet.current_message
         ):
+            if packet.working_entity is not None:
+                return EntityResolutionResult(
+                    entity=packet.working_entity,
+                    candidates=(packet.working_entity,),
+                    resolved_entities=(packet.working_entity,),
+                    inherited=True,
+                    confidence=0.9,
+                )
+            if len(packet.working_candidates) == 1:
+                entity = packet.working_candidates[0]
+                return EntityResolutionResult(
+                    entity=entity,
+                    candidates=(entity,),
+                    resolved_entities=(entity,),
+                    inherited=True,
+                    confidence=0.86,
+                )
+            if len(packet.working_candidates) > 1:
+                return _ambiguous_result(packet.working_candidates)
             inherited_candidates = _entities_from_history(packet.recent_messages)
             if len(inherited_candidates) == 1:
                 entity = inherited_candidates[0]

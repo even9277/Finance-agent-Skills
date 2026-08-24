@@ -18,6 +18,14 @@ class ReplyPreferenceExtractor:
             单一高置信偏好；没有明确信号时不更新。
         """
         query = text or ""
+        if any(
+            token in query
+            for token in ("取消回答偏好", "按默认回答", "不用简洁了", "不用详细了")
+        ):
+            return ReplyPreference(
+                operation=PreferenceOperation.CLEAR,
+                confidence=0.9,
+            )
         if any(token in query for token in ("先说风险", "先讲风险", "风险优先")):
             return _preference("风险提示优先", 0.92)
         if any(token in query for token in ("先给结论", "结论先行", "直接说结论")):

@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from dataclasses import asdict
 
-from sqlalchemy import select
+from sqlalchemy import select, update as update_row
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.db.models import (
     MemoryOutboxTaskRow,
+    MemoryStateEventRow,
     MemoryWorkingStateRow,
     Message,
     Session,
@@ -23,9 +24,13 @@ from src.memory.contracts import (
     OutboxTask,
     OutboxTaskKind,
     OutboxTaskStatus,
+    TurnCommittedPayload,
     WorkingEntity,
     WorkingState,
+    WorkingStateTransition,
+    WorkingStateUpdate,
 )
+from src.memory.working_state import reduce_working_state
 
 
 class MemoryRepositoryError(RuntimeError):
@@ -78,7 +83,11 @@ class SqlAlchemyMemoryRepository:
             source_message_id=source_message_id,
         )
 
-        row = await self._db.get(MemoryWorkingStateRow, session_id)
+        row = await self._db.scalar(
+            select(MemoryWorkingStateRow)
+            .where(MemoryWorkingStateRow.session_id == session_id)
+            .with_for_update()
+        )
         if row is None:
             row = MemoryWorkingStateRow(
                 session_id=session_id,
@@ -94,6 +103,72 @@ class SqlAlchemyMemoryRepository:
             self._db.add(row)
             await self._db.flush()
         return self._to_working_state(row)
+
+    async def apply_working_state(
+        self,
+        *,
+        current: WorkingState,
+        update: WorkingStateUpdate,
+        session_id: str,
+        source_message_id: int,
+        trace_id: str | None,
+    ) -> WorkingStateTransition:
+        """以乐观版本更新快照，并在同一事务写入字段事件。
+
+        Raises:
+            MemoryRepositoryError: 当前快照已被并发轮次更新。
+        """
+        transition = reduce_working_state(
+            current,
+            update,
+            session_id=session_id,
+            source_message_id=source_message_id,
+            trace_id=trace_id,
+        )
+        if not transition.events:
+            return transition
+
+        state = transition.state
+        statement = (
+            update_row(MemoryWorkingStateRow)
+            .where(
+                MemoryWorkingStateRow.session_id == session_id,
+                MemoryWorkingStateRow.state_version == current.state_version,
+            )
+            .values(
+                state_version=state.state_version,
+                active_entity=_json_value(state.active_entity),
+                candidate_entities=_json_value(state.candidate_entities),
+                constraints=list(state.constraints),
+                reply_preference_hint=state.reply_preference_hint,
+                scope=state.scope.value,
+                source_message_id=source_message_id,
+            )
+        )
+        result = await self._db.execute(statement)
+        if getattr(result, "rowcount", 0) != 1:
+            raise MemoryRepositoryError(
+                MemoryErrorCode.VERSION_CONFLICT,
+                "working-state optimistic version is stale",
+            )
+        for event in transition.events:
+            self._db.add(
+                MemoryStateEventRow(
+                    session_id=event.session_id,
+                    message_id=event.message_id,
+                    field_name=event.field.value,
+                    operation=event.operation.value,
+                    old_value=_json_value(event.old_value),
+                    new_value=_json_value(event.new_value),
+                    source=event.source.value,
+                    confidence=event.confidence,
+                    state_version=event.state_version,
+                    schema_version=event.schema_version,
+                    trace_id=event.trace_id,
+                )
+            )
+        await self._db.flush()
+        return transition
 
     async def enqueue_outbox(self, intent: NewOutboxTask) -> OutboxTask:
         """暂存 Outbox 任务并将唯一键冲突转换为稳定领域错误。
@@ -144,7 +219,10 @@ class SqlAlchemyMemoryRepository:
 
     async def _assert_turn_authority(self, intent: NewOutboxTask) -> None:
         """验证 Outbox 中冗余标识都指向同一用户的真实对话轮次。"""
-        if intent.task_kind is not OutboxTaskKind.TURN_COMMITTED:
+        if intent.task_kind not in {
+            OutboxTaskKind.TURN_COMMITTED,
+            OutboxTaskKind.SUMMARY_COMPACT,
+        }:
             return
         assert intent.session_id is not None  # 已由 NewOutboxTask 合同验证。
         owner_id = await self._db.scalar(
@@ -159,6 +237,14 @@ class SqlAlchemyMemoryRepository:
             raise MemoryRepositoryError(
                 MemoryErrorCode.OWNERSHIP_MISMATCH,
                 "outbox user does not own the referenced session",
+            )
+
+        if intent.task_kind is not OutboxTaskKind.TURN_COMMITTED:
+            return
+        if not isinstance(intent.payload, TurnCommittedPayload):
+            raise MemoryRepositoryError(
+                MemoryErrorCode.INVALID_CONTRACT,
+                "turn outbox payload type is invalid",
             )
 
         message_rows = (
@@ -258,3 +344,12 @@ class SqlAlchemyMemoryRepository:
             source_message_id=row.source_message_id,
             updated_at=row.updated_at,
         )
+
+
+def _json_value(value: object) -> object:
+    """把不可变领域值转换为 JSON 列可接受的安全结构。"""
+    if isinstance(value, WorkingEntity):
+        return asdict(value)
+    if isinstance(value, tuple):
+        return [_json_value(item) for item in value]
+    return value
