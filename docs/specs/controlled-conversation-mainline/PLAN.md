@@ -581,9 +581,16 @@ Router/WS Presenter
   - Limitation: 真实 LLM/Tushare Live E2E 和 JSONL/Langfuse 完整阶段 Trace 属于 M7；WS 当前保持兼容文本帧但不是 Provider token streaming。
 - [x] Milestone 7: Observability, Eval, CI, and Real Compose E2E Closure
   - Completed: 2026-08-24
-  - Evidence: `WorkflowEvent` 已接入脱敏 root Trace + 12 个阶段 Span；mainline eval 新增终态准确率和阶段覆盖率；默认全量 `126 passed, 2 skipped, 5 deselected`，离线 Compose `73 passed, 1 skipped`；真实 LLM + 只读 Tushare + HTTP + 临时 SQLite Live E2E `1 passed`。
+  - Evidence: `WorkflowEvent` 已接入脱敏 root Trace；固定成功案例产生 12 个阶段 Span；mainline eval 新增终态准确率和阶段覆盖率；默认全量 `126 passed, 2 skipped, 5 deselected`，离线 Compose `73 passed, 1 skipped`；真实 LLM + 只读 Tushare + HTTP + 临时 SQLite Live E2E `1 passed`。
   - Limitation: GitHub protected Live workflow 尚需仓库管理员配置 Environment secrets；真实 Langfuse 未调用；固定案例不代表历史质量指标已复测。
-- [ ] Milestone 8: Verification, Narrow Fixes, Documentation, and Handoff
+- [x] Milestone 8: Verification, Narrow Fixes, Documentation, and Handoff
+  - Completed: 2026-08-24
+  - Evidence: 新增 18 模块面试口径实现映射和最终交接报告；默认全量测试
+    `126 passed, 2 skipped, 5 deselected`，CI 维护范围 Ruff/Pyright 零问题，前端全部门禁通过，
+    离线 Compose `73 passed, 1 skipped` 且资源已清理。M8 未重复产生付费 Live 调用，复用
+    M7 真实 LLM + 只读 Tushare `1 passed` 证据。
+  - Limitation: 全历史目录 Ruff/Pyright 扫描仍有 81/80 个存量错误，已登记 Issue #20；
+    历史面试指标仍待按新主链复测，真实 Langfuse 和 GitHub protected Live Environment 配置未完成。
 
 ## 16. Decision Log
 
@@ -617,9 +624,11 @@ Router/WS Presenter
 | 2026-08-24 | 有界 Replanner 只补 missing requirement、沿用原权限快照、选择不同 action fingerprint，默认最多一次 | 保留 workflow-style 主链，仅在执行后形成可证明终止的窄反馈环 | M5 controller/replan E2E evidence |
 | 2026-08-24 | REST/WS 同时切到 `ControlledChatUseCase`，Application 独占 commit/rollback | 消除入口双轨，保证同步/流式核心语义和一轮消息事务一致 | Issue #15 + M6 contract/integration evidence |
 | 2026-08-24 | 删除旧 `chat_service.py`，STM worker 只迁移必要压缩支持 | 禁止兼容转发壳，同时保留未被替代的后台压缩职责 | M6 legacy removal audit |
-| 2026-08-24 | Compose 只 Fake Model/Tool/Trace Ports | 公开 E2E 必须真实经过新 Workflow、Repository 和 PostgreSQL | M6 Compose evidence |
+| 2026-08-24 | Compose 只 Fake 外部 Model/Tool Ports，使用生产 Trace Adapter | 公开 E2E 必须真实经过新 Workflow、Repository、PostgreSQL 和 Trace 落盘边界 | M6 Compose evidence |
 | 2026-08-24 | M7 将领域 `WorkflowEvent` 映射为单 root + 稳定阶段 Span，并让 JSONL/exporter 共用脱敏边界 | 既能跨阶段回放，又不把 Prompt、回答、证据正文或秘密复制到观测出口 | Issue #17 + trace unit/Compose/Live evidence |
 | 2026-08-24 | Live E2E 固化为显式 `workflow_dispatch`/环境开关、真实只读 Tushare、一次模型调用和临时 SQLite | 证明生产 Adapter 可运行，同时保证默认 CI 零费用、无生产写和失败不可伪装为 skip | User authorization + M7 live evidence |
+| 2026-08-24 | M8 用四种状态逐模块对齐面试材料与当前实现，不修改 `Finance` 历史来源 | 防止把设计目标、历史代码、未来增强和历史数字混写成当前成果 | Issue #19 + current code/test evidence |
+| 2026-08-24 | M8 不修复全历史目录 81 个 Ruff/80 个 Pyright 存量错误，另建 Issue #20 | 冻结里程碑仅允许文档和明确失败的窄修；跨报告/Memory/旧 Runtime 批量修复需要独立 Spec/PR | Full static scan + scope control |
 
 ## 17. Surprises & Discoveries
 
@@ -652,13 +661,15 @@ Router/WS Presenter
 | 旧 Compose 通过替换整个 Chat Service 返回固定四元组 | HTTP 200 不能证明新工作流、持久化和会话读取 | M6 改为只 Fake 外部 Ports，并验证 PostgreSQL 中 user/assistant 一对消息 |
 | `uv run --with socksio pytest` 在 Windows 仍调用项目 `.venv` 的 `pytest.exe` | 临时依赖未进入解释器，Live 在 Provider 构造前失败 | 唯一 Live 命令固化为 `uv run --with socksio -- python -m pytest ...`，不污染生产依赖 |
 | Compose Trace 初次成为可由测试容器读取的共享产物 | 可以从公开代理入口证明 12 阶段同一 Trace，而不是只看 HTTP 200 | 使用临时命名卷只读挂载，断言后随 `down -v` 删除 |
+| README、架构、SOP 和验收基线仍保留 M0/M6 前的旧入口、Fake Chat Service 和 Live 未执行描述 | 面试官或新开发者会得到与当前代码相反的结论 | M8 按当前调用链和 M7 证据完成窄幅事实更新 |
+| 冻结 PLAN 的全仓 Ruff/Pyright 命令覆盖大量未迁移历史模块，分别发现 81/80 个错误 | 默认 CI 全绿不等于整个历史仓库零静态债务 | 保持 CI 维护边界零问题，并用 Issue #20 分批扩展门禁，不在 M8 降低规则 |
 
 ## 18. Outcomes & Retrospective
 
-- **What changed:** M0/M1 冻结基线；M2-M5 建立完整受控 Workflow；M6 切换唯一公开入口并删除旧双轨；M7 完成 root/span Trace、版本化主链评测、扩大 CI、真实 Compose 和保护性 Live E2E。
+- **What changed:** M0/M1 冻结基线；M2-M5 建立完整受控 Workflow；M6 切换唯一公开入口并删除旧双轨；M7 完成 root/span Trace、版本化主链评测、扩大 CI、真实 Compose 和保护性 Live E2E；M8 完成面试口径逐模块事实映射、最终验证和交接。
 - **What was verified:** 理解、执行、证据、补证、总结、公开协议、事务回滚、用户隔离、PostgreSQL、Trace 脱敏以及真实 Model/Tushare 均有证据。全量默认测试为 `126 passed, 2 skipped, 5 deselected`，Compose 为 `73 passed, 1 skipped`，Live 为 `1 passed`。
-- **What remains risky:** GitHub Live Environment 配置、真实 Langfuse、面试口径最终逐模块核对和历史指标复测尚未闭环；WS 不是 Provider token streaming。
-- **What should be improved next:** M8 只做最终验证、窄修、文档事实标注、独立 Review 和交付，不新增功能。
+- **What remains risky:** GitHub Live Environment 配置、真实 Langfuse、历史黄金集/指标复测和全仓静态债务尚未闭环；WS 不是 Provider token streaming，Redis/前端过程卡/网页新闻仍未实现。
+- **What should be improved next:** 本计划不再扩范围；后续按映射文档优先重建黄金集，再分别为前端事件、网页新闻、模型理解阶段和分布式韧性建立新规格。
 
 ## 19. Deferred Work
 
@@ -674,6 +685,7 @@ Router/WS Presenter
 
 ## 20. Handoff to Small-step Implementation
 
-Milestone 7 已完成本地实现、离线/Compose/Live 验收，待完成 Issue #17 的 commit、PR、CI、Review 和 squash merge 后交接。
-
-下一个执行单元仅为 Milestone 8：最终验证、窄修、面试口径状态标注、独立 Review 与交付；不得扩展新功能或把历史指标写成当前已验证事实。
+Milestone 0-8 已完成本地实现与验证。最终交接见
+`FINAL_VERIFICATION_AND_HANDOFF.md`，面试口径见
+`INTERVIEW_NARRATIVE_IMPLEMENTATION_MATRIX.md`。本 PLAN 不再有下一个实现里程碑；任何增强必须
+另建 Requirement Spec、Issue、短分支和独立 PR，不得把历史指标写成当前已验证事实。

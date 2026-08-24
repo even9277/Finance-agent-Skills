@@ -11,7 +11,8 @@
 
 围绕这些问题，当前仓库已经实现：
 
-- 对话模式：多轮追问、STM/LTM、用户画像、Tushare Skill 数据增强
+- 对话模式：多轮追问、会话尾窗与既有摘要/画像读取、Tushare Skill 数据增强；仓库保留
+  STM/LTM 基础设施，但完整 LTM 检索与写回尚未接入受控主链
 - 报告模式：多 Agent 协作生成基本面、技术面、估值、新闻等综合分析报告
 - 账号体系：登录、注册、切换账号、JWT 登录态恢复
 - 工程化链路：Router / Planner / Executor / Evidence 校验、结构化 Trace、可选 Langfuse 观测、Docker 部署
@@ -257,14 +258,19 @@ Workspace 金融场景扩展与 Trace / Langfuse 配置见下面两节。
 ```text
 前端输入
   -> FastAPI Chat Router
-  -> Memory / STM / LTM 上下文注入
-  -> Skill Router
-  -> Planner / Deterministic Executor / Agentic Executor
-  -> Tushare / MCP 工具
-  -> Evidence 校验
-  -> LLM 综合生成最终回答
-  -> 保存会话 / 更新画像 / 触发 LTM 写入
+  -> ControlledChatUseCase（REST / WebSocket 共用）
+  -> 最小上下文 -> 权威实体 -> 两阶段路由 -> route-specific rewrite
+  -> 请求级只读工具权限快照 -> Planner -> Validator -> 有界 Executor
+  -> Evidence Verifier -> Controller -> 最多一次补证
+  -> accepted-evidence-only LLM Synthesis
+  -> 同一事务保存会话消息 -> 脱敏 root / stage Trace
 ```
+
+受控对话主链的当前实现、限制和面试材料逐模块映射见
+[`INTERVIEW_NARRATIVE_IMPLEMENTATION_MATRIX.md`](docs/specs/controlled-conversation-mainline/INTERVIEW_NARRATIVE_IMPLEMENTATION_MATRIX.md)。
+当前 WebSocket 发送兼容的终态文本帧，不是 Provider 逐 token streaming；前端
+`skill_confirm/plan_preview/step_status/verification_summary`、网页新闻、Redis 共享熔断和
+完整在线 Langfuse 评测回流属于后续增强。
 
 ### 报告模式主链路
 
@@ -638,29 +644,33 @@ python src/main.py --command "帮我看看贵州茅台值不值得长期持有"
 - **结构化 Trace**：`Financial-MCP-Agent/logs/chat_traces.jsonl`（行式事件）、`Financial-MCP-Agent/logs/skill_trace.log`（汇总）
 - 可选：`TRACE_ARTIFACT_DIR` 下的对话产物
 
-Skill 对话链路会记录这些关键事件：
+受控对话链路会记录一个 root 和以下稳定阶段 Span：
 
-- `chat.router.decision`
-- `chat.skill.selected`
-- `chat.tool.plan`
-- `chat.model.stage`
-- `chat.tool.start`
-- `chat.tool.end`
-- `chat.tool.error`
-- `chat.reply.completed`
+- `controlled_chat.context`
+- `controlled_chat.entity_resolution`
+- `controlled_chat.route`
+- `controlled_chat.rewrite`
+- `controlled_chat.permission`
+- `controlled_chat.plan`
+- `controlled_chat.validate`
+- `controlled_chat.execute`
+- `controlled_chat.verify`
+- `controlled_chat.controller`
+- `controlled_chat.synthesis`
+- `controlled_chat.termination`
 
 如果你要排查“为什么没有命中 Skill”，建议优先看：
 
-1. `chat.router.decision`
-2. `chat.tool.plan`
-3. `chat.reply.completed`
+1. `controlled_chat.entity_resolution` 和 `controlled_chat.route`
+2. `controlled_chat.permission`、`controlled_chat.plan` 和 `controlled_chat.validate`
+3. `controlled_chat.execute`、`controlled_chat.verify` 和 `controlled_chat.controller`
 
 若已开启 **Langfuse**，可在控制台按 trace / session 查看与本地 JSONL 对应的观测数据；配置与排障见 [`docs/部署指南-Langfuse-本机开发联调.md`](docs/部署指南-Langfuse-本机开发联调.md)。
 
 ## 项目结构
 
 ```text
-Finance/
+Finance-agent-Skills/
 ├── backend/                     # FastAPI 后端
 ├── frontend/                    # Vue 前端
 ├── Financial-MCP-Agent/         # Agent、Skill、记忆与日志核心
@@ -675,12 +685,16 @@ Finance/
 - `backend/`
   - FastAPI 入口
   - Chat / Memory / Report / Auth 路由
-  - 会话管理与数据库访问
+  - `application/chat` 单一聊天用例与事务合同
+  - `infrastructure/chat` 模型、Tushare、数据库和 Trace Adapter
+
+- `Financial-MCP-Agent/src/conversation/`
+  - 受控对话 Typed Contracts 与唯一 Workflow
+  - 实体、路由、Rewrite、权限、规划、执行、证据、控制和总结阶段
 
 - `Financial-MCP-Agent/src/agents/`
-  - 报告模式多 Agent
-  - Skill router / executor
-  - planner / evidence 等运行时逻辑
+  - 报告模式和迁移前历史 Agent 资产
+  - 不再作为公开受控对话的唯一编排入口
 
 - `Financial-MCP-Agent/src/tools/`
   - Tushare SDK 封装
@@ -698,16 +712,20 @@ Finance/
 ## 当前已实现的关键工程点
 
 - 报告模式多 Agent 协作
-- 对话模式 STM / LTM（含动态预算压缩与后台 compaction worker；前端上下文占用可视化）
-- 用户画像与跨会话记忆
+- 仓库保留 STM 压缩 worker、LTM/画像基础设施和前端上下文可视化；当前受控主链只消费
+  最近消息、既有 `running_summary` 和既有画像，尚未重新接入自动压缩入队、LTM 检索/写回
+  或分阶段画像注入
+- 用户画像读取和跨会话记忆基础设施
 - 登录、切换账号、JWT 鉴权
 - 新账号注册与登录态恢复
 - 官方 Tushare Skill vendor 接入
 - Workspace 金融领域扩展 Skills（个股首轮、板块热点、异动解释、ETF 筛选、基金对比等）
-- Router / Planner / Executor / Evidence 完整链路
-- deterministic + agentic 混合执行路径
-- router / resolver / synthesis 模型分层
-- 本地结构化 Trace（JSONL / 日志）与可选 Langfuse 导出
+- 唯一受控对话主链：Typed State、实体、两阶段路由、三路 Rewrite、权限快照、
+  Planner、Validator、有界 Executor、Evidence、Controller/Replanner 和 Synthesis
+- 当前理解和规划阶段使用确定性可复现基线；真实模型仅用于 accepted-evidence-only Synthesis
+- 本地结构化 Trace（每轮一个 root，并按实际分支记录有序阶段 Span；固定成功案例为
+  12 个阶段 Span、JSONL）与可选脱敏 exporter
+- 默认零费用离线 CI、真实 Workflow Compose E2E，以及显式保护的 LLM + 只读 Tushare Live E2E
 - 基金 / ETF、板块、个股等高频咨询场景支持
 
 ## 后续计划
@@ -717,7 +735,9 @@ Finance/
 - 更完整的项目截图与 GIF
 - 架构图 / 时序图
 - 生产环境部署说明
-- CI / 自动化测试说明
+- 历史黄金集重建与面试指标复测
+- 前端受控过程事件和确认卡
+- Redis 分布式韧性与完整 Langfuse 评测回流
 - 更完整的 FAQ
 
 ## 鸣谢
@@ -732,5 +752,6 @@ Finance/
 
 ## 说明
 
-- 当前仓库默认优先保证本地开发、实验与演示效率，完整生产化仍可继续补 CI、部署脚本与监控体系。
+- 当前仓库已经具备 CI、分层测试、Compose E2E 和保护性 Live E2E；尚未提供生产 CD、SLA、
+  Redis 分布式韧性或真实 Langfuse 在线闭环。
 - 根目录中的部分训练脚本、数据处理脚本和实验文件保留为历史能力与扩展入口，并不是最小启动链路的必需项。

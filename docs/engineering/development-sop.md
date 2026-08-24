@@ -34,9 +34,17 @@
 
 记录版本、trace_id、成功/失败、耗时、费用和遗留风险。问题通过 revert/上一镜像恢复，随后补坏案例和根因记录。
 
-## 4. 当前基础设施验收入口
+## 4. 当前受控主链验收入口
 
-基础设施阶段已经完成离线验收，但没有伪造真实模型证据。开发者可直接运行 `CONTRIBUTING.md` 中的锁定命令；其中 Compose E2E 会通过 Vue/Nginx 代理请求真实 FastAPI，使用测试装配 Fake 聊天服务，并清理 PostgreSQL、容器和网络。真实服务只能在后续模块的受保护 `workflow_dispatch` 中运行，未满足凭证、隔离租户和预算条件时必须记录为未执行。
+开发者可直接运行 `CONTRIBUTING.md` 中的锁定命令。Compose E2E 会通过
+Vue/Nginx 代理请求真实 FastAPI，并经过正式 `ControlledChatUseCase`、
+`ControlledConversationWorkflow`、Repository、PostgreSQL 和生产 Trace Adapter；只在外部
+Model、Tool Ports 使用确定性测试实现，验收后清理容器、网络和卷。
+
+真实模型与只读 Tushare 只能通过显式 `live` marker 或受保护的
+`workflow_dispatch` 运行，使用隔离数据库、关闭生产写并限制调用次数。M7 已在本地完成
+一次真实模型 + 真实只读 Tushare 的公开 HTTP 验收；GitHub Environment secrets 和审批
+仍需仓库管理员配置。默认 CI 永远不能读取这些凭证或产生费用。
 
 ## 5. 高风险停止条件
 
