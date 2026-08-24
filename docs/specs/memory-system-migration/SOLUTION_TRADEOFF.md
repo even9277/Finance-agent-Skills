@@ -379,7 +379,7 @@ Likely ownership areas are `backend/domain/memory`, `backend/application/memory`
 - Redis Streams/Kafka as primary task durability.
 - Replacement of the controlled workflow with LangGraph persistence.
 - Multi-region cache/database replication and production disaster-recovery automation.
-- Full report-mode E2E unless shared contracts cannot otherwise be verified.
+- Report-mode memory injection and full report-mode E2E; both require a later separately scoped milestone, while this program shares only domain contracts and authoritative repositories.
 - A broad Langfuse v2-to-current-major migration.
 - Numeric performance/quality claims until reproducible baselines exist.
 - User data export format; inspect/correct/delete/forget remains in scope.

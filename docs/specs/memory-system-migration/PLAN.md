@@ -60,10 +60,10 @@ The plan follows Option B from `SOLUTION_TRADEOFF.md` and embeds observation-fir
 - Assumption: The current REST and WebSocket chat schemas remain compatible. Memory-control results use ordinary assistant messages plus existing-compatible/additive metadata only if required.
 - Assumption: The existing PostgreSQL container is replaced by or remains on the existing `pgvector/pgvector:pg16` image; a separate vector database is not required.
 - Assumption: Mem0 runs in-process inside backend/worker containers. The Mem0 index is derived and can be rebuilt from project-owned active memory records.
-- Assumption: `mem0ai>=2.0.18,<2.1`, `redis>=8.1,<9`, `alembic>=1.19,<2`, and `pgvector>=0.5,<1` are the proposed dependency ranges; `uv.lock` freezes exact resolved versions. If the compatibility check fails, stop before changing source code and record the smallest compatible version decision.
-- Assumption: Docker uses a stable Redis 7.4 Alpine image unless compatibility evidence in Milestone 0 requires another supported pinned tag.
+- Assumption: `alembic>=1.19,<2` is introduced with the authoritative schema in Milestone 2; `redis>=8.1,<9` is introduced with the cache adapter in Milestone 4; `mem0ai>=2.0.18,<2.1` and `pgvector>=0.5,<1` are introduced only with the governed provider adapter in Milestone 6. `uv.lock` freezes exact resolved versions at each owning milestone. If compatibility fails, stop before source changes and record the smallest compatible decision.
+- Assumption: Milestone 4 must resolve and record an immutable Redis 7.4 patch tag or digest before changing Compose. `redis:7.4-alpine` is only a family candidate and must not be committed as the final reproducible image reference.
 - Assumption: Explicit direct user memory commands are trusted user evidence after authentication and validation. Model-extracted high-impact profile suggestions are not.
-- Assumption: Confirmed memories remain until explicit deletion/supersession; candidate and safe audit-metadata retention values are typed settings finalized with tests, not compliance claims.
+- Assumption: Confirmed memories remain until explicit deletion/supersession. Typed defaults are 30 days for unpromoted candidates, 90 days for auto-promoted inferred text, 10 minutes for pending destructive confirmations, and 180 days for safe audit metadata. They are reproducible engineering defaults, not production legal/SLA claims.
 - Assumption: Real `.env` values may be read by the application at runtime but are never copied into reports, commands, fixtures, screenshots, or committed files.
 
 ## 6. Changed Surface
@@ -106,10 +106,14 @@ ChatView / API client
 -> build_chat_use_case
 -> ControlledChatUseCase.execute
 -> repository.prepare_turn
--> memory preflight + explicit memory command decision
--> ControlledConversationWorkflow.run
-   -> typed Working State / Context Gateway
-   -> entity -> rewrite -> route -> plan -> execute -> verify/control -> synthesis
+-> typed memory preflight + explicit memory command decision
+   -> memory command?
+      -> yes: command use case -> validate/authorize -> mutate or persist pending confirmation
+              -> persistence/cache/index consistency result -> REST/WS response
+      -> no: ControlledConversationWorkflow.run
+             -> typed Working State / Context Gateway
+             -> entity -> route -> rewrite -> permission -> plan -> validate
+             -> execute -> verify -> controller/bounded replan -> synthesis
 -> repository.save_result + state/events/outbox in one transaction
 -> commit foreground response
 -> memory worker claims durable tasks
@@ -168,6 +172,7 @@ ChatView / API client
 - Multi-region Redis/PostgreSQL, autoscaling, production backup orchestration, or legal compliance certification.
 - Replacement of the controlled workflow or introduction of a parallel memory runtime.
 - Changes to unrelated Tushare tools, financial evidence rules, portfolio/report business behavior, or MCP protocol.
+- Report-mode memory injection and report-mode E2E; report mode shares domain contracts and authoritative repositories only in this program and requires a later separately scoped milestone for runtime integration.
 - Broad Langfuse SDK major upgrade.
 - Historical performance/quality claims without new evidence.
 
@@ -221,12 +226,28 @@ ChatView / API client
 | pgvector | Docker DB image capability | Derived vector collection/index; measured exact/HNSW choice | Embedding dimensions/version consistent | Migration/query/eval |
 | Hybrid retrieval | Missing | Lexical + semantic candidates, fusion, post-filter, rerank, budget | Only active authorized records returned | Unit/integration/eval |
 | Durable outbox | Partial separate task commits | Same foreground transaction; deterministic claiming/idempotency | No lost/duplicate effective writes | Concurrency/crash tests |
-| Redis image | None | Pin `redis:7.4-alpine` unless M0 evidence changes it | Supported by locked redis-py | Compose health/contract |
-| Python dependencies | No Mem0/Redis/Alembic/pgvector package | Proposed bounded ranges from Section 5 | `uv lock` and Python 3.12 compatibility | `uv sync --locked`, import smoke |
+| Redis image | None | Resolve an immutable supported Redis 7.4 patch tag or digest in Milestone 4; do not treat `redis:7.4-alpine` as frozen | Supported by locked redis-py and obtainable in the active registry environment | Manifest/digest record + Compose health/contract |
+| Python dependencies | No Mem0/Redis/Alembic/pgvector package | Add Alembic in M2, redis-py in M4, and Mem0/pgvector only in M6 | Each dependency appears only when its governed adapter is ready; `uv.lock` and Python 3.12 remain compatible | Per-milestone `uv lock`/`uv sync --locked` + import/no-activation smoke |
 | Frontend test dependencies | Lint/type/build only | Add focused Vitest/Vue Test Utils and one Playwright journey if compatible | Existing build/toolchain remains | npm lock/lint/type/test/build |
 | Typed Settings | Current flags/provider secrets | Redis/Mem0/embedding/rerank/task/budget/retention/live settings | Safe defaults; no real values committed | Settings tests + Compose config |
 | Prompts/schemas | Current summary/profile extraction assets | Versioned Working State/summary/candidate/command structured outputs | Version in tasks/traces/eval | Snapshot/schema tests |
 | Trace schema | Current controlled trace | Stable memory foreground/background stage names and safe attributes | Langfuse remains optional exporter | Trace/redaction tests |
+
+### 9.1 Frozen Field Authority Matrix
+
+| Field / memory kind | Authority | Model path | Automatic effect | Scope and precedence |
+| --- | --- | --- | --- | --- |
+| `risk_level`, `investment_horizon`, `expected_return_min/max` | Explicit user command, UI/API edit, or user confirmation | Candidate allowed | Never auto-promote | Persistent until superseded/deleted; current explicit instruction wins for the turn |
+| `sectors`, `watchlist` | Explicit user command, UI/API edit, or user confirmation | Candidate allowed | Never auto-promote | Persistent, item-addressable, owner-scoped; current entity never mutates these implicitly |
+| Real holdings/positions | Portfolio/account domain only | No Memory authority | Never | Memory cannot overwrite, infer, or expose these as account facts |
+| `user_reported_position_context` | Explicit user statement or confirmation | Labelled text candidate only | Never auto-promote | Time-bounded; cannot act as portfolio truth, market evidence, valuation input, or tool authorization |
+| Persistent financial constraints | Explicit user command, UI/API edit, or user confirmation | Candidate allowed | Never auto-promote | Persistent until superseded/deleted; session Working State may override without rewriting LTM |
+| Current `constraints` | Validated current user message | Not LTM by default | Working State only | `this_turn` or `session_segment`; deterministic clear/expiry |
+| Current `reply_preference_hint` | Validated current user message | May seed text candidate | Working State only | Current explicit wording wins; bounded turn/segment scope |
+| Text response preference | Explicit command or repeated user-side evidence | Candidate allowed | Only after deterministic repeat/context/recency/conflict gates | Bounded scope, visible and deletable; current hint wins |
+| Text topic interest | Explicit command or repeated user-side evidence | Candidate allowed | Only after the same gates plus topic/entity/task scope | Cannot change active entity, widen tools, or act as market evidence |
+
+Assistant text, tool output, market data, and unsupported summary content cannot independently establish or promote any field. Portfolio/account data remains outside Memory authority. Every effective write records source, evidence reference, `policy_version`, `activation_source`, version, scope, and deletion state.
 
 ## 10. Engineering Implementation Contract
 
@@ -245,20 +266,21 @@ ChatView / API client
 
 Run from `D:\FinanceProject\Finance-agent-Skills` unless stated otherwise:
 
-1. `uv sync --locked --no-install-project --group dev`
-2. `uv run --locked ruff check backend Financial-MCP-Agent/src tests`
-3. `uv run --locked pyright backend Financial-MCP-Agent/src tests`
-4. `uv run --locked python -m pytest backend -q`
-5. `uv run --locked python -m pytest Financial-MCP-Agent -q -m "not live"`
-6. `uv run --locked python -m pytest tests/unit tests/contract tests/integration -q`
-7. `uv run --locked python -m pytest tests/evals -q -m "eval_smoke and not live"`
-8. `uv run --locked python -m pytest tests/e2e -q -m "e2e and not live"`
-9. `uv run --locked python -m pytest -q`
-10. From `frontend`: `npm.cmd ci`, `npm.cmd run lint -- --quiet`, `npm.cmd run type-check`, `npm.cmd run build`; add the frozen frontend unit/E2E test script when introduced.
-11. `docker compose -f docker/docker-compose.yml config --quiet`
-12. `docker compose -f docker/docker-compose.offline.yml config --quiet`
-13. `docker compose -f docker/docker-compose.offline.yml up --build --abort-on-container-exit --exit-code-from offline-e2e`
-14. Always cleanup: `docker compose -f docker/docker-compose.offline.yml down -v --remove-orphans`.
+1. `uv sync --locked --no-install-project --group dev`.
+2. Run the exact maintained-scope Ruff command from `.github/workflows/ci.yml`, plus every Python file/module changed by the current milestone. Every changed or newly owned module must finish with zero Ruff errors.
+3. Run the exact maintained-scope Pyright command from `.github/workflows/ci.yml`, plus every Python file/module changed by the current milestone. Every changed or newly owned module must finish with zero Pyright errors.
+4. Run `uv run --locked ruff check backend Financial-MCP-Agent/src tests` and `uv run --locked pyright backend Financial-MCP-Agent/src tests` as repository-debt scans at cumulative gates. Compare against Issue #20's recorded baseline of 81 Ruff errors and 80 Pyright errors/6 warnings; this program may introduce no new finding. A touched historical module must be reduced to zero in the owning PR, and no new ignore may hide debt. Until Issue #20 closes, unchanged pre-existing findings are recorded rather than misreported as milestone regressions.
+5. `uv run --locked python -m pytest backend -q`.
+6. `uv run --locked python -m pytest Financial-MCP-Agent -q -m "not live"`.
+7. `uv run --locked python -m pytest tests/unit tests/contract tests/integration -q`.
+8. `uv run --locked python -m pytest tests/evals -q -m "eval_smoke and not live"`.
+9. `uv run --locked python -m pytest tests/e2e -q -m "e2e and not live"`.
+10. `uv run --locked python -m pytest -q`.
+11. From `frontend`: `npm.cmd ci`, `npm.cmd run lint -- --quiet`, `npm.cmd run type-check`, `npm.cmd run build`; add the frozen frontend unit/E2E test script when introduced.
+12. `docker compose -f docker/docker-compose.yml config --quiet`.
+13. `docker compose -f docker/docker-compose.offline.yml config --quiet`.
+14. `docker compose -f docker/docker-compose.offline.yml up --build --abort-on-container-exit --exit-code-from offline-e2e`.
+15. Always cleanup: `docker compose -f docker/docker-compose.offline.yml down -v --remove-orphans`.
 
 Focused milestones run only their relevant subset first. Root regression, frontend gates, Compose, and live gates are cumulative final checks. Test result counts must be recorded from each actual run; historical counts are not acceptance facts.
 
@@ -377,9 +399,9 @@ Tests expected to fail before implementation are added in the milestone that own
 
 **Goal:** Establish the authoritative data model and transaction boundary needed by all later memory behavior.
 
-**Files / Modules:** `Financial-MCP-Agent/src/memory` domain contracts/policy; new backend memory application/infrastructure boundaries; database models/Alembic; chat application/repository transaction integration; settings/dependencies; focused tests/docs.
+**Files / Modules:** `Financial-MCP-Agent/src/memory` domain contracts/policy; new backend memory application/infrastructure boundaries; database models/Alembic; chat application/repository transaction integration; schema settings and Alembic dependency only; focused tests/docs.
 
-**Implementation Intent:** Add typed Working State, events, summary metadata, profile/text record, candidate, audit, outbox task, provider-reference, command/retrieval/status/error contracts. Add expand-first Alembic revisions and replace new memory schema mutation through startup patching. Ensure foreground message/state/outbox rows share one transaction and services do not commit internally.
+**Implementation Intent:** Add typed Working State, events, summary metadata, profile/text record, candidate, audit, outbox task, provider-reference, command/retrieval/status/error contracts. Add expand-first Alembic revisions and replace new memory schema mutation through startup patching. Ensure foreground message/state/outbox rows share one transaction and services do not commit internally. Install Alembic only; explicitly defer redis-py to Milestone 4 and Mem0/pgvector SDKs to Milestone 6 so a dependency cannot activate the ungoverned legacy provider path.
 
 **Tests / Checks:** Domain/contract tests; Alembic upgrade/downgrade/re-upgrade; existing-session readability; rollback/atomicity/idempotency/concurrency tests; `uv sync --locked`; Ruff/Pyright; focused and root database regressions.
 
@@ -415,7 +437,7 @@ Tests expected to fail before implementation are added in the milestone that own
 
 **Files / Modules:** Redis adapter/ports/settings/bootstrap, application repositories/use cases, Docker/CI, fake/real integration tests, health/trace code.
 
-**Implementation Intent:** Implement namespaced versioned cache-aside for Working State, recent tail/summary, and compact profile; TTL, invalidate-on-write, malformed/stale rejection, database fallback, single-flight/lease token rules, health status, and metrics. Use PostgreSQL tasks as durable truth.
+**Implementation Intent:** Before changing Compose, resolve an obtainable immutable Redis 7.4 patch tag or image digest, record it with redis-py compatibility evidence, and use that reference in committed configuration. Then implement namespaced versioned cache-aside for Working State, recent tail/summary, and compact profile; TTL, invalidate-on-write, malformed/stale rejection, database fallback, single-flight/lease token rules, health status, and metrics. Use PostgreSQL tasks as durable truth.
 
 **Tests / Checks:** Real Redis key/TTL/version/invalidation/isolation/corruption/outage tests; lease ownership/expiry; concurrent reads; Compose health/config; STM regression with Redis on/off.
 
@@ -441,7 +463,7 @@ Tests expected to fail before implementation are added in the milestone that own
 
 **Stop Condition:** Model text can bypass deterministic gates; assistant/tool results can become user-confirmed facts; retries duplicate effective memory; raw private evidence leaks to logs/audit.
 
-**Rollback Note:** Stop governance workers/integration and revert milestone code; candidates remain non-effective. Do not bulk-delete any non-test record.
+**Rollback Note:** Stop governance workers/integration and reject new auto-promotions from the reverted `policy_version`. Records already auto-promoted under that policy are identified by `policy_version` and `activation_source`, immediately excluded by the integration seam when required, and reported for owner-scoped inspection/repair. User-confirmed writes remain authoritative and are not automatically undone by code rollback. Do not bulk-delete any non-test record.
 
 **Handoff Evidence:** Candidate lifecycle matrix, provenance-negative tests, task recovery proof, prompt/schema versions, safe trace/audit samples.
 
@@ -451,7 +473,7 @@ Tests expected to fail before implementation are added in the milestone that own
 
 **Files / Modules:** Mem0 provider adapter/settings/lifecycle, pgvector/migration/index configuration, retrieval application/domain policy, controlled context/rewrite/synthesis integration, worker reconcile/delete tasks, Docker/tests/eval.
 
-**Implementation Intent:** Initialize one `AsyncMemory` per process; index promoted records with `infer=False`; store project memory/version/provider IDs; perform mandatory scoped Mem0 search plus PostgreSQL lexical recall; fuse/rerank, authoritatively post-filter, and token-pack results; inject only into allowed stages. Handle index lag, provider timeout, dimension/version mismatch, reconciliation, and delete retry.
+**Implementation Intent:** Add and lock the Mem0/pgvector SDK dependencies only after a no-activation test proves the legacy client/worker cannot start outside the new governed bootstrap. Initialize one `AsyncMemory` per process; index promoted records with `infer=False`; store project memory/version/provider IDs; perform mandatory scoped Mem0 search plus PostgreSQL lexical recall; fuse/rerank, authoritatively post-filter, and token-pack results; inject only into allowed stages. Handle index lag, provider timeout, dimension/version mismatch, reconciliation, and delete retry.
 
 **Tests / Checks:** Fake provider contract; real pgvector CRUD/filter/ownership; exact vs indexed query baseline before HNSW; hybrid retrieval/fusion/rerank; deleted/expired/conflicted suppression; cross-session eval; tool/evidence non-expansion; Mem0 outage degradation.
 
@@ -469,9 +491,9 @@ Tests expected to fail before implementation are added in the milestone that own
 
 **Files / Modules:** Memory command domain/application, chat integration, memory routes/schemas, current frontend API/store/composables/components/chat view, focused frontend tests/browser path, docs.
 
-**Implementation Intent:** Detect inspect/update/delete/forget commands before financial planning; validate typed target/scope/value; require confirmation for ambiguous or broad destructive requests; perform owner-scoped mutations; acknowledge exact effect and consistency state; refresh/invalidate frontend/Redis/provider projections. Preserve ordinary finance queries and API compatibility.
+**Implementation Intent:** Detect inspect/update/delete/forget commands before financial planning; validate typed target/scope/value; perform owner-scoped mutations; acknowledge exact effect and consistency state; refresh/invalidate frontend/Redis/provider projections. Ambiguous or broad destructive requests create a persisted pending command bound to authenticated `user_id`, `session_id`, normalized target scope, safe preview/count, command fingerprint, expected state version, and expiry. Confirmation is one-shot and idempotent, rejects replay/cross-user/cross-session/stale-version use, and is cancelled when it expires, the user cancels, or a new conflicting memory command supersedes it. REST and WebSocket presenters consume the same application result/status contract. Preserve ordinary finance queries and API compatibility.
 
-**Tests / Checks:** Command classification/actions, profile/text updates, targeted deletion, bulk confirmation, unauthorized/cross-user attempts, ordinary-query non-mutation, API contract, frontend unit/type/lint/build, browser journey, controlled E2E.
+**Tests / Checks:** Command classification/actions, profile/text updates, targeted deletion, pending-command TTL/fingerprint/version/one-shot/replay/cancellation, bulk confirmation, unauthorized/cross-user/cross-session attempts, REST/WS parity, ordinary-query non-mutation, API contract, frontend unit/type/lint/build, browser journey, controlled E2E.
 
 **Expected Result:** The requested Chinese commands modify only the intended memory, are visible in UI/API, and affect later sessions after the defined consistency boundary.
 
@@ -582,6 +604,14 @@ Before implementation, rollback is simply discarding the unexecuted plan. During
 | 2026-08-24 | Controlled conversation is mandatory public E2E; report mode shares contracts only | Avoids duplicate runtime while matching immediate target | Clarification P1-05 |
 | 2026-08-24 | Keep frontend unit/browser testing in scope and add it only in the owning milestone | Current frontend exposes lint/type/build but no test script; memory commands need UI evidence | Milestone 0 inspection |
 | 2026-08-24 | Treat Docker registry access as an explicit pre-Compose risk rather than a passed prerequisite | Docker daemon works, but a non-pulling Redis manifest request did not complete in the 30-second inspection window | Milestone 0 inspection |
+| 2026-08-24 | Correct the controlled stage order to `entity -> route -> rewrite` and prohibit formal LTM before route | The previous plan text contradicted the production workflow and could misplace Context Gateway ownership | PR #23 independent review |
+| 2026-08-24 | Install Alembic, redis-py, and Mem0/pgvector only in their owning milestones | Installing Mem0 in M2 could activate the ungoverned legacy provider path before ownership/filter controls exist | PR #23 independent review |
+| 2026-08-24 | Freeze controlled conversation as the only runtime acceptance path; report mode shares contracts/repositories only | Removes a contradiction between complete acceptance and deferred report E2E | PR #23 independent review |
+| 2026-08-24 | Freeze the field-level authority/auto-promotion matrix | Schema and promotion work must not invent product/safety decisions during implementation | PR #23 independent review |
+| 2026-08-24 | Use zero-error gates for maintained/changed scope and baseline-diff scans for untouched repository debt | Full scans currently contain 81 Ruff and 80 Pyright errors tracked by Issue #20 | PR #23 independent review / Issue #20 |
+| 2026-08-24 | Keep real holdings/positions exclusively in the Portfolio/account domain | Memory must not become a second authority for account facts; only labelled, expiring user-reported context is permitted | PR #23 second independent review |
+| 2026-08-24 | Freeze development retention defaults while deferring production legal/SLA policy | Reproducible tests need concrete values, but the project cannot invent compliance guarantees | PR #23 second independent review |
+| 2026-08-24 | Model memory commands as a branch before the ordinary controlled workflow | Mutation/confirmation must not accidentally continue into financial planning, while ordinary requests retain permission/validation/controller stages | PR #23 second independent review |
 
 ## 17. Surprises & Discoveries
 
@@ -597,6 +627,7 @@ Before implementation, rollback is simply discarding the unexecuted plan. During
 | Frontend `package.json` has no unit or browser E2E command | API-only testing would not prove the requested dialogue-box workflow | Add focused Vitest/Vue tests and one Playwright journey in Milestone 7, then wire the gate in Milestone 8/9 |
 | Docker Engine/Compose are available, but Docker Hub manifest inspection stalled | Later image pulls may repeat the user's prior authorization/network failure | Recheck registry access at the first milestone that changes Compose; prefer pinned images and document a registry mirror/local-cache fallback without changing real Docker settings silently |
 | Test collection reports a Starlette/httpx deprecation warning | Baseline is usable but future dependency changes could turn it into a failure | Track the warning; do not broaden Milestone 0 into an unrelated dependency upgrade |
+| Independent review found five P1 and three P2 contract gaps before merge | The plan was not yet safely executable despite green CI | Correct stage order, dependency timing, report scope, authority matrix, static gates, data rollback, pending-command state, and immutable Redis image requirements in PR #23 |
 
 ## 18. Outcomes & Retrospective
 
@@ -611,7 +642,7 @@ Before implementation, rollback is simply discarding the unexecuted plan. During
 - Redis Streams/Kafka/Celery as primary job durability.
 - LangGraph runtime/checkpointer replacement.
 - Multi-region, autoscaling, production backup/restore automation, and compliance certification.
-- Full report-mode E2E unless shared-contract verification proves insufficient.
+- Report-mode memory injection and full report-mode E2E; both require a later separately scoped milestone.
 - Broad Langfuse major upgrade.
 - Numeric quality/performance/resume claims before target baselines.
 - User memory export format.
@@ -619,4 +650,4 @@ Before implementation, rollback is simply discarding the unexecuted plan. During
 
 ## 20. Handoff to Small-step Implementation
 
-Start with Milestone 0 only. Run `git status --short`, confirm the changed surface and available tests, validate the planning artifacts and toolchain, and do not edit runtime/source/configuration files. Produce the M0 execution report and update Sections 15-18 before requesting or beginning Milestone 1.
+Milestone 0 is complete. The first unchecked milestone is Milestone 1. Execute only its characterization contracts and memory evaluation baseline, keep production behavior unchanged, produce the M1 execution report, update Sections 15-18, and stop before Milestone 2.

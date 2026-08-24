@@ -41,7 +41,7 @@ The target memory subsystem must form one governed lifecycle around the existing
 3. Use rolling summaries only for earlier conversation continuity, with quality, version, and compression-boundary controls.
 4. Maintain typed and auditable working state for the minimum execution-critical fields: current entity, current constraints, and current reply-preference hint.
 5. Enforce safe entity inheritance, explicit replacement, ambiguity handling, multi-entity handling, scoped constraint updates, and temporary reply-preference semantics.
-6. Assemble stage-specific context so route, rewrite, planner, executor/verifier, synthesis, and report paths receive only the memory they need.
+6. Assemble stage-specific context so route, rewrite, planner, executor/verifier, and synthesis receive only the memory they need in the controlled conversation path.
 7. Convert sufficiently supported user-side interaction signals into LTM candidates asynchronously, without delaying or failing the foreground answer.
 8. Keep user-confirmed structured profile data authoritative. Model-inferred profile suggestions must never overwrite it automatically.
 9. Govern inferred memories through schema validation, user-evidence validation, deduplication, conflict detection, scope, recency, versioning, promotion, expiry, deletion, and audit.
@@ -174,7 +174,7 @@ The analysis and eventual migration must cover the following requirement modules
 
 - Skip formal LTM retrieval during route unless a later verified requirement proves it safe.
 - Build stage-specific retrieval queries only from already-confirmed current-turn state.
-- Keep rewrite injection compact, planner usage non-expansive, and synthesis/report usage bounded by scope and token budgets.
+- Keep rewrite injection compact, planner usage non-expansive, and synthesis usage bounded by scope and token budgets.
 - LTM can alter emphasis or presentation but cannot replace current financial evidence.
 
 **LTM-09 — User controls, privacy, and projection**
@@ -207,6 +207,7 @@ The analysis and eventual migration must cover the following requirement modules
 - Automatic model control over confirmed high-impact financial profile fields.
 - Caching or reusing final financial answers as memory.
 - Using LTM as financial evidence, an authorization source, or a reason to bypass tool/evidence governance.
+- Report-mode memory injection and report-mode E2E. This delivery shares memory domain contracts and authoritative repositories with report mode, but verifies and activates memory only through the controlled conversation path; a later separately scoped milestone must integrate report behavior.
 - Production deployment, production data writes, or production user-memory migration without a separately approved migration and rollback procedure.
 - Commit, push, pull request, merge, release, branch-protection changes, or deployment unless explicitly authorized for the relevant delivery step. Issue #22 and the working branch were explicitly authorized and already created.
 - Declaring the implementation complete merely because files or module stubs exist; final completion requires the acceptance evidence in Section 10.
@@ -215,8 +216,7 @@ The analysis and eventual migration must cover the following requirement modules
 
 - The exact supported Mem0 SDK and embedding-provider versions that are compatible with the target Python stack and Docker environment.
 - Whether Redis also owns background-task coordination/locking in the first complete delivery or remains limited to hot-state cache and idempotency assistance.
-- The exact data-retention duration, encryption-at-rest policy, export format, and hard-deletion SLA for personal financial profile data.
-- Whether report mode consumes the unified memory services in the same release or only shares contracts and repositories while conversation mode is the verified public path.
+- Production legal retention, encryption-at-rest implementation, export format, and hard-deletion SLA require a deployment-specific policy and are not compliance claims of this project. The project engineering defaults are fixed below and remain testable typed settings.
 - The numeric quality thresholds for extraction precision, promotion precision, retrieval relevance, cache performance, and E2E latency; these require target-repository baselines before they can become gates.
 
 ## 7. Constraints
@@ -359,15 +359,15 @@ The analysis and eventual migration must cover the following requirement modules
 
 1. - Question: Which inferred memories can auto-promote, and which require user confirmation?
    - Why it matters: It defines the safety boundary between useful personalization and unauthorized profile mutation.
-   - Suggested default: Confirmed investment-profile fields always require the user; narrowly scoped response preferences may auto-promote only after strong, reproducible evidence and remain user-deletable.
+   - Resolution: `risk_level`, `investment_horizon`, `expected_return_min/max`, `sectors`, `watchlist`, and persistent constraints are confirmed structured fields. A model may create a candidate but cannot auto-promote it. Real holdings/positions belong exclusively to the Portfolio/account domain and are never authoritative Memory fields; Memory may retain only a confirmed, time-bounded `user_reported_position_context` that is labelled as user-reported context and cannot act as account fact or market evidence. Current-turn/session-segment constraints and reply hints remain Working State, not confirmed LTM. Only narrowly scoped text memories such as response style or topic interest may auto-promote after repeated user-side evidence, deterministic gates, conflict checks, and bounded scope/expiry; every promoted item remains visible and deletable.
 
 2. - Question: What retention, encryption, access, export, and hard-deletion policy applies to personal financial profiles and source evidence?
    - Why it matters: It changes schemas, audit design, artifacts, backups, and user-control APIs.
-   - Suggested default: Minimize stored evidence, encrypt transport/storage through platform facilities, restrict access by user, support visible deletion, and avoid logging raw private content until policy is confirmed.
+   - Resolution: Confirmed user memories remain until deletion/supersession; unpromoted candidates default to 30 days; auto-promoted inferred text defaults to 90 days; pending destructive confirmations default to 10 minutes; safe audit metadata defaults to 180 days. Raw evidence is not duplicated into audit/log/trace. Deletion immediately removes the record from effective retrieval and enqueues durable provider/vector hard deletion until terminal success or visible operator action. Transport/storage encryption is delegated to the configured PostgreSQL/Redis/provider platform; production legal retention, backup erasure, export format, and hard-delete SLA require a separate deployment policy and are not claimed here.
 
 3. - Question: Must report mode and controlled conversation share the same memory services in the first release?
    - Why it matters: A partial split may recreate duplicate state or inconsistent precedence.
-   - Suggested default: Share domain contracts and repositories immediately, but integrate one verified user path at a time behind explicit rollout gates.
+   - Resolution: Share domain contracts and authoritative repositories immediately. Runtime injection, public E2E, and acceptance in this program cover controlled conversation only; report-mode behavior requires a later separately scoped milestone and must not create a duplicate memory runtime.
 
 4. - Question: Which historical thresholds and evaluation metrics should become project acceptance gates?
    - Why it matters: Unverified numbers cannot be used as credible CI gates or interview claims.

@@ -60,15 +60,33 @@ The user authorized one complete memory-delivery program and delegated implement
 - Default: Explicit user commands may directly mutate user-owned profile/text memory after validation. Model-inferred high-impact profile candidates always require confirmation. Low-impact text preferences may auto-promote only after repeatable user-side evidence, bounded confidence rules, and full user visibility/deletion.
 - Reason: This balances useful personalization with resistance to memory pollution.
 
+The field-level authority contract is frozen as follows:
+
+| Field / memory kind | Authoritative source | Model candidate allowed | Auto-promotion | Scope / expiry | Current-turn precedence and deletion |
+| --- | --- | --- | --- | --- | --- |
+| `risk_level` | Explicit user command, UI/API edit, or user confirmation | Yes | Never | Persistent until superseded/deleted | Current explicit instruction wins for the turn; deletion makes it immediately non-effective |
+| `investment_horizon` | Explicit user command, UI/API edit, or user confirmation | Yes | Never | Persistent until superseded/deleted | Current explicit instruction wins; old inferred candidates cannot restore it |
+| `expected_return_min/max` | Explicit user command, UI/API edit, or user confirmation | Yes | Never | Persistent until superseded/deleted | Current explicit instruction wins; numeric validation is mandatory |
+| `sectors`, `watchlist` | Explicit user command, UI/API edit, or user confirmation | Yes | Never | Persistent and item-addressable until superseded/deleted | Current entity does not mutate these fields implicitly; deletion is owner-scoped |
+| Real holdings/positions | Portfolio/account domain only | No Memory authority | Never | Governed by the Portfolio/account source of truth | Memory cannot overwrite, infer, or expose these as account facts |
+| `user_reported_position_context` | Explicit user statement or confirmation | Yes, as labelled text context only | Never | Time-bounded and source-labelled | Cannot act as portfolio truth, market evidence, valuation input, or tool authorization |
+| Persistent financial constraints | Explicit user command, UI/API edit, or user confirmation | Yes | Never | Persistent until superseded/deleted | Current-turn/session Working State overrides without silently rewriting LTM |
+| Current `constraints` | Current user message through validated Working State extraction | Not an LTM candidate by default | Not applicable | `this_turn` or `session_segment`; deterministic expiry | Current explicit wording wins; expiry/clear produces an audit event |
+| Current `reply_preference_hint` | Current user message through validated Working State extraction | May seed a text-memory candidate | Never as structured profile | `this_turn` or `session_segment`; deterministic expiry | Current explicit wording wins over any older preference |
+| Text response preference | Explicit user command, or repeated user-side evidence | Yes | Allowed only after deterministic repeat/unique-context/recency/conflict gates | Bounded scope; expires or is superseded by policy | Current hint wins; visible targeted deletion disables retrieval immediately |
+| Text topic interest | Explicit user command, or repeated user-side evidence | Yes | Allowed only with topic/entity/task scope and the same deterministic gates | Bounded time/topic scope; expires or is superseded | Cannot change active entity or expand tools; visible targeted deletion disables retrieval immediately |
+
+Assistant text, tool output, market data, and unsupported summary claims may provide debugging context but can never independently establish or promote any field above. Portfolio/account data remains outside the Memory authority boundary.
+
 ### P1-04 — Retention and deletion baseline
 
-- Default: Confirmed profile/text memories remain until user deletion, supersession, or an explicit configured policy. Unpromoted candidates expire after a bounded configurable period proposed during planning. Deletion removes active retrieval immediately and schedules provider/vector hard deletion with durable retry. Audit records retain safe metadata only and never retain deleted raw private content.
-- Reason: Exact legal retention was not provided, so the implementation must be configurable and privacy-minimizing without inventing compliance claims.
+- Default: Confirmed profile/text memories remain until user deletion or supersession. Unpromoted candidates default to 30 days, auto-promoted inferred text to 90 days, pending destructive confirmations to 10 minutes, and safe audit metadata to 180 days; all are typed settings with validation. Deletion removes active retrieval immediately and schedules provider/vector hard deletion with durable retry. Audit records never retain deleted raw private content.
+- Reason: These values create reproducible project behavior without pretending to be legal or production SLA requirements. Deployment-specific retention, encryption-at-rest, backup erasure, export, and hard-delete SLA remain a separate policy decision.
 
 ### P1-05 — Report-mode boundary
 
-- Default: Conversation and report mode share domain contracts and repositories, but the controlled conversation path is the first and mandatory public E2E acceptance path. No duplicate report-only memory runtime may be created.
-- Reason: The user's immediate target is the controlled conversation mainline; shared ownership prevents later divergence.
+- Default: Conversation and report mode share domain contracts and authoritative repositories. This delivery activates, tests, and accepts memory injection only in the controlled conversation path. Report-mode injection and report E2E require a later separately scoped milestone; no duplicate report-only memory runtime may be created.
+- Reason: The user's immediate target is the controlled conversation mainline. Making the deferred runtime boundary explicit prevents the plan from claiming report behavior that it does not verify while shared ownership prevents later divergence.
 
 ### P1-06 — Quality thresholds
 
@@ -85,7 +103,7 @@ The user authorized one complete memory-delivery program and delegated implement
 - The final numeric latency, cache-hit, extraction-precision, promotion-precision, and retrieval-relevance targets are deferred until baselines exist.
 - A user data export format is deferred; inspect/correct/delete/forget remains required.
 - Multi-region Redis/PostgreSQL deployment, production autoscaling, and production disaster recovery are deferred; local/CI Compose reliability and rollback remain required.
-- Full report-mode E2E is deferred unless implementation shows that shared contracts cannot be safely verified through the controlled conversation path.
+- Report-mode memory injection and full report-mode E2E are deferred to a separately scoped milestone; this program verifies only shared contracts/repositories and the controlled-conversation runtime.
 
 ## 5. Required Solution-Tradeoff Questions
 
