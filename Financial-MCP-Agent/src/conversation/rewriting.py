@@ -80,7 +80,7 @@ class RouteAwareRewriter:
                 effective_query=_effective_query(packet.current_message, entities, data_requirements),
                 entity=entity_result.entity,
                 entities=entities,
-                requested_dimensions=_m2_dimensions(data_requirements),
+                requested_dimensions=_evidence_dimensions(data_requirements),
                 data_requirements=data_requirements,
                 constraints=constraints,
                 reply_preference=preference,
@@ -136,7 +136,7 @@ class RouteAwareRewriter:
             effective_query=_effective_query(packet.current_message, entities, requirements),
             entity=entities[0] if entities else None,
             entities=entities,
-            requested_dimensions=_m2_dimensions(requirements),
+            requested_dimensions=_evidence_dimensions(requirements),
             skill_name=skill_name,
             data_requirements=requirements,
             constraints=constraints,
@@ -221,12 +221,34 @@ def _infer_data_requirements(text: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(requirements or ["current_financial_facts"]))
 
 
-def _m2_dimensions(requirements: tuple[str, ...]) -> tuple[EvidenceDimension, ...]:
+def _evidence_dimensions(requirements: tuple[str, ...]) -> tuple[EvidenceDimension, ...]:
     dimensions: list[EvidenceDimension] = []
     if any(item in requirements for item in ("basic_profile", "stock_basic")):
         dimensions.append(EvidenceDimension.BASIC_PROFILE)
-    if any(item in requirements for item in ("market_snapshot", "stock_market")):
+    if any(
+        item in requirements
+        for item in ("market_snapshot", "stock_market", "current_financial_facts")
+    ):
         dimensions.append(EvidenceDimension.MARKET_SNAPSHOT)
+    if any(
+        item in requirements
+        for item in ("financial_indicator", "fundamental_or_valuation")
+    ):
+        dimensions.append(EvidenceDimension.FINANCIAL_INDICATOR)
+    if "fund_basic" in requirements:
+        dimensions.append(EvidenceDimension.FUND_BASIC)
+    if any(item in requirements for item in ("fund_nav_or_market", "fund_nav")):
+        dimensions.append(EvidenceDimension.FUND_NAV)
+    if "fund_market" in requirements:
+        dimensions.append(EvidenceDimension.FUND_MARKET)
+    if "fund_share" in requirements:
+        dimensions.append(EvidenceDimension.FUND_SHARE)
+    if "sector_snapshot" in requirements:
+        dimensions.append(EvidenceDimension.SECTOR_SNAPSHOT)
+    if "sector_constituents" in requirements:
+        dimensions.append(EvidenceDimension.SECTOR_CONSTITUENTS)
+    if "index_or_sector_context" in requirements or "index_daily" in requirements:
+        dimensions.append(EvidenceDimension.INDEX_DAILY)
     return tuple(dimensions)
 
 

@@ -119,7 +119,7 @@ def test_controlled_chat_vertical_slice_reaches_expected_terminal(case: dict[str
             )
 
         if case["tool_behavior"] == "timeout_market":
-            market_calls = [call for call in tool.calls if call.tool_name == "pro_bar"]
+            market_calls = [call for call in tool.calls if call.tool_name == "get_market_bars"]
             assert len(market_calls) == result.context.budget.max_tool_attempts
             assert result.error_code is ErrorCode.TOOL_TIMEOUT
         elif case["tool_behavior"] == "missing_market":
@@ -240,8 +240,8 @@ def test_low_confidence_skill_route_clarifies_before_tools() -> None:
 
 
 @pytest.mark.e2e
-def test_m3_sop_understanding_stops_before_unmigrated_execution() -> None:
-    """确认高置信 SOP 已生成 Rewrite，但不会冒充 M4/M5 执行完成。"""
+def test_m4_sop_runs_validated_tools_before_baseline_evidence_stages() -> None:
+    """确认高置信 SOP 只执行权限快照内的 Validated Plan。"""
 
     async def run_case() -> None:
         model = FakeModelProvider()
@@ -265,16 +265,26 @@ def test_m3_sop_understanding_stops_before_unmigrated_execution() -> None:
             )
         )
 
-        assert result.status is TerminalStatus.UNSUPPORTED
+        assert result.status is TerminalStatus.SUCCEEDED
         assert result.route is not None and result.route.skill_name == "stock-first-pass"
-        assert result.tool_call_count == 0
-        assert model.calls == []
-        assert tool.calls == []
+        assert result.tool_call_count == 3
+        assert len(model.calls) == 1
+        assert {call.tool_name for call in tool.calls} == {
+            "get_stock_basic_info",
+            "get_market_bars",
+            "get_fina_indicator",
+        }
         assert [event.stage.value for event in trace.events] == [
             "context",
             "entity_resolution",
             "route",
             "rewrite",
+            "permission",
+            "plan",
+            "validate",
+            "execute",
+            "verify",
+            "controller",
             "synthesis",
             "termination",
         ]

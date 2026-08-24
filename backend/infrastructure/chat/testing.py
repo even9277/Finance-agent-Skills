@@ -47,7 +47,7 @@ class FakeToolProvider:
     async def execute(self, call: ToolCall) -> ToolObservation:
         """按固定模式返回与当前只读工具意图一致的结果。"""
         self.calls.append(call)
-        if self.behavior == "timeout_market" and call.tool_name == "pro_bar":
+        if self.behavior == "timeout_market" and call.tool_name == "get_market_bars":
             raise ToolTimeoutError("fixture timeout")
 
         if call.evidence_dimension is EvidenceDimension.BASIC_PROFILE:

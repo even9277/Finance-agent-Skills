@@ -35,12 +35,13 @@ from .control import RuleController
 from .entity import AuthoritativeEntityResolver
 from .errors import StepBudgetExceededError
 from .execution import ControlledExecutor
-from .permissions import DeterministicPermissionResolver
-from .planning import DeterministicPlanner
+from .permissions import ControlledPermissionResolver
+from .planning import ControlledPlanner
 from .ports import ModelPort, ToolPort, TraceSink
 from .rewriting import RouteAwareRewriter
 from .routing import TwoStageRouter
 from .synthesis import ControlledSynthesizer
+from .tool_governance import ToolGovernanceCatalog
 from .validation import PlanValidator
 from .verification import EvidenceVerifier
 
@@ -55,8 +56,8 @@ class _WorkflowServices:
     entity: AuthoritativeEntityResolver
     router: TwoStageRouter
     rewriter: RouteAwareRewriter
-    permissions: DeterministicPermissionResolver
-    planner: DeterministicPlanner
+    permissions: ControlledPermissionResolver
+    planner: ControlledPlanner
     validator: PlanValidator
     executor: ControlledExecutor
     verifier: EvidenceVerifier
@@ -79,13 +80,17 @@ class ControlledConversationWorkflow:
         self._trace = trace
         self._budget = budget or RunBudget()
         catalog = skill_catalog or SkillCatalogSnapshot.empty()
+        tool_catalog = ToolGovernanceCatalog.default()
         self._services = _WorkflowServices(
             context=ContextBuilder(),
             entity=AuthoritativeEntityResolver(),
             router=TwoStageRouter(catalog),
             rewriter=RouteAwareRewriter(catalog),
-            permissions=DeterministicPermissionResolver(),
-            planner=DeterministicPlanner(),
+            permissions=ControlledPermissionResolver(
+                catalog=tool_catalog,
+                skill_catalog=catalog,
+            ),
+            planner=ControlledPlanner(catalog=tool_catalog),
             validator=PlanValidator(),
             executor=ControlledExecutor(tool),
             verifier=EvidenceVerifier(),
@@ -301,27 +306,7 @@ class ControlledConversationWorkflow:
                     route=route,
                 )
 
-            if route.family is RouteFamily.FINANCIAL_SOP:
-                state.transition(RunPhase.SYNTHESIZING)
-                state.terminate(TerminalStatus.UNSUPPORTED)
-                self._emit(
-                    events,
-                    context,
-                    StageName.SYNTHESIS,
-                    StageStatus.SKIPPED,
-                    time.perf_counter(),
-                )
-                self._emit_terminal(events, context, TerminalStatus.UNSUPPORTED, None)
-                return ConversationResult(
-                    status=TerminalStatus.UNSUPPORTED,
-                    reply="专业 Skill 的理解合同已生成；其执行与证据链将在后续里程碑接入。",
-                    context=context,
-                    events=tuple(events),
-                    entity=rewrite.entity,
-                    route=route,
-                )
-
-            if rewrite.entity is None:
+            if rewrite.entity is None and route.family is RouteFamily.TUSHARE_DATA:
                 return self._failed_result(
                     state=state,
                     events=events,
@@ -346,7 +331,11 @@ class ControlledConversationWorkflow:
             )
 
             started = time.perf_counter()
-            plan = self._services.planner.plan(rewrite.entity, rewrite.requested_dimensions)
+            plan = self._services.planner.plan(
+                rewrite,
+                permissions,
+                trace_id=context.trace_id,
+            )
             state.transition(RunPhase.PLANNED)
             self._emit(
                 events,
@@ -361,7 +350,11 @@ class ControlledConversationWorkflow:
             )
 
             started = time.perf_counter()
-            validation = self._services.validator.validate(plan, permissions)
+            validation = self._services.validator.validate(
+                plan,
+                permissions,
+                budget=context.budget,
+            )
             state.transition(RunPhase.VALIDATED)
             self._emit(
                 events,
@@ -400,15 +393,53 @@ class ControlledConversationWorkflow:
                 started,
                 attributes=(
                     EventAttribute(key="tool_call_count", value=execution.tool_call_count),
+                    EventAttribute(key="batch_count", value=execution.batch_count),
+                    EventAttribute(key="failed_count", value=execution.failed_count),
+                    EventAttribute(
+                        key="deduplicated_count",
+                        value=execution.deduplicated_count,
+                    ),
                 ),
             )
+
+            if rewrite.entity is None:
+                state.transition(RunPhase.VERIFIED)
+                self._emit(
+                    events,
+                    context,
+                    StageName.VERIFY,
+                    StageStatus.SKIPPED,
+                    time.perf_counter(),
+                    attributes=(EventAttribute(key="reason", value="entityless_m5_pending"),),
+                )
+                state.transition(RunPhase.SYNTHESIZING)
+                self._emit(
+                    events,
+                    context,
+                    StageName.SYNTHESIS,
+                    StageStatus.SKIPPED,
+                    time.perf_counter(),
+                )
+                state.terminate(TerminalStatus.UNSUPPORTED)
+                self._emit_terminal(events, context, TerminalStatus.UNSUPPORTED, None)
+                return ConversationResult(
+                    status=TerminalStatus.UNSUPPORTED,
+                    reply="工具计划已受控执行；无主实体证据的验收与总结将在后续里程碑接入。",
+                    context=context,
+                    events=tuple(events),
+                    route=route,
+                    plan=plan,
+                    tool_call_count=execution.tool_call_count,
+                )
 
             started = time.perf_counter()
             state.transition(RunPhase.VERIFIED)
             verification = self._services.verifier.verify(
                 entity=rewrite.entity,
                 observations=execution.observations,
-                required_dimensions=rewrite.requested_dimensions,
+                required_dimensions=tuple(
+                    item.dimension for item in plan.requirements if item.required
+                ),
             )
             self._emit(
                 events,
