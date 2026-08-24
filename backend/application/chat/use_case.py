@@ -60,6 +60,7 @@ class ControlledChatUseCase:
             status=result.status,
             error_code=result.error_code,
             memory_profile=prepared.memory_profile,
+            working_state=prepared.working_state,
             context_window=context_window,
             workflow_result=result,
         )

@@ -12,6 +12,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    ForeignKeyConstraint,
     Integer,
     JSON,
     String,
@@ -285,4 +286,349 @@ class StmCompactionTask(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     started_at: Mapped[datetime | None] = mapped_column(DateTime)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+# ------------------------------ 记忆权威存储 v1 ------------------------------
+# 下列表由 Alembic 管理；应用启动的 legacy create_all 不直接创建它们。
+ALEMBIC_MANAGED_TABLE_NAMES = frozenset(
+    {
+        "memory_working_states",
+        "memory_state_events",
+        "memory_summary_metadata",
+        "memory_records",
+        "memory_candidates",
+        "memory_audit_events",
+        "memory_outbox_tasks",
+        "memory_provider_references",
+    }
+)
+
+
+class MemoryWorkingStateRow(Base):
+    """持久化每个会话唯一的版本化 Working State 快照。"""
+
+    __tablename__ = "memory_working_states"
+
+    session_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    schema_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    state_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    active_entity: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    candidate_entities: Mapped[list[dict[str, object]]] = mapped_column(
+        JSON,
+        nullable=False,
+        default=list,
+    )
+    constraints: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    reply_preference_hint: Mapped[str] = mapped_column(String(220), nullable=False, default="")
+    scope: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_message_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("messages.id", ondelete="SET NULL"),
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=_now,
+        onupdate=_now,
+        nullable=False,
+    )
+
+
+class MemoryStateEventRow(Base):
+    """保存 Working State 的字段级审计事件。"""
+
+    __tablename__ = "memory_state_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    message_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("messages.id", ondelete="SET NULL"),
+    )
+    field_name: Mapped[str] = mapped_column(String(40), nullable=False)
+    operation: Mapped[str] = mapped_column(String(24), nullable=False)
+    old_value: Mapped[dict[str, object] | list[object] | str | None] = mapped_column(JSON)
+    new_value: Mapped[dict[str, object] | list[object] | str | None] = mapped_column(JSON)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
+    state_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    trace_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now, nullable=False)
+
+
+class MemorySummaryMetadataRow(Base):
+    """保存 Rolling Summary 的版本、来源边界和生成状态。"""
+
+    __tablename__ = "memory_summary_metadata"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    summary_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("session_summaries.id", ondelete="SET NULL"),
+    )
+    summary_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, index=True)
+    source_start_message_id: Mapped[int | None] = mapped_column(Integer)
+    source_end_message_id: Mapped[int | None] = mapped_column(Integer)
+    source_message_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    input_token_estimate: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    output_token_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    prompt_version: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    schema_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "session_id",
+            "summary_version",
+            name="uq_memory_summary_session_version",
+        ),
+    )
+
+
+class MemoryRecordRow(Base):
+    """保存用户可检查、可版本化和可删除的权威长期记忆。"""
+
+    __tablename__ = "memory_records"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    category: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    profile_field: Mapped[str | None] = mapped_column(String(40))
+    value_json: Mapped[str | float | list[str] | None] = mapped_column(JSON)
+    content: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, index=True)
+    scope: Mapped[str] = mapped_column(String(32), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    evidence_ref: Mapped[str | None] = mapped_column(String(255))
+    policy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    activation_source: Mapped[str] = mapped_column(String(32), nullable=False)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, index=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=_now,
+        onupdate=_now,
+        nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "id",
+            "user_id",
+            name="uq_memory_record_id_user",
+        ),
+    )
+
+
+class MemoryCandidateRow(Base):
+    """保存尚未取得权威效力的记忆候选和治理元数据。"""
+
+    __tablename__ = "memory_candidates"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    category: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    profile_field: Mapped[str | None] = mapped_column(String(40))
+    value_json: Mapped[str | float | list[str] | None] = mapped_column(JSON)
+    content: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    evidence_ref: Mapped[str | None] = mapped_column(String(255))
+    fingerprint: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(160), nullable=False)
+    conflict_group_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    policy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, index=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    reviewed_by: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=_now,
+        onupdate=_now,
+        nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "id",
+            "user_id",
+            name="uq_memory_candidate_id_user",
+        ),
+        UniqueConstraint(
+            "user_id",
+            "idempotency_key",
+            name="uq_memory_candidate_user_idempotency",
+        ),
+    )
+
+
+class MemoryAuditEventRow(Base):
+    """保存权威记录和候选生命周期的安全审计元数据。"""
+
+    __tablename__ = "memory_audit_events"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    record_id: Mapped[str | None] = mapped_column(
+        String(64),
+        index=True,
+    )
+    candidate_id: Mapped[str | None] = mapped_column(
+        String(64),
+        index=True,
+    )
+    action: Mapped[str] = mapped_column(String(40), nullable=False)
+    actor: Mapped[str] = mapped_column(String(32), nullable=False)
+    before_status: Mapped[str | None] = mapped_column(String(32))
+    after_status: Mapped[str | None] = mapped_column(String(32))
+    reason_code: Mapped[str | None] = mapped_column(String(64))
+    trace_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now, nullable=False)
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["record_id", "user_id"],
+            ["memory_records.id", "memory_records.user_id"],
+            name="fk_memory_audit_record_owner",
+        ),
+        ForeignKeyConstraint(
+            ["candidate_id", "user_id"],
+            ["memory_candidates.id", "memory_candidates.user_id"],
+            name="fk_memory_audit_candidate_owner",
+        ),
+    )
+
+
+class MemoryOutboxTaskRow(Base):
+    """保存与业务状态同事务提交的幂等后台任务。"""
+
+    __tablename__ = "memory_outbox_tasks"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    session_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        index=True,
+    )
+    aggregate_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    aggregate_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    task_kind: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+    payload_json: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(180), nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    trace_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    available_at: Mapped[datetime] = mapped_column(DateTime, default=_now, nullable=False)
+    lease_owner: Mapped[str | None] = mapped_column(String(64))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime)
+    last_error_code: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=_now,
+        onupdate=_now,
+        nullable=False,
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "idempotency_key",
+            name="uq_memory_outbox_user_idempotency",
+        ),
+    )
+
+
+class MemoryProviderReferenceRow(Base):
+    """保存权威记忆到外部派生索引的版本化映射。"""
+
+    __tablename__ = "memory_provider_references"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    memory_record_id: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        index=True,
+    )
+    provider: Mapped[str] = mapped_column(String(40), nullable=False)
+    provider_record_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    memory_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    schema_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    last_synced_at: Mapped[datetime | None] = mapped_column(DateTime)
+    last_error_code: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=_now,
+        onupdate=_now,
+        nullable=False,
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["memory_record_id", "user_id"],
+            ["memory_records.id", "memory_records.user_id"],
+            name="fk_memory_provider_record_owner",
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint(
+            "user_id",
+            "provider",
+            "provider_record_id",
+            name="uq_memory_provider_user_record",
+        ),
+    )
 

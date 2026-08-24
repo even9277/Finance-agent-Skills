@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.application.chat.contracts import (
@@ -16,14 +16,23 @@ from backend.application.chat.contracts import (
     ChatSummaryRecord,
     PreparedChatTurn,
 )
+from backend.application.memory.ports import TransactionalMemoryRepository
 from backend.config import settings
 from backend.db.models import Message, Session, SessionSummary, UserInvestProfile
+from backend.infrastructure.memory.repository import SqlAlchemyMemoryRepository
 from backend.services.stm_context_service import (
     build_context_window_payload,
     refresh_session_context_metrics,
 )
 from backend.services.token_counter import count_message_tokens
 from src.conversation.contracts import ConversationRequest, ConversationResult
+from src.memory.contracts import (
+    NewOutboxTask,
+    OutboxTaskKind,
+    TurnCommittedPayload,
+    WorkingState,
+    build_turn_outbox_key,
+)
 
 
 def _context_data(session: Session, *, counting_mode: str | None = None) -> ChatContextWindowData:
@@ -35,9 +44,16 @@ def _context_data(session: Session, *, counting_mode: str | None = None) -> Chat
 class SqlAlchemyConversationRepository:
     """在调用方提供的 AsyncSession 中实现聊天持久化。"""
 
-    def __init__(self, db: AsyncSession) -> None:
+    def __init__(
+        self,
+        db: AsyncSession,
+        memory_repository: TransactionalMemoryRepository | None = None,
+    ) -> None:
         self._db = db
         self._prepared_sessions: dict[str, Session] = {}
+        self._prepared_user_message_ids: dict[str, int] = {}
+        self._prepared_working_states: dict[str, WorkingState] = {}
+        self._memory = memory_repository or SqlAlchemyMemoryRepository(db)
 
     async def prepare_turn(self, command: ChatCommand) -> PreparedChatTurn:
         """隔离用户会话、读取尾窗并暂存当前用户消息。
@@ -48,7 +64,12 @@ class SqlAlchemyConversationRepository:
         Returns:
             包含权威 session_id、裁剪历史和可选画像的输入快照。
         """
-        session = await self._owned_session(command.session_id, command.user_id)
+        # 同一会话的完整轮次串行化，避免首次状态初始化和 turn_count 丢失更新。
+        session = await self._owned_session(
+            command.session_id,
+            command.user_id,
+            lock=True,
+        )
         if session is None:
             session = Session(user_id=command.user_id, mode="chat")
             self._db.add(session)
@@ -62,24 +83,31 @@ class SqlAlchemyConversationRepository:
         )
         recent = list(reversed(list(history_result.scalars().all())))
         token_count, _ = count_message_tokens("user", command.message)
-        self._db.add(
-            Message(
-                session_id=session.id,
-                role="user",
-                content=command.message,
-                token_count=token_count,
-            )
+        user_message = Message(
+            session_id=session.id,
+            role="user",
+            content=command.message,
+            token_count=token_count,
         )
+        self._db.add(user_message)
         if not session.title:
             session.title = command.message[:30]
         await self._db.flush()
+        working_state = await self._memory.load_or_create_working_state(
+            user_id=command.user_id,
+            session_id=session.id,
+            source_message_id=user_message.id,
+        )
         self._prepared_sessions[session.id] = session
+        self._prepared_user_message_ids[session.id] = user_message.id
+        self._prepared_working_states[session.id] = working_state
 
         return PreparedChatTurn(
             session_id=session.id,
             recent_messages=tuple(f"{item.role}: {item.content}" for item in recent),
             running_summary=session.running_summary,
             memory_profile=await self._load_memory_profile(command.user_id),
+            working_state=working_state,
         )
 
     async def save_result(
@@ -95,18 +123,47 @@ class SqlAlchemyConversationRepository:
             raise RuntimeError("prepared chat session is missing")
 
         token_count, _ = count_message_tokens("assistant", result.reply)
-        self._db.add(
-            Message(
+        assistant_message = Message(
+            session_id=session.id,
+            role="assistant",
+            content=result.reply,
+            token_count=token_count,
+        )
+        self._db.add(assistant_message)
+        await self._db.flush()
+        # 使用数据库表达式递增，SQLite 忽略 FOR UPDATE 时也不会发生丢失更新。
+        await self._db.execute(
+            update(Session)
+            .where(Session.id == session.id)
+            .values(
+                turn_count=func.coalesce(Session.turn_count, 0) + 1,
+                updated_at=datetime.now(UTC).replace(tzinfo=None),
+            )
+            .execution_options(synchronize_session=False)
+        )
+        await self._db.refresh(session, attribute_names=("turn_count", "updated_at"))
+        context = await refresh_session_context_metrics(self._db, session)
+        user_message_id = self._prepared_user_message_ids.get(session.id)
+        working_state = self._prepared_working_states.get(session.id)
+        if user_message_id is None or working_state is None:
+            raise RuntimeError("prepared memory transaction context is missing")
+        await self._memory.enqueue_outbox(
+            NewOutboxTask(
+                user_id=request.user_id,
                 session_id=session.id,
-                role="assistant",
-                content=result.reply,
-                token_count=token_count,
+                aggregate_type="chat_turn",
+                aggregate_id=session.id,
+                task_kind=OutboxTaskKind.TURN_COMMITTED,
+                idempotency_key=build_turn_outbox_key(session.id, user_message_id),
+                payload=TurnCommittedPayload(
+                    session_id=session.id,
+                    user_message_id=user_message_id,
+                    assistant_message_id=assistant_message.id,
+                    state_version=working_state.state_version,
+                ),
+                trace_id=result.context.trace_id,
             )
         )
-        session.turn_count = int(session.turn_count or 0) + 1
-        session.updated_at = datetime.now(UTC).replace(tzinfo=None)
-        await self._db.flush()
-        context = await refresh_session_context_metrics(self._db, session)
         return ChatContextWindowData(**context.model_dump())
 
     async def commit(self) -> None:
@@ -198,12 +255,23 @@ class SqlAlchemyConversationRepository:
         await self._db.delete(session)
         return True
 
-    async def _owned_session(self, session_id: str | None, user_id: str) -> Session | None:
+    async def _owned_session(
+        self,
+        session_id: str | None,
+        user_id: str,
+        *,
+        lock: bool = False,
+    ) -> Session | None:
+        """按用户读取会话，并可为前台写事务取得行锁。"""
         if not session_id:
             return None
-        result = await self._db.execute(
-            select(Session).where(Session.id == session_id, Session.user_id == user_id)
+        statement = select(Session).where(
+            Session.id == session_id,
+            Session.user_id == user_id,
         )
+        if lock:
+            statement = statement.with_for_update()
+        result = await self._db.execute(statement)
         return result.scalar_one_or_none()
 
     async def _load_memory_profile(self, user_id: str) -> dict[str, object] | None:

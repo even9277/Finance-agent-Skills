@@ -40,18 +40,28 @@ jobs:
         run: >-
           uv run --locked ruff check
           backend/application/chat backend/infrastructure/chat
+          backend/application/memory backend/infrastructure/memory
+          backend/db/database.py backend/db/migration_runner.py
+          backend/db/models.py backend/migrations
           backend/routers/chat.py backend/schemas/chat.py
           backend/services/stm_compaction_support.py
           Financial-MCP-Agent/src/conversation
+          Financial-MCP-Agent/src/memory/contracts.py
+          Financial-MCP-Agent/src/memory/policy.py
           Financial-MCP-Agent/src/prompts/chat/registry.py
           Financial-MCP-Agent/src/tools/skill_trace.py tests
       - name: Pyright boundary check
         run: >-
           uv run --locked pyright
           backend/application/chat backend/infrastructure/chat
+          backend/application/memory backend/infrastructure/memory
+          backend/db/database.py backend/db/migration_runner.py
+          backend/db/models.py backend/migrations
           backend/routers/chat.py backend/schemas/chat.py
           backend/services/stm_compaction_support.py
           Financial-MCP-Agent/src/conversation
+          Financial-MCP-Agent/src/memory/contracts.py
+          Financial-MCP-Agent/src/memory/policy.py
           Financial-MCP-Agent/src/prompts/chat/registry.py
           Financial-MCP-Agent/src/tools/skill_trace.py tests
       - name: Backend offline tests
@@ -87,15 +97,21 @@ jobs:
         run: npm run build
 
   compose-config:
-    name: Docker Compose configuration
+    name: Docker packaging and Compose configuration
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - name: Create safe Compose env placeholders
         run: touch Financial-MCP-Agent/.env backend/.env
       - name: Validate Compose file
         run: docker compose -f docker/docker-compose.yml config --quiet
+      - name: Build production backend image
+        run: docker build -f docker/Dockerfile.backend -t finance-agent-backend-ci:local .
+      - name: Verify production migration dependency
+        run: >-
+          docker run --rm --entrypoint python finance-agent-backend-ci:local
+          -c "import alembic; from backend.db.migration_runner import upgrade_database; print(alembic.__version__)"
 
   offline-compose-e2e:
     name: Offline Compose E2E
