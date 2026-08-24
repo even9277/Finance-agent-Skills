@@ -1,0 +1,32 @@
+{
+  "fixture_version": "legacy-chat-characterization-v1",
+  "cases": [
+    {
+      "case_id": "legacy-route-general-fallback",
+      "message": "你是谁",
+      "conversation_context": "",
+      "expected_skill_family": "fallback",
+      "expected_skill": "fallback",
+      "expected_skill_name": null,
+      "expected_analysis_mode": "general_chat"
+    },
+    {
+      "case_id": "legacy-route-explicit-stock-data",
+      "message": "查询 600519.SH 最新行情",
+      "conversation_context": "",
+      "expected_skill_family": "tushare-data",
+      "expected_skill": "tushare-data",
+      "expected_skill_name": null,
+      "expected_analysis_mode": "single_stock_data"
+    },
+    {
+      "case_id": "legacy-route-etf-follow-up",
+      "message": "是，请查询",
+      "conversation_context": "用户: 能推荐下黄金ETF的基金吗？\n助手: 可以继续查询黄金ETF基金。",
+      "expected_skill_family": "financial-sop",
+      "expected_skill": "financial-sop",
+      "expected_skill_name": "etf-screen",
+      "expected_analysis_mode": "etf_screen"
+    }
+  ]
+}
