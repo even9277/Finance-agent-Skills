@@ -125,9 +125,8 @@ def test_bulk_forget_requires_explicit_confirmation_before_service_call() -> Non
 
 
 @pytest.mark.contract
-@TARGET_GAP
 def test_prepared_turn_exposes_typed_working_state() -> None:
-    """目标合同：Repository 必须把版本化 Working State 交给唯一聊天用例。"""
+    """确认 Repository 合同把版本化 Working State 交给唯一聊天用例。"""
     field_names = {item.name for item in fields(PreparedChatTurn)}
     assert "working_state" in field_names
     working_state_type = get_type_hints(PreparedChatTurn)["working_state"]

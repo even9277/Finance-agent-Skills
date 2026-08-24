@@ -15,6 +15,7 @@ from src.conversation.contracts import (
     TerminalStatus,
     VerificationResult,
 )
+from src.memory.contracts import WorkingState
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +54,7 @@ class PreparedChatTurn:
     recent_messages: tuple[str, ...] = ()
     running_summary: str | None = None
     memory_profile: dict[str, object] | None = None
+    working_state: WorkingState = field(default_factory=WorkingState)
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +66,7 @@ class ChatOutcome:
     status: TerminalStatus
     error_code: ErrorCode | None = None
     memory_profile: dict[str, object] | None = None
+    working_state: WorkingState = field(default_factory=WorkingState)
     context_window: ChatContextWindowData | None = None
     workflow_result: ConversationResult | None = None
 

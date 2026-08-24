@@ -4,6 +4,8 @@ Phase 1: SQLite + aiosqlite
 Phase 生产: 切换 DATABASE_URL 为 postgresql+asyncpg://...
 """
 
+import asyncio
+
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -35,26 +37,36 @@ class Base(DeclarativeBase):
 
 async def init_db() -> None:
     """
-    应用启动时创建所有表（Phase 1/2/3 直接建表，生产环境换 Alembic）。
-    对于已存在的表，通过 try-catch 方式追加 Phase 2/3 新增字段（增量迁移）。
+    启动历史表并通过 Alembic 升级新记忆 Schema。
+
+    历史表仍使用 create_all 和既有补列逻辑保持兼容；memory-v1 表明确排除
+    在 create_all 之外，只能由版本化 Alembic revision 创建。
     """
-    from backend.db import models  # noqa: F401
+    from backend.db import models
+    from backend.db.migration_runner import upgrade_database
 
     async with engine.begin() as conn:
-        # 创建所有新表（已存在的表不会被覆盖）
-        await conn.run_sync(Base.metadata.create_all)
+        legacy_tables = [
+            table
+            for name, table in Base.metadata.tables.items()
+            if name not in models.ALEMBIC_MANAGED_TABLE_NAMES
+        ]
+        await conn.run_sync(Base.metadata.create_all, tables=legacy_tables)
 
     # ── Phase 2/3 增量字段迁移（对已存在的表追加缺失字段）─────
     await _migrate_add_columns()
+    # Alembic 的异步模板内部运行事件循环，因此放入工作线程避免嵌套 asyncio.run。
+    await asyncio.to_thread(upgrade_database, settings.database_url)
 
 
 async def _migrate_add_columns() -> None:
     """
     为已存在的表追加缺失的 Phase 2/3 字段。
-    SQLite 支持 ALTER TABLE ADD COLUMN（不支持 NOT NULL 无默认值的列）。
-    对于已有字段，忽略异常（OperationalError: duplicate column name）。
+
+    先通过 Inspector 判断列是否存在，避免 PostgreSQL 在捕获重复列异常后仍将
+    整笔 DDL 事务标记为失败。真实 DDL 错误不得吞掉，以免启动假成功。
     """
-    from sqlalchemy import text
+    from sqlalchemy import inspect, text
 
     is_sqlite = "sqlite" in settings.database_url
     is_postgres = "postgresql" in settings.database_url
@@ -87,72 +99,65 @@ async def _migrate_add_columns() -> None:
     ]
 
     async with engine.begin() as conn:
+        existing_columns = await conn.run_sync(
+            lambda sync_conn: {
+                table: {
+                    column["name"]
+                    for column in inspect(sync_conn).get_columns(table)
+                }
+                for table in {table for table, _, _ in migrations}
+            }
+        )
         for table, column, col_def in migrations:
-            try:
-                await conn.execute(
-                    text(f"ALTER TABLE {table} ADD COLUMN {column} {col_def}")
-                )
-            except Exception:
-                # 字段已存在时会抛出 OperationalError，直接忽略
-                pass
+            if column in existing_columns[table]:
+                continue
+            dialect_col_def = col_def.replace("DATETIME", "TIMESTAMP") if is_postgres else col_def
+            await conn.execute(
+                text(f"ALTER TABLE {table} ADD COLUMN {column} {dialect_col_def}")
+            )
 
         # ── PostgreSQL 专属：字段类型/默认值对齐（幂等）──────────────
         if is_postgres:
             # 1) risk_level 扩容：支持 balanced_conservative 等值
-            try:
-                await conn.execute(
-                    text(
-                        "ALTER TABLE user_invest_profiles "
-                        "ALTER COLUMN risk_level TYPE VARCHAR(50)"
-                    )
+            await conn.execute(
+                text(
+                    "ALTER TABLE user_invest_profiles "
+                    "ALTER COLUMN risk_level TYPE VARCHAR(50)"
                 )
-            except Exception:
-                pass
+            )
 
             # 2) response_pref / updated_by 可能历史数据为 NULL：补默认，避免后续 NOT NULL 约束爆炸
             #    （即便列允许 NULL，业务也依赖默认值）
-            try:
-                await conn.execute(
-                    text(
-                        "UPDATE user_invest_profiles "
-                        "SET response_pref = 'balanced' "
-                        "WHERE response_pref IS NULL"
-                    )
+            await conn.execute(
+                text(
+                    "UPDATE user_invest_profiles "
+                    "SET response_pref = 'balanced' "
+                    "WHERE response_pref IS NULL"
                 )
-            except Exception:
-                pass
-            try:
-                await conn.execute(
-                    text(
-                        "UPDATE user_invest_profiles "
-                        "SET updated_by = 'system' "
-                        "WHERE updated_by IS NULL"
-                    )
+            )
+            await conn.execute(
+                text(
+                    "UPDATE user_invest_profiles "
+                    "SET updated_by = 'system' "
+                    "WHERE updated_by IS NULL"
                 )
-            except Exception:
-                pass
+            )
 
             # 3) JSON 字段历史数据可能为 NULL：统一为 []
-            try:
-                await conn.execute(
-                    text(
-                        "UPDATE user_invest_profiles "
-                        "SET sectors = '[]'::jsonb "
-                        "WHERE sectors IS NULL"
-                    )
+            await conn.execute(
+                text(
+                    "UPDATE user_invest_profiles "
+                    "SET sectors = '[]'::jsonb "
+                    "WHERE sectors IS NULL"
                 )
-            except Exception:
-                pass
-            try:
-                await conn.execute(
-                    text(
-                        "UPDATE user_invest_profiles "
-                        "SET constraints = '[]'::jsonb "
-                        "WHERE constraints IS NULL"
-                    )
+            )
+            await conn.execute(
+                text(
+                    "UPDATE user_invest_profiles "
+                    "SET constraints = '[]'::jsonb "
+                    "WHERE constraints IS NULL"
                 )
-            except Exception:
-                pass
+            )
 
         # ── SQLite 专属：保持现有逻辑（无额外动作）───────────────────
         if is_sqlite:
