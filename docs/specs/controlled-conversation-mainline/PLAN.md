@@ -559,7 +559,10 @@ Router/WS Presenter
   - Completed: 2026-08-24
   - Evidence: 新增 1 份版本化离线路由 fixture，以及 Router/Executor、Trace、REST/WS、事务提交/失败回滚/跨用户会话隔离的 17 项刻画测试；聚焦测试 `16 passed, 1 xfailed`，仓库默认全量测试 `76 passed, 6 skipped, 4 deselected, 1 xfailed`。
   - Limitation: 严格 `xfail` 登记了当前 WS Router 会把内部异常原文返回客户端；该安全缺陷按冻结计划留到 Milestone 6 修复。现有 Starlette TestClient 与 `datetime.utcnow()` 弃用警告不在本里程碑修改。
-- [ ] Milestone 2: Typed Contracts and Offline Vertical Slice
+- [x] Milestone 2: Typed Contracts and Offline Vertical Slice
+  - Completed: 2026-08-24
+  - Evidence: 新增 Typed Contracts、显式状态机、12 阶段单一 Orchestrator、Application Use Case、四类 Fake external Ports 和版本化 Prompt；成功/歧义澄清/工具超时/证据不足均从同一用例到达唯一终态。新增聚焦测试 `25 passed`，仓库默认全量 `91 passed, 6 skipped, 4 deselected, 1 xfailed`，离线 Compose `42 passed, 1 xfailed` 且容器/卷已清理。
+  - Limitation: M2 按冻结范围尚未切换公开 REST/WS，Compose 中公开 `/api/chat/message` 仍验证旧入口；真实 Orchestrator 通过同一容器测试进程的 `test_controlled_chat_chain.py` 验证。全仓旧代码仍有 Ruff/Pyright 存量债务，新 M2 范围自身 Ruff/Pyright 为零问题。
 - [ ] Milestone 3: Entity, Routing, Rewrite, and Skill Discovery Migration
 - [ ] Milestone 4: Planner, Validator, Executor, and Tool Governance Migration
 - [ ] Milestone 5: Evidence, Controller, Replanner, and Synthesis Migration
@@ -586,6 +589,8 @@ Router/WS Presenter
 | 2026-08-24 | M1 仅增加离线 characterization/contract/integration tests 和固定 fixture | 先冻结迁移前可观测行为，不以重构代码改变基线，也不默认访问真实模型或数据源 | PLAN Milestone 1 + small-step protocol |
 | 2026-08-24 | WS 内部错误文本泄露用 `xfail(strict=True)` 登记，留到 M6 修复 | 让当前缺陷持续可见，同时避免在只读行为刻画里程碑越界修改 Router 和公开协议 | Contract test evidence + PLAN Milestone 6 |
 | 2026-08-24 | 用户持续授权每个里程碑执行 Issue、短分支、commit/push、PR、CI/Review 和 Squash Merge | 后续里程碑不再逐次等待相同 GitHub 操作授权，但仍必须逐个里程碑、全门禁通过且禁止部署/生产写 | User explicit authorization |
+| 2026-08-24 | M2 使用 frozen dataclass/StrEnum/Protocol 合同和确定性领域阶段建立纵向基线 | 在不切公开入口、不引入依赖/Schema/旧 Runtime Adapter 的情况下，先证明所有模块能由单一 Orchestrator 执行和回滚 | Issue #7 + M2 implementation |
+| 2026-08-24 | M2 仅在 Model/Tool/Repository/Trace 四个外部 Port 使用 Fake | 防止测试替换核心编排，保证成功、澄清、超时、证据不足都覆盖真实新工作流 | PLAN M2 acceptance |
 
 ## 17. Surprises & Discoveries
 
@@ -605,13 +610,16 @@ Router/WS Presenter
 | WS Router 当前把 `str(exc)` 直接作为 error frame 的 message | 可能暴露数据库、模型或基础设施内部细节 | 用 strict xfail 建立安全回归门；M6 切换公开入口时改为稳定错误码和安全文案 |
 | Chat Service 成功时提交一对 user/assistant 消息；执行异常依赖请求 Session 关闭回滚 | 当前没有写入半轮消息，但事务所有权仍隐含在入口生命周期 | M1 用 SQLite 集成测试冻结；M2/M6 将事务边界纳入 Application contract |
 | M1 全量默认测试通过，但出现 Starlette TestClient 和 `datetime.utcnow()` 弃用警告 | 不阻塞本里程碑，未来依赖/Python 升级可能转为失败 | 记录为独立技术债，不在 characterization 里修改生产代码或依赖 |
+| M2 的新范围 Ruff/Pyright 为零问题，但全仓严格扫描仍存在旧 Agent/Backend 的 Ruff 和 111 个 Pyright 错误 | 不能把新增模块的质量结论夸大为全仓无静态债务，也不能在单里程碑中无关扫修 | M2 报告区分新增范围门禁和全仓存量；M7 扩大 CI 时按受控迁移触及范围逐步收敛 |
+| M2 Compose E2E 在容器内执行了新 Orchestrator 测试，但公开 HTTP 请求仍由旧 offline Chat Service 处理 | 已证明容器环境可运行新链，不等于公开入口已经切换 | M6 切换 REST/WS，M7 移除替换整个 Chat Service 的 offline 装配后再做真正公开全链验收 |
+| Compose 启动旧数据库初始化逻辑会重复执行 `ALTER TABLE` 并在 PostgreSQL 输出事务中止错误，应用仍健康且测试通过 | 暴露既有初始化幂等性/日志噪声问题，不属于 M2 新代码 | 记录为基础设施技术债；禁止在 M2 越界改 Schema 初始化 |
 
 ## 18. Outcomes & Retrospective
 
-- **What changed:** M0 完成安全基线；M1 在不修改生产行为的前提下新增版本化离线路由案例和 Router/Executor、Trace、REST/WS、持久化边界测试，并建立 GitHub Issue #3 与独立短分支的追踪关系。
-- **What was verified:** 当前规则路由和模型异常降级、Executor 禁用/失败归一化/顺序、根 Trace 与工具失败脱敏、REST/WS 帧合同、成功提交、失败回滚和跨用户隔离都有可重复的离线证据。全量默认测试为 `76 passed, 6 skipped, 4 deselected, 1 xfailed`；此前显式授权的真实模型/Tushare/旧 HTTP 主链证据仍见 `LIVE_VALIDATION_REPORT.md`。
-- **What remains risky:** 新受控主链尚未实现；WS 仍泄露内部异常原文；事务所有权仍隐含；当前基础设施改动尚未提交；锁文件缺少 SOCKS 支持；Windows GBK 启动输出失败；现有弃用警告未处理。M1 的离线测试不代表新主链的真实模型质量。
-- **What should be improved next:** M2 只建立 Typed Contracts 和 600519.SH 的 Fake external Ports 离线纵向切片，保持公开 REST/WS 不切换；新实现必须让状态、阶段、错误、终止和 Trace 合同显式化。
+- **What changed:** M0/M1 已冻结安全和旧行为基线；M2 在最终目录新增强类型合同、显式状态机、全部受控阶段的确定性最小实现、单一 Orchestrator、Application Use Case、版本化 Prompt 和 Fake external Ports。每个阶段已是可执行代码，不是占位空壳。
+- **What was verified:** 贵州茅台 `600519.SH` 成功链精确经过 12 个阶段并调用 2 个只读工具；“平安现在能买吗”在工具调用前澄清；市场工具超时按 2 次尝试有限停止并返回 PARTIAL；缺失行情证据返回 PARTIAL；步骤预算和 Trace exporter 故障均有限收口。全量默认测试为 `91 passed, 6 skipped, 4 deselected, 1 xfailed`，Compose 为 `42 passed, 1 xfailed`。
+- **What remains risky:** 公开 REST/WS 仍未接新 Use Case；M2 的 Entity/Route/Planner/Verifier 是用于冻结合同的确定性基线，尚未迁入历史有效复杂规则；真实 Model/Tushare adapter、数据库 Repository 和生产 Trace adapter 尚未实现。旧 WS 泄露、全仓静态债务、数据库初始化噪声和弃用警告仍存在。
+- **What should be improved next:** M3 只迁移工具调用前的实体解析、两阶段路由、三路 rewrite、约束/回答偏好和 Skill discovery；用离线 eval 证明规则来源，且继续不切公开 REST/WS。
 
 ## 19. Deferred Work
 
@@ -627,6 +635,6 @@ Router/WS Presenter
 
 ## 20. Handoff to Small-step Implementation
 
-Milestone 1 已完成。下一步只能执行 **Milestone 2: Typed Contracts and Offline Vertical Slice**。
+Milestone 2 已完成。下一步只能执行 **Milestone 3: Entity, Routing, Rewrite, and Skill Discovery Migration**。
 
-执行者必须继续保护当前未提交基础设施改动，只在 PLAN 为 M2 允许的 `src/conversation`、必要测试/fixture 和里程碑治理文档内工作。M2 不切换公开 REST/WS 入口、不读取历史 `Finance` 代码作为运行时依赖、不新增依赖或数据库 Schema；先用 Fake Model/Tool/Memory Ports 跑通 600519.SH 的 typed offline vertical slice，完成后提交合同示例、阶段 Trace、类型检查、测试结果和残余风险。
+执行者必须从已合并的 M2 Typed Contracts 和确定性纵向基线开始，只迁移工具调用前的受控理解链。先读取当前目标仓库 Router/Skill Registry 和历史只读证据，建立规则来源及 bad-case 清单，再以测试/eval 先行方式实现实体继承与歧义、两阶段路由、结构化 rewrite、窄约束/回答偏好抽取和 Skill snapshot。M3 不切换公开 REST/WS、不迁移执行/证据/总结复杂逻辑、不新增依赖/Schema/兼容 Adapter；完成后必须保留 M2 四路径全链回归并提交迁移规则、评测结果和未迁移说明。
