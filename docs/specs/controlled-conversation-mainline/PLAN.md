@@ -571,7 +571,10 @@ Router/WS Presenter
   - Completed: 2026-08-24
   - Evidence: 新增只读工具治理目录、冻结权限快照、强类型计划参数、DAG 校验和有界执行器；M4 focused `42 passed`，默认全量 `108 passed, 3 skipped, 4 deselected, 1 xfailed`，离线 Compose `56 passed, 1 xfailed` 且容器/网络/卷已清理。
   - Limitation: 公开 REST/WS 尚未切换；M4 仍使用 M2 的 Evidence/Controller/Synthesis 基线，实体缺失的 SOP 会在工具执行后诚实返回 `UNSUPPORTED`；真实 LLM/Tushare 尚未调用。
-- [ ] Milestone 5: Evidence, Controller, Replanner, and Synthesis Migration
+- [x] Milestone 5: Evidence, Controller, Replanner, and Synthesis Migration
+  - Completed: 2026-08-24
+  - Evidence: 新增统一 Evidence Envelope、五维验收评分、稳定拒绝码、required/optional 与逐实体 coverage、有界备用工具补证、accepted-only AnswerContextPack 和 `chat-synthesis-v2`；M5 focused `26 passed`，默认全量 `116 passed, 2 skipped, 4 deselected, 1 xfailed`，离线 Compose `63 passed, 1 xfailed` 且资源已清理。
+  - Limitation: 公开 REST/WS 仍未切换；真实 Model/Tushare adapter 和 Live E2E 尚未验收；Skill 级细化 degrade policy 当前由统一 claim-level 边界表达，后续不得把历史指标当成当前测量值。
 - [ ] Milestone 6: Persistence, REST/WebSocket Cutover, and Legacy Removal
 - [ ] Milestone 7: Observability, Eval, CI, and Real Compose E2E Closure
 - [ ] Milestone 8: Verification, Narrow Fixes, Documentation, and Handoff
@@ -603,6 +606,9 @@ Router/WS Presenter
 | 2026-08-24 | M4 用静态版本化 Tool Governance Catalog 与 Skill 执行白名单求交，生成请求级冻结权限快照 | 工具 Schema、只读属性和权限来源可审计，且不会让 Planner 或 Executor 自行扩大能力 | Issue #11 + M4 contract/eval evidence |
 | 2026-08-24 | Executor 只接受 `ValidatedToolPlan`，按拓扑层执行并在执行边界再次去重 | 从类型和运行时两层禁止未校验计划、越权调用、重复 action 和依赖未满足执行 | M4 unit/E2E evidence |
 | 2026-08-24 | M4 采用确定性 requirement-to-tool 映射，不直接复制历史 scheduler/planner Runtime | 复用历史业务意图但移除 `dict[str, Any]`、Registry 耦合和隐式运行态，保持当前主链为唯一真相源 | Finance comparison + M4 implementation |
+| 2026-08-24 | M5 统一使用 `EvidenceVerifier` 验收主体、时效、维度、角色、质量和冲突，并把 claim level 收敛为 ANALYTICAL/DESCRIPTIVE/REFUSE | 将“工具成功”与“证据可用”解耦，直接映射面试口径且让下游机器可判定 | Issue #13 + interview docs + M5 tests |
+| 2026-08-24 | AnswerContextPack 只携带 accepted facts；rejected evidence 只转成没有事实值的 rejection summary | Synthesis 仍能解释限制，但无法从被拒绝 payload 恢复或引用错误事实 | M5 isolation unit/eval evidence |
+| 2026-08-24 | 有界 Replanner 只补 missing requirement、沿用原权限快照、选择不同 action fingerprint，默认最多一次 | 保留 workflow-style 主链，仅在执行后形成可证明终止的窄反馈环 | M5 controller/replan E2E evidence |
 
 ## 17. Surprises & Discoveries
 
@@ -629,13 +635,15 @@ Router/WS Presenter
 | 本地 `python -m pytest` 与 CI `pytest` 控制台入口的仓库根路径行为不同 | 四个新 eval 在首轮 Linux CI 无法导入 `tests.evals.runner`，业务断言尚未执行 | eval 测试显式注入 `PROJECT_ROOT`，并在本地增加与 CI 完全一致的命令复验；不降低 CI 规则 |
 | M4 前 planner/executor eval 通过跳过不存在的历史模块而显示为 skip | 评测门禁没有实际运行受控 Planner/Executor | 重写为直接执行 `ControlledPlanner`、`PlanValidator` 和 `BoundedToolExecutor`；eval-smoke 从 6 passed/4 skipped 收敛为 9 passed/1 skipped |
 | 工程文档引用 `observability-standard.md`，仓库实际文件为 `observability.md` | 自动导航和新手查找可能混淆，但不影响运行时 | 本里程碑读取并遵循实际文档；记录为文档命名债务，不越界新增重复真相源 |
+| M5 前 Verifier eval 依赖不存在的历史 `src.agents.verifier` 并整体 skip，Synthesis eval 只检查静态 prediction | 证据与总结门禁没有执行目标主链实现 | 两套 eval 都改为实际执行 M5 Verifier/Synthesizer；eval-smoke 达到 `10 passed`、无 M5 skip |
+| 最小 Tushare 权限快照原本只含首选行情工具，无法在不越权的前提下证明备用工具补证 | Controller 即使决定 replan 也没有安全新动作 | 仅对股票行情需求把治理内 `get_daily_bars` 作为备用权限候选；首轮 Planner 仍选 `get_market_bars`，Replanner 才可使用备用项 |
 
 ## 18. Outcomes & Retrospective
 
-- **What changed:** M0/M1 已冻结安全和旧行为基线；M2 建立 Typed Contracts 和完整离线纵向基线；M3 完成理解链；M4 已把版本化只读工具目录、冻结权限快照、强类型计划、DAG 校验和有界执行接入同一 Workflow。
-- **What was verified:** 权限、Schema、非法/循环 DAG、预算、去重、依赖、超时、瞬时/永久失败和批次并发均有离线证据。全量默认测试为 `108 passed, 3 skipped, 4 deselected, 1 xfailed`，Compose 为 `56 passed, 1 xfailed`。
-- **What remains risky:** 公开 REST/WS 未切换；M5 的 Evidence/Controller/Replanner/Synthesis 仍为 M2 单实体基线，M4 真实 Provider adapter 尚未闭环。旧 WS 泄露、全仓静态债务、数据库初始化噪声和弃用警告仍存在。
-- **What should be improved next:** M5 只迁移 Evidence、Verifier、Controller、有界补证和 Synthesis，证明证据不足不强答、重试/补证有限终止；不得提前切公开入口或加入 Live 调用。
+- **What changed:** M0/M1 冻结基线；M2 建立 Typed Contracts；M3 完成理解链；M4 完成受控工具执行；M5 已把统一 Evidence、Verifier、Controller、有界 Replanner 和 accepted-only Synthesis 接入同一 Workflow。
+- **What was verified:** 空结果、错主体、过期、冲突、缺维度、逐实体 requirement、一次备用工具补证、无新增信息降级和 rejected facts 隔离均有离线证据。全量默认测试为 `116 passed, 2 skipped, 4 deselected, 1 xfailed`，Compose 为 `63 passed, 1 xfailed`。
+- **What remains risky:** 公开 REST/WS 尚未切换，因此用户入口仍使用旧 Chat Service；真实 Provider/Repository/Trace adapter、旧编排删除和受保护 Live E2E 尚未闭环。旧 WS 泄露、数据库初始化噪声与弃用警告仍存在。
+- **What should be improved next:** M6 同时切换 REST/WS 到单一 Chat Use Case，收拢事务与事件映射并删除被替代旧编排；不得保留兼容壳或长期双轨。
 
 ## 19. Deferred Work
 
@@ -651,6 +659,6 @@ Router/WS Presenter
 
 ## 20. Handoff to Small-step Implementation
 
-Milestone 4 已完成本地实现和全部离线/Compose 验收，待完成 Issue #11 的 commit、PR、CI、Review 和 squash merge 后交接。
+Milestone 5 已完成本地实现和全部离线/Compose 验收，待完成 Issue #13 的 commit、PR、CI、Review 和 squash merge 后交接。
 
-下一个执行单元仅为 Milestone 5：Evidence、Controller、Replanner 和 Synthesis。开始前必须从最新 `main` 创建新 Issue 和短分支，保持公开 REST/WS、Schema、依赖与真实外部服务不变；先写空证据、错实体、过期、冲突、缺维度、有限终止和未验收证据隔离测试，再迁移实现。
+下一个执行单元仅为 Milestone 6：Persistence、REST/WebSocket Cutover 和 Legacy Removal。开始前必须从最新 `main` 创建新 Issue 和短分支；先重新确认旧入口调用方、事务边界和 WS 帧合同，再一次性切换同步/流式入口并删除被替代编排，不保留转发壳或永久开关。

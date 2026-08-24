@@ -1,4 +1,4 @@
-"""M2 离线验收使用的外部 Port 确定性实现。"""
+"""受控对话离线验收使用的外部 Port 确定性实现。"""
 
 from __future__ import annotations
 
@@ -29,7 +29,8 @@ class FakeModelProvider:
         self.calls.append(request)
         entity = request.context.entity
         sources = sorted({item.source for item in request.context.accepted_evidence})
-        return f"{entity.symbol}（{entity.name}）的离线只读证据来自：{'、'.join(sources)}。"
+        subject = f"{entity.symbol}（{entity.name}）" if entity is not None else "当前主题"
+        return f"{subject}的离线只读证据来自：{'、'.join(sources)}。"
 
 
 @dataclass(slots=True)
@@ -40,7 +41,12 @@ class FakeToolProvider:
     calls: list[ToolCall] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        allowed = {"success", "timeout_market", "missing_market"}
+        allowed = {
+            "success",
+            "timeout_market",
+            "missing_market",
+            "recover_market_with_alternative",
+        }
         if self.behavior not in allowed:
             raise ContractViolationError("unsupported fake tool behavior")
 
@@ -55,12 +61,15 @@ class FakeToolProvider:
                 EvidenceFact(key="name", value="贵州茅台"),
                 EvidenceFact(key="industry", value="白酒"),
             )
-        elif self.behavior == "missing_market":
+        elif self.behavior == "missing_market" or (
+            self.behavior == "recover_market_with_alternative"
+            and call.tool_name == "get_market_bars"
+        ):
             facts = ()
         else:
             facts = (
                 EvidenceFact(key="close", value="1688.00", unit="CNY"),
-                EvidenceFact(key="trade_date", value="2026-08-24"),
+                EvidenceFact(key="trade_date", value=date.today().isoformat()),
             )
         return ToolObservation(
             step_id=call.step_id,
@@ -69,7 +78,7 @@ class FakeToolProvider:
             evidence_dimension=call.evidence_dimension,
             facts=facts,
             source=f"fixture:{call.tool_name}:v1",
-            observed_at=date(2026, 8, 24),
+            observed_at=date.today(),
             attempts=1,
         )
 

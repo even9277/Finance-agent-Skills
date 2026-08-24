@@ -37,7 +37,8 @@ _DEFAULT_LIMITS = {
 }
 
 
-def _fingerprint(tool_name: str, arguments: tuple[ToolArgument, ...]) -> str:
+def tool_action_fingerprint(tool_name: str, arguments: tuple[ToolArgument, ...]) -> str:
+    """为规范化只读工具动作生成稳定去重指纹。"""
     payload = json.dumps(
         {item.name: item.value for item in arguments},
         ensure_ascii=False,
@@ -65,13 +66,14 @@ def _subjects_for_tool(
     return (None,)
 
 
-def _arguments(
+def build_tool_arguments(
     *,
     tool_name: str,
     entity: Entity | None,
     query: str,
     catalog: ToolGovernanceCatalog,
 ) -> tuple[ToolArgument, ...]:
+    """按治理 Schema 为首轮计划或补证计划构造参数。"""
     fields = {item.name for item in catalog.require(tool_name).input_fields}
     values: list[ToolArgument] = []
     if entity is not None and entity.entity_type.value == "sector" and "sector_name" in fields:
@@ -124,7 +126,7 @@ class ControlledPlanner:
         for tool_name in selected_tools:
             policy = permissions.require(tool_name)
             for entity in _subjects_for_tool(rewrite, tool_name, self._catalog):
-                arguments = _arguments(
+                arguments = build_tool_arguments(
                     tool_name=tool_name,
                     entity=entity,
                     query=rewrite.effective_query,
@@ -140,13 +142,17 @@ class ControlledPlanner:
                         evidence_dimension=policy.evidence_dimension,
                         required=True,
                         arguments=arguments,
-                        idempotency_key=_fingerprint(tool_name, arguments),
+                        idempotency_key=tool_action_fingerprint(tool_name, arguments),
                     )
                 )
 
-        dimensions = tuple(dict.fromkeys(step.evidence_dimension for step in steps))
         requirements = tuple(
-            EvidenceRequirement(dimension=dimension, required=True) for dimension in dimensions
+            EvidenceRequirement(
+                dimension=step.evidence_dimension,
+                required=step.required,
+                entity_symbol=step.symbol or None,
+            )
+            for step in steps
         )
         route_family = (
             RouteFamily.FINANCIAL_SOP

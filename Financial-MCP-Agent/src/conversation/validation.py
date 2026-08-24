@@ -112,9 +112,20 @@ class PlanValidator:
                 )
             )
 
-        covered = {step.evidence_dimension for step in plan.steps}
+        covered = {
+            (step.evidence_dimension, step.symbol or None)
+            for step in plan.steps
+        }
         for requirement in plan.requirements:
-            if requirement.required and requirement.dimension not in covered:
+            key = (requirement.dimension, requirement.entity_symbol)
+            dimension_covered = any(
+                dimension is requirement.dimension for dimension, _ in covered
+            )
+            if requirement.required and (
+                key not in covered
+                if requirement.entity_symbol is not None
+                else not dimension_covered
+            ):
                 issues.append(
                     self._issue(
                         ValidationIssueCode.MISSING_REQUIRED_EVIDENCE,

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from src.prompts.chat.registry import SYNTHESIS_PROMPT_VERSION, load_synthesis_prompt
 
-from .contracts import AnswerContextPack, ModelSynthesisRequest, TerminalStatus
+from .contracts import AnswerContextPack, ClaimLevel, ModelSynthesisRequest, TerminalStatus
+from .errors import ContractViolationError
 from .ports import ModelPort
 
 
@@ -23,6 +24,10 @@ class ControlledSynthesizer:
         Returns:
             对部分结果明确标注缺失维度的安全回答。
         """
+        if pack.rejected_evidence:
+            raise ContractViolationError("synthesis context must not contain rejected evidence")
+        if pack.claim_level is ClaimLevel.REFUSE:
+            raise ContractViolationError("refused evidence cannot enter model synthesis")
         model_reply = (
             await self._model.synthesize(
                 ModelSynthesisRequest(

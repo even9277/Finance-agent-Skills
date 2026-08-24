@@ -1,57 +1,96 @@
 from __future__ import annotations
 
-import asyncio
-import json
 import sys
+from datetime import date
 from pathlib import Path
-from typing import Any
 
 import pytest
 
-sys.path.insert(0, str(Path("Financial-MCP-Agent").resolve()))
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+AGENT_ROOT = PROJECT_ROOT / "Financial-MCP-Agent"
+for path in (PROJECT_ROOT, AGENT_ROOT):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
 
-from importlib.util import find_spec
-
-pytestmark = pytest.mark.skipif(
-    find_spec("src.agents.verifier") is None,
-    reason="依赖受控主链 verifier 模块，待 M2 迁移后自动启用",
+from src.conversation.contracts import (  # noqa: E402
+    ConstraintSet,
+    Entity,
+    EntityType,
+    EvidenceDimension,
+    EvidenceFact,
+    ReplyPreference,
+    SkillCatalogSnapshot,
+    StepStatus,
+    TimeScope,
+    ToolObservation,
+    TushareRewriteResult,
 )
+from src.conversation.permissions import ControlledPermissionResolver  # noqa: E402
+from src.conversation.planning import ControlledPlanner  # noqa: E402
+from src.conversation.tool_governance import ToolGovernanceCatalog  # noqa: E402
+from src.conversation.verification import EvidenceVerifier  # noqa: E402
+from tests.evals.runner import load_jsonl  # noqa: E402
 
 
-def _tool_snapshots() -> dict[str, Any]:
-    return json.loads(Path("tests/evals/_fixtures/tool_snapshots.json").read_text(encoding="utf-8"))
+def _build_plan(message: str):
+    entity = Entity(symbol="600519.SH", name="贵州茅台", entity_type=EntityType.STOCK)
+    rewrite = TushareRewriteResult(
+        effective_query=message,
+        entity=entity,
+        entities=(entity,),
+        requested_dimensions=(
+            EvidenceDimension.BASIC_PROFILE,
+            EvidenceDimension.MARKET_SNAPSHOT,
+        ),
+        data_requirements=("basic_profile", "market_snapshot"),
+        constraints=ConstraintSet(),
+        reply_preference=ReplyPreference(),
+        time_scope=TimeScope.RECENT_5_TRADING_DAYS,
+    )
+    catalog = ToolGovernanceCatalog.default()
+    permissions = ControlledPermissionResolver(
+        catalog=catalog,
+        skill_catalog=SkillCatalogSnapshot.empty(),
+    ).resolve(rewrite)
+    return ControlledPlanner(catalog=catalog).plan(
+        rewrite,
+        permissions,
+        trace_id="verifier-eval",
+    )
 
 
 @pytest.mark.eval_smoke
-def test_verifier_smoke_scores_sufficient_and_partial_cases() -> None:
-    from src.agents.executor.budget import ExecutionBudget
-    from src.agents.executor.execution_scheduler import ExecutionScheduler, StepResult
-    from src.agents.planner.plan_validator import ToolPlanV2
-    from src.agents.verifier.evidence_verifier import EvidenceVerifier
-    from tests.evals.runner import load_jsonl
-
-    executor_rows = {row["case_id"]: row for row in load_jsonl(Path("tests/evals/executor/data/smoke.jsonl"))}
-    verifier_rows = load_jsonl(Path("tests/evals/verifier/data/smoke.jsonl"))
-    snapshots = _tool_snapshots()
-
-    async def run_steps(row: dict[str, Any]) -> tuple[ToolPlanV2, list[StepResult]]:
-        plan_payload = executor_rows[row["plan_ref"]]["plan"]
-        plan = ToolPlanV2.model_validate(plan_payload) if hasattr(ToolPlanV2, "model_validate") else ToolPlanV2.parse_obj(plan_payload)
-
-        async def fake_invoker(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-            return snapshots[row["fixture_key"]][tool_name]
-
-        scheduler = ExecutionScheduler(
-            budget=ExecutionBudget(per_tool_retry_limit=0, min_interval_ms=0, max_concurrency=2, per_api_family_limit=2),
-            tool_invoker=fake_invoker,
+def test_verifier_smoke_executes_controlled_contract() -> None:
+    """执行真实 M5 Verifier，而不是读取静态 prediction 或历史模块。"""
+    rows = load_jsonl(Path("tests/evals/verifier/data/smoke.jsonl"))
+    for row in rows:
+        plan = _build_plan(row["message"])
+        steps = {step.evidence_dimension.value: step for step in plan.steps}
+        observations = tuple(
+            ToolObservation(
+                step_id=steps[item["dimension"]].step_id,
+                tool_name=steps[item["dimension"]].tool_name,
+                symbol=str(item.get("symbol", plan.entity.symbol if plan.entity else "")),
+                evidence_dimension=steps[item["dimension"]].evidence_dimension,
+                facts=tuple(
+                    EvidenceFact(key=str(key), value=str(value))
+                    for key, value in item.get("facts", {}).items()
+                ),
+                source="fixture:verifier:v1",
+                observed_at=date.fromisoformat(item["observed_at"]),
+                attempts=1,
+                status=StepStatus.SUCCEEDED,
+            )
+            for item in row["observations"]
         )
-        batches = await scheduler.run(plan)
-        return plan, [result for batch in batches for result in batch.step_results]
+        result = EvidenceVerifier().verify(
+            plan=plan,
+            observations=observations,
+            as_of=date.fromisoformat(row["as_of"]),
+        )
 
-    verifier = EvidenceVerifier()
-    for row in verifier_rows:
-        plan, step_results = asyncio.run(run_steps(row))
-        result = verifier.verify(plan=plan, step_results=step_results)
-
-        assert result.status == row["gold"]["expected_status"]
-        assert result.allowed_claim_level == row["gold"]["allowed_claim_level"]
+        assert result.claim_level.value == row["gold"]["allowed_claim_level"]
+        assert sorted(item.value for item in result.missing_dimensions) == sorted(
+            row["gold"]["missing_dimensions"]
+        )
+        assert len(result.rejected) == row["gold"]["rejected_count"]

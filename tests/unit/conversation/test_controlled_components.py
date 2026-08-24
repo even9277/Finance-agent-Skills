@@ -1,4 +1,4 @@
-"""验证 M2 确定性阶段的权限、计划和证据门控。"""
+"""验证受控权限、计划和证据门控。"""
 
 from __future__ import annotations
 
@@ -99,15 +99,14 @@ def test_planner_produces_stable_steps_for_requested_dimensions() -> None:
 @pytest.mark.unit
 def test_verifier_rejects_empty_payload_and_reports_missing_dimension() -> None:
     """确认 HTTP 成功但无事实的数据不能成为可用证据。"""
-    entity = Entity(
-        symbol="600519.SH",
-        name="贵州茅台",
-        entity_type=EntityType.STOCK,
-    )
+    plan, _ = _planning_inputs()
+    entity = plan.entity
+    assert entity is not None
+    basic_step, market_step = plan.steps
     observations = (
         ToolObservation(
-            step_id="fetch-basic-profile",
-            tool_name="stock_basic",
+            step_id=basic_step.step_id,
+            tool_name=basic_step.tool_name,
             symbol=entity.symbol,
             evidence_dimension=EvidenceDimension.BASIC_PROFILE,
             facts=(EvidenceFact(key="name", value="贵州茅台"),),
@@ -116,8 +115,8 @@ def test_verifier_rejects_empty_payload_and_reports_missing_dimension() -> None:
             attempts=1,
         ),
         ToolObservation(
-            step_id="fetch-market-snapshot",
-            tool_name="pro_bar",
+            step_id=market_step.step_id,
+            tool_name=market_step.tool_name,
             symbol=entity.symbol,
             evidence_dimension=EvidenceDimension.MARKET_SNAPSHOT,
             facts=(),
@@ -128,15 +127,12 @@ def test_verifier_rejects_empty_payload_and_reports_missing_dimension() -> None:
     )
 
     result = EvidenceVerifier().verify(
-        entity=entity,
+        plan=plan,
         observations=observations,
-        required_dimensions=(
-            EvidenceDimension.BASIC_PROFILE,
-            EvidenceDimension.MARKET_SNAPSHOT,
-        ),
+        as_of=date(2026, 8, 24),
     )
 
     assert [item.evidence_dimension.value for item in result.accepted] == ["basic_profile"]
     assert [item.evidence_dimension.value for item in result.rejected] == ["market_snapshot"]
     assert result.missing_dimensions == (EvidenceDimension.MARKET_SNAPSHOT,)
-    assert result.claim_level.value == "PARTIAL"
+    assert result.claim_level.value == "DESCRIPTIVE"
