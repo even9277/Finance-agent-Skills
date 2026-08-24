@@ -14,7 +14,9 @@ from tests.evals.metrics import (
     latency_percentiles,
     overclaim_rate,
     planned_evidence_coverage,
+    required_stage_coverage,
     schema_pass_rate,
+    terminal_status_accuracy,
 )
 
 
@@ -40,6 +42,9 @@ def compute_metrics(target: str, records: list[dict[str, Any]]) -> dict[str, Any
         metrics["allowed_claim_level_match"] = allowed_claim_level_match(records)
     if target == "synthesis":
         metrics["overclaim_rate"] = overclaim_rate(records)
+    if target == "mainline":
+        metrics["terminal_status_accuracy"] = terminal_status_accuracy(records)
+        metrics["required_stage_coverage"] = required_stage_coverage(records)
     return metrics
 
 
@@ -86,7 +91,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--target",
-        choices=["entity", "route", "rewrite", "planner", "executor", "verifier", "synthesis", "skill_activation", "web_search"],
+        choices=["entity", "route", "rewrite", "planner", "executor", "verifier", "synthesis", "skill_activation", "web_search", "mainline"],
         required=True,
     )
     parser.add_argument("--mode", choices=["smoke", "full"], default="smoke")

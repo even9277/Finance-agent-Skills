@@ -42,7 +42,10 @@ services:
       LANGFUSE_SECRET_KEY: ""
       ENABLE_MEMORY: "false"
       ENABLE_STM: "false"
-      ENABLE_TRACE: "false"
+      ENABLE_TRACE: "true"
+      CHAT_TRACE_JSONL_PATH: /test-artifacts/chat_traces.jsonl
+    volumes:
+      - trace-e2e:/test-artifacts
     depends_on:
       postgres-e2e:
         condition: service_healthy
@@ -86,6 +89,9 @@ services:
       LANGFUSE_SECRET_KEY: ""
       ENABLE_MEMORY: "false"
       ENABLE_STM: "false"
+      OFFLINE_TRACE_PATH: /test-artifacts/chat_traces.jsonl
+    volumes:
+      - trace-e2e:/test-artifacts:ro
     depends_on:
       postgres-e2e:
         condition: service_healthy
@@ -97,3 +103,6 @@ services:
 networks:
   default:
     internal: true
+
+volumes:
+  trace-e2e:

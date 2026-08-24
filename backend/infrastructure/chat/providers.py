@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import logging
 from dataclasses import asdict, is_dataclass
 from datetime import date, datetime
 from enum import Enum
@@ -18,13 +17,9 @@ from src.conversation.contracts import (
     ModelSynthesisRequest,
     ToolCall,
     ToolObservation,
-    WorkflowEvent,
 )
 from src.conversation.errors import ToolPermanentError, ToolTimeoutError, ToolTransientError
 from src.tools.chat_tushare_tools import get_tushare_toolkit
-
-logger = logging.getLogger(__name__)
-
 
 def _jsonable(value: Any) -> Any:
     """把不可变领域合同转换为仅用于模型输入的安全 JSON 值。"""
@@ -151,21 +146,3 @@ class TushareToolProvider:
             except ValueError:
                 continue
         return date.today()
-
-
-class StructuredLoggingTraceSink:
-    """在 M7 接入完整 Trace exporter 前提供稳定低风险结构化日志。"""
-
-    def emit(self, event: WorkflowEvent) -> None:
-        """记录阶段、关联标识和耗时，不记录问题、证据或回答正文。"""
-        logger.info(
-            "controlled_chat.stage trace_id=%s run_id=%s session_id=%s stage=%s "
-            "status=%s elapsed_ms=%.2f error_code=%s",
-            event.trace_id,
-            event.run_id,
-            event.session_id,
-            event.stage.value,
-            event.status.value,
-            event.elapsed_ms,
-            event.error_code.value if event.error_code is not None else None,
-        )

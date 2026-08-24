@@ -4,7 +4,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.application.chat.use_case import ControlledChatUseCase
 from backend.infrastructure.chat.repository import SqlAlchemyConversationRepository
-from backend.infrastructure.chat.testing import FakeModelProvider, FakeToolProvider, InMemoryTraceSink
+from backend.infrastructure.chat.testing import FakeModelProvider, FakeToolProvider
+from backend.infrastructure.chat.trace import SkillTraceSink
 from backend.main import app
 from backend.routers import chat as chat_router
 from src.conversation.workflow import ControlledConversationWorkflow
@@ -19,7 +20,7 @@ def build_offline_chat_use_case(db: AsyncSession) -> ControlledChatUseCase:
         workflow=ControlledConversationWorkflow(
             model=FakeModelProvider(),
             tool=FakeToolProvider(),
-            trace=InMemoryTraceSink(),
+            trace=SkillTraceSink(),
             skill_catalog=SkillRegistry().conversation_snapshot(),
         ),
         repository=SqlAlchemyConversationRepository(db),

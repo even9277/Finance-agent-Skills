@@ -123,6 +123,43 @@ POST /api/chat/message
 | 现有 committed Live 测试只覆盖 Router | 没有真实 Tushare/HTTP Live 测试文件 | 本次用受控脚本手工验收 | 后续建立显式 marker、预算、隔离 DB 和只读工具的自动 Live E2E |
 | 当前 E2E 仍经过巨型 `chat_service` | 新受控 Orchestrator 尚未迁移 | 作为迁移前基线保存 | Milestone 1–7 逐步建立并切换新主链 |
 
-## 7. 最终结论
+## 7. M0 阶段结论（历史基线）
 
 当前仓库的真实 LLM、真实 Tushare 和旧公开聊天主链可以跑通；之前只做测试收集的结果不能代表这一点。本次已经获得真实调用证据，但也确认默认 Live 环境仍存在 SOCKS 依赖、Windows 终端编码和自动化覆盖缺口。这些缺口必须进入后续里程碑，不能用本次临时运行方式掩盖。
+
+## 8. M7 新受控主链 Live E2E
+
+### 8.1 验收对象与安全边界
+
+- 日期：2026-08-24。
+- 自动化用例：`tests/e2e/test_live_controlled_chat_chain.py`。
+- 公开入口：`POST /api/chat/message`。
+- 生产装配：`ControlledChatUseCase → ControlledConversationWorkflow → OpenAICompatibleModelProvider + TushareToolProvider → SqlAlchemyConversationRepository → SkillTraceSink`。
+- 外部调用：一次真实 OpenAI-compatible Synthesis；Tushare 仅执行 `600519.SH` 的只读查询。
+- 隔离：临时 SQLite、临时 Trace JSONL、Auth/Memory/STM/Langfuse 关闭；不存在交易、持仓或生产数据写入。
+- 秘密：仅从 Git 忽略的本地 `.env` 读取；测试、控制台摘要和已提交证据均不包含值。
+
+### 8.2 执行命令与结果
+
+```powershell
+$env:RUN_PROTECTED_LIVE_E2E="true"
+uv run --with socksio -- python -m pytest tests/e2e/test_live_controlled_chat_chain.py -q -m live
+```
+
+- 结果：`1 passed`，约 29.59 秒。
+- HTTP：`200`，回复非空，会话 ID 非空。
+- Tushare：生产 Adapter 返回非空事实，所有观察的 `symbol=600519.SH`，`source` 均以 `tushare:` 开头。
+- LLM：生产 Adapter 恰好调用一次；测试不保存 Prompt 或回答正文。
+- 持久化：临时数据库恰好保存 `user → assistant` 两条消息，助手内容与 HTTP 返回一致。
+- Trace：`trace_id=tr_b6915e75e0214145a58b64190a7a4e8b`，`run_id=run_89f264850882443ab8a38a7800de5b4b`，12 个有序阶段 Span，root 状态为 `started → ok`，终态为 `SUCCEEDED`。
+- 脱敏：JSONL 中不存在原始问题、LLM API Key 或 Tushare Token。
+
+### 8.3 自动化门禁
+
+- 默认 `pytest` 通过 marker 排除 live，不产生费用或真实网络访问。
+- `.github/workflows/live-e2e.yml` 仅支持 `workflow_dispatch`，绑定 `protected-live-e2e` Environment；显式触发但 secrets 缺失时必须失败。
+- 第一次本地尝试因 `pytest.exe` 没有继承 uv 临时 `socksio` 而在 Provider 构造前失败，未发生真实调用；改用 `python -m pytest` 后通过，项目依赖和锁文件未改变。
+
+### 8.4 更新后的结论
+
+M7 已不再依赖旧 `chat_service` 证据：真实 LLM、真实 Tushare、公开 HTTP、唯一受控 Orchestrator、事务持久化和同一 Trace 多阶段链已经在新主链上自动化跑通。该结论证明固定纵向案例的工程可运行性，不等于所有金融问法、所有 Skill 或历史准确率指标已经完成复测。

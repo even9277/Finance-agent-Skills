@@ -579,7 +579,10 @@ Router/WS Presenter
   - Completed: 2026-08-24
   - Evidence: REST/WS 已同时切换到唯一事务型 Chat Use Case；新增 SQLAlchemy、OpenAI-compatible、Tushare 生产适配器并删除旧 `chat_service.py` 双编排。M6 聚焦 `26 passed`，默认全量 `122 passed, 2 skipped, 4 deselected`，离线 Compose 真实经过 Nginx/FastAPI/Workflow/PostgreSQL 且容器内 `70 passed`。
   - Limitation: 真实 LLM/Tushare Live E2E 和 JSONL/Langfuse 完整阶段 Trace 属于 M7；WS 当前保持兼容文本帧但不是 Provider token streaming。
-- [ ] Milestone 7: Observability, Eval, CI, and Real Compose E2E Closure
+- [x] Milestone 7: Observability, Eval, CI, and Real Compose E2E Closure
+  - Completed: 2026-08-24
+  - Evidence: `WorkflowEvent` 已接入脱敏 root Trace + 12 个阶段 Span；mainline eval 新增终态准确率和阶段覆盖率；默认全量 `126 passed, 2 skipped, 5 deselected`，离线 Compose `73 passed, 1 skipped`；真实 LLM + 只读 Tushare + HTTP + 临时 SQLite Live E2E `1 passed`。
+  - Limitation: GitHub protected Live workflow 尚需仓库管理员配置 Environment secrets；真实 Langfuse 未调用；固定案例不代表历史质量指标已复测。
 - [ ] Milestone 8: Verification, Narrow Fixes, Documentation, and Handoff
 
 ## 16. Decision Log
@@ -615,6 +618,8 @@ Router/WS Presenter
 | 2026-08-24 | REST/WS 同时切到 `ControlledChatUseCase`，Application 独占 commit/rollback | 消除入口双轨，保证同步/流式核心语义和一轮消息事务一致 | Issue #15 + M6 contract/integration evidence |
 | 2026-08-24 | 删除旧 `chat_service.py`，STM worker 只迁移必要压缩支持 | 禁止兼容转发壳，同时保留未被替代的后台压缩职责 | M6 legacy removal audit |
 | 2026-08-24 | Compose 只 Fake Model/Tool/Trace Ports | 公开 E2E 必须真实经过新 Workflow、Repository 和 PostgreSQL | M6 Compose evidence |
+| 2026-08-24 | M7 将领域 `WorkflowEvent` 映射为单 root + 稳定阶段 Span，并让 JSONL/exporter 共用脱敏边界 | 既能跨阶段回放，又不把 Prompt、回答、证据正文或秘密复制到观测出口 | Issue #17 + trace unit/Compose/Live evidence |
+| 2026-08-24 | Live E2E 固化为显式 `workflow_dispatch`/环境开关、真实只读 Tushare、一次模型调用和临时 SQLite | 证明生产 Adapter 可运行，同时保证默认 CI 零费用、无生产写和失败不可伪装为 skip | User authorization + M7 live evidence |
 
 ## 17. Surprises & Discoveries
 
@@ -645,13 +650,15 @@ Router/WS Presenter
 | 最小 Tushare 权限快照原本只含首选行情工具，无法在不越权的前提下证明备用工具补证 | Controller 即使决定 replan 也没有安全新动作 | 仅对股票行情需求把治理内 `get_daily_bars` 作为备用权限候选；首轮 Planner 仍选 `get_market_bars`，Replanner 才可使用备用项 |
 | 旧 `chat_service.py` 同时拥有协议无关业务、事务、模型、工具、记忆和流式分支 | 无法证明公开入口走新受控链，且 REST/WS 易漂移 | M6 删除旧文件；Router 只映射同一 `ChatOutcome`，事务下沉到 Application + Repository |
 | 旧 Compose 通过替换整个 Chat Service 返回固定四元组 | HTTP 200 不能证明新工作流、持久化和会话读取 | M6 改为只 Fake 外部 Ports，并验证 PostgreSQL 中 user/assistant 一对消息 |
+| `uv run --with socksio pytest` 在 Windows 仍调用项目 `.venv` 的 `pytest.exe` | 临时依赖未进入解释器，Live 在 Provider 构造前失败 | 唯一 Live 命令固化为 `uv run --with socksio -- python -m pytest ...`，不污染生产依赖 |
+| Compose Trace 初次成为可由测试容器读取的共享产物 | 可以从公开代理入口证明 12 阶段同一 Trace，而不是只看 HTTP 200 | 使用临时命名卷只读挂载，断言后随 `down -v` 删除 |
 
 ## 18. Outcomes & Retrospective
 
-- **What changed:** M0/M1 冻结基线；M2-M5 建立完整受控 Workflow；M6 已把 REST/WS 同时切到唯一事务型 Chat Use Case，并删除旧 Chat Service 编排。
-- **What was verified:** 理解、执行、证据、补证、总结、公开协议、事务回滚、用户隔离和 PostgreSQL Compose 均有离线证据。全量默认测试为 `122 passed, 2 skipped, 4 deselected`，Compose 为 `70 passed`。
-- **What remains risky:** 真实 Model/Tushare 调用、JSONL/Langfuse 完整 Trace、受保护 Live E2E 和面试口径最终逐模块核对尚未闭环；WS 不是 Provider token streaming。
-- **What should be improved next:** M7 只闭环观测、评测、CI、真实 Compose/Live 证据，不回改 M6 已冻结的入口事务和协议。
+- **What changed:** M0/M1 冻结基线；M2-M5 建立完整受控 Workflow；M6 切换唯一公开入口并删除旧双轨；M7 完成 root/span Trace、版本化主链评测、扩大 CI、真实 Compose 和保护性 Live E2E。
+- **What was verified:** 理解、执行、证据、补证、总结、公开协议、事务回滚、用户隔离、PostgreSQL、Trace 脱敏以及真实 Model/Tushare 均有证据。全量默认测试为 `126 passed, 2 skipped, 5 deselected`，Compose 为 `73 passed, 1 skipped`，Live 为 `1 passed`。
+- **What remains risky:** GitHub Live Environment 配置、真实 Langfuse、面试口径最终逐模块核对和历史指标复测尚未闭环；WS 不是 Provider token streaming。
+- **What should be improved next:** M8 只做最终验证、窄修、文档事实标注、独立 Review 和交付，不新增功能。
 
 ## 19. Deferred Work
 
@@ -667,6 +674,6 @@ Router/WS Presenter
 
 ## 20. Handoff to Small-step Implementation
 
-Milestone 6 已完成本地实现和全部离线/Compose 验收，待完成 Issue #15 的 commit、PR、CI、Review 和 squash merge 后交接。
+Milestone 7 已完成本地实现、离线/Compose/Live 验收，待完成 Issue #17 的 commit、PR、CI、Review 和 squash merge 后交接。
 
-下一个执行单元仅为 Milestone 7：Observability、Eval、CI 和真实 Compose/Live E2E 闭环。开始前必须从最新 `main` 创建新 Issue 和短分支；真实调用只允许只读 Tushare 和用户授权的 LLM API，证据必须脱敏且禁止生产写。
+下一个执行单元仅为 Milestone 8：最终验证、窄修、面试口径状态标注、独立 Review 与交付；不得扩展新功能或把历史指标写成当前已验证事实。

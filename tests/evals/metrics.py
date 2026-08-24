@@ -103,6 +103,31 @@ def allowed_claim_level_match(records: list[dict[str, Any]]) -> float:
     return matched / len(records)
 
 
+def terminal_status_accuracy(records: list[dict[str, Any]]) -> float:
+    """计算完整主链终态与固定 gold 的精确匹配率。"""
+    if not records:
+        return 0.0
+    matched = sum(
+        1
+        for item in records
+        if (item.get("prediction") or {}).get("terminal_status")
+        == (item.get("gold") or {}).get("terminal_status")
+    )
+    return matched / len(records)
+
+
+def required_stage_coverage(records: list[dict[str, Any]]) -> float:
+    """计算每个案例的必经阶段是否都出现在实际主链事件中。"""
+    if not records:
+        return 0.0
+    scores: list[float] = []
+    for item in records:
+        required = set((item.get("gold") or {}).get("required_stages") or [])
+        actual = set((item.get("prediction") or {}).get("stages") or [])
+        scores.append(1.0 if not required else len(required & actual) / len(required))
+    return sum(scores) / len(scores)
+
+
 def latency_percentiles(records: list[dict[str, Any]]) -> dict[str, int]:
     latencies = sorted(
         int((item.get("prediction") or item).get("latency_ms") or 0)

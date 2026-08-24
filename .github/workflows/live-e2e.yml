@@ -1,0 +1,44 @@
+name: protected-live-e2e
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: protected-live-e2e-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  controlled-chat-live:
+    name: Real LLM and Tushare controlled-chat E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: protected-live-e2e
+    env:
+      RUN_PROTECTED_LIVE_E2E: "true"
+      AUTH_ENABLED: "false"
+      ENABLE_MEMORY: "false"
+      ENABLE_STM: "false"
+      ENABLE_LANGFUSE: "false"
+      OPENAI_COMPATIBLE_API_KEY: ${{ secrets.OPENAI_COMPATIBLE_API_KEY }}
+      OPENAI_COMPATIBLE_BASE_URL: ${{ secrets.OPENAI_COMPATIBLE_BASE_URL }}
+      OPENAI_COMPATIBLE_MODEL: ${{ secrets.OPENAI_COMPATIBLE_MODEL }}
+      CHAT_SKILL_SYNTHESIS_MODEL: ${{ secrets.CHAT_SKILL_SYNTHESIS_MODEL }}
+      TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          version: "0.12.3"
+      - name: Install locked Python environment
+        run: uv sync --locked --no-install-project --group dev
+      - name: Run protected read-only live chain
+        run: >-
+          uv run --locked pytest
+          tests/e2e/test_live_controlled_chat_chain.py
+          -q -m live

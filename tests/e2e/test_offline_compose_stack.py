@@ -2,6 +2,7 @@
 
 import json
 import os
+from pathlib import Path
 from urllib.request import Request, urlopen
 
 import pytest
@@ -65,3 +66,20 @@ def test_frontend_proxy_reaches_backend_and_fake_chat_chain() -> None:
         history = json.loads(response.read().decode("utf-8"))
     assert [item["role"] for item in history["messages"]] == ["user", "assistant"]
     assert history["messages"][1]["content"] == chat["reply"]
+
+    trace_path = Path(os.environ["OFFLINE_TRACE_PATH"])
+    records = [
+        json.loads(line)
+        for line in trace_path.read_text(encoding="utf-8").splitlines()
+    ]
+    roots = [item for item in records if item["record_type"] == "trace"]
+    spans = [item for item in records if item["record_type"] == "span"]
+    assert [item["status"] for item in roots] == ["started", "ok"]
+    assert spans[0]["stage"] == "context"
+    assert spans[-1]["stage"] == "termination"
+    assert len({item["trace_id"] for item in records}) == 1
+    assert len({item["run_id"] for item in records}) == 1
+    trace_text = trace_path.read_text(encoding="utf-8")
+    assert "查询贵州茅台" not in trace_text
+    assert "OPENAI_COMPATIBLE_API_KEY" not in trace_text
+    assert "TUSHARE_TOKEN" not in trace_text
