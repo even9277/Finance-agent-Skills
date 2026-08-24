@@ -1,0 +1,46 @@
+{
+  "schema_version": "controlled-chat-trace-index-v1",
+  "milestone": "M7",
+  "generated_at": "2026-08-24T11:50:00+08:00",
+  "artifacts": [
+    {
+      "kind": "offline_compose",
+      "storage": "ephemeral_docker_volume_removed_after_validation",
+      "trace_id": "tr_bc6dd854a7e94538ba1f01f95003a4ac",
+      "span_count": 12,
+      "terminal_status": "SUCCEEDED",
+      "root_status": "ok",
+      "external_ports": "fake_model_and_tool",
+      "database": "temporary_postgresql",
+      "redaction_asserted": true
+    },
+    {
+      "kind": "protected_live",
+      "storage": "ephemeral_pytest_tmp_path",
+      "trace_id": "tr_b6915e75e0214145a58b64190a7a4e8b",
+      "run_id": "run_89f264850882443ab8a38a7800de5b4b",
+      "span_count": 12,
+      "terminal_status": "SUCCEEDED",
+      "root_status": "ok",
+      "model_call_count": 1,
+      "tool_source": "tushare_read_only",
+      "database": "temporary_sqlite",
+      "redaction_asserted": true
+    }
+  ],
+  "stage_order": [
+    "context",
+    "entity_resolution",
+    "route",
+    "rewrite",
+    "permission",
+    "plan",
+    "validate",
+    "execute",
+    "verify",
+    "controller",
+    "synthesis",
+    "termination"
+  ],
+  "contains_prompts_replies_or_secrets": false
+}

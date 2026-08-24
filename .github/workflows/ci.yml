@@ -37,9 +37,23 @@ jobs:
       - name: Install locked Python environment
         run: uv sync --locked --no-install-project --group dev
       - name: Ruff lint
-        run: uv run --locked ruff check tests Financial-MCP-Agent/src/tools/skill_trace.py
+        run: >-
+          uv run --locked ruff check
+          backend/application/chat backend/infrastructure/chat
+          backend/routers/chat.py backend/schemas/chat.py
+          backend/services/stm_compaction_support.py
+          Financial-MCP-Agent/src/conversation
+          Financial-MCP-Agent/src/prompts/chat/registry.py
+          Financial-MCP-Agent/src/tools/skill_trace.py tests
       - name: Pyright boundary check
-        run: uv run --locked pyright tests Financial-MCP-Agent/src/tools/skill_trace.py
+        run: >-
+          uv run --locked pyright
+          backend/application/chat backend/infrastructure/chat
+          backend/routers/chat.py backend/schemas/chat.py
+          backend/services/stm_compaction_support.py
+          Financial-MCP-Agent/src/conversation
+          Financial-MCP-Agent/src/prompts/chat/registry.py
+          Financial-MCP-Agent/src/tools/skill_trace.py tests
       - name: Backend offline tests
         run: uv run --locked pytest backend -q
       - name: Agent offline tests

@@ -17,7 +17,12 @@ logger = setup_logger("skill_trace")
 _TRACE_SCHEMA_VERSION = "2026-04-07.1"
 _TRACE_POLICY_VERSION = "trace-v1"
 _TRACE_WORKFLOW_NAME = "chat-skill-turn"
-_JSONL_PATH = Path(__file__).resolve().parents[2] / "logs" / "chat_traces.jsonl"
+_JSONL_PATH = Path(
+    os.getenv(
+        "CHAT_TRACE_JSONL_PATH",
+        str(Path(__file__).resolve().parents[2] / "logs" / "chat_traces.jsonl"),
+    )
+)
 _JSONL_LOCK = threading.Lock()
 _EXPORTERS_LOCK = threading.Lock()
 _RUNTIME_LOCK = threading.Lock()
@@ -495,6 +500,102 @@ def log_trace_finished(**kwargs: Any) -> None:
         metrics=metrics,
         refs=refs,
     )
+
+
+def log_workflow_event(
+    *,
+    sequence: int,
+    trace_id: str,
+    run_id: str,
+    session_id: str,
+    stage: str,
+    status: str,
+    elapsed_ms: float,
+    error_code: str | None,
+    attributes: dict[str, Any] | None = None,
+    contract_version: str,
+    workflow_name: str,
+) -> None:
+    """把一个受控 WorkflowEvent 写为同一 root Trace 下的稳定阶段 Span。
+
+    Args:
+        sequence: 本轮从 1 开始单调递增的阶段序号。
+        trace_id: 一轮聊天的唯一 Trace 标识。
+        run_id: 一次工作流运行标识。
+        session_id: 多轮对话聚合标识。
+        stage: 低基数稳定阶段名。
+        status: `SUCCEEDED/PARTIAL/FAILED/SKIPPED` 等阶段状态。
+        elapsed_ms: 领域阶段已测量耗时，单位毫秒。
+        error_code: 可选稳定错误码，不接受 Provider 异常原文。
+        attributes: 已限制为低风险标量的阶段属性；写入前仍统一脱敏。
+        contract_version: WorkflowEvent 合同版本。
+        workflow_name: 稳定工作流名。
+
+    Returns:
+        无返回值；本地 JSONL 或 exporter 失败均由既有观测边界降级处理。
+    """
+    context = {
+        "trace_id": trace_id,
+        "group_id": session_id,
+        "run_id": run_id,
+        "session_id": session_id,
+        "workflow_name": workflow_name,
+        "policy_version": "controlled-workflow-v1",
+        "trace_schema_version": contract_version,
+    }
+    with skill_trace_context(**context):
+        if sequence == 1:
+            _emit_record(
+                record_type="trace",
+                name=workflow_name,
+                stage="workflow",
+                status="started",
+                data={"contract_version": contract_version},
+            )
+
+        # Workflow 已经测量阶段耗时，因此这里只构造 Span 关联上下文，不重复计时。
+        span_token = _SPAN_STACK.set(
+            (
+                {
+                    "span_id": new_span_id(),
+                    "parent_span_id": None,
+                    "name": f"controlled_chat.{stage}",
+                    "stage": stage,
+                },
+            )
+        )
+        try:
+            _emit_record(
+                record_type="span",
+                name=f"controlled_chat.{stage}",
+                stage=stage,
+                status=status,
+                duration_ms=round(max(0.0, elapsed_ms), 2),
+                data={
+                    "sequence": sequence,
+                    "error_code": error_code,
+                    "attributes": attributes or {},
+                },
+            )
+        finally:
+            _SPAN_STACK.reset(span_token)
+
+        if stage == "termination":
+            final_status = str((attributes or {}).get("terminal_status") or status)
+            root_status = (
+                "error"
+                if status == "FAILED"
+                else "partial"
+                if status == "PARTIAL"
+                else "ok"
+            )
+            _emit_record(
+                record_type="trace",
+                name=workflow_name,
+                stage="workflow",
+                status=root_status,
+                data={"final_status": final_status, "error_code": error_code},
+            )
 
 
 @contextmanager

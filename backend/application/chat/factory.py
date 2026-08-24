@@ -6,10 +6,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.infrastructure.chat.providers import (
     OpenAICompatibleModelProvider,
-    StructuredLoggingTraceSink,
     TushareToolProvider,
 )
 from backend.infrastructure.chat.repository import SqlAlchemyConversationRepository
+from backend.infrastructure.chat.trace import SkillTraceSink
 from src.conversation.workflow import ControlledConversationWorkflow
 from src.skills.skill_registry import SkillRegistry
 
@@ -23,7 +23,7 @@ def build_chat_use_case(db: AsyncSession) -> ControlledChatUseCase:
     workflow = ControlledConversationWorkflow(
         model=OpenAICompatibleModelProvider(),
         tool=TushareToolProvider(),
-        trace=StructuredLoggingTraceSink(),
+        trace=SkillTraceSink(),
         skill_catalog=SkillRegistry().conversation_snapshot(),
     )
     return ControlledChatUseCase(workflow=workflow, repository=repository)

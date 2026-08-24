@@ -19,9 +19,18 @@
 
 ## 3. 完整 E2E 验收
 
-使用 `docker/docker-compose.offline.yml` 启动临时 PostgreSQL、真实 FastAPI、生产构建的 Vue/Nginx 和测试执行器，检查健康接口，从前端代理入口发送固定虚拟请求，并验证最终响应、数据库隔离、Trace 脱敏和错误路径。当前聊天服务的 Fake 装配只存在于 `tests/e2e/offline_app.py`，不属于生产兼容 Adapter；真正迁移 Provider 时必须让 Fake 实现与真实 Provider 相同的公共 Port。
+使用 `docker/docker-compose.offline.yml` 启动临时 PostgreSQL、真实 FastAPI、生产构建的 Vue/Nginx 和测试执行器，检查健康接口，从前端代理入口发送固定虚拟请求，并验证最终响应、数据库隔离、Trace 脱敏和错误路径。`tests/e2e/offline_app.py` 只注入 Fake Model/Tool Ports，真实 Application、Orchestrator、Trace Adapter 和 Repository 均不替换；该装配不是生产兼容 Adapter。
 
 Live E2E 使用独立测试账号、固定少量只读问题和预算上限。真实写只允许测试租户；生产写、下单、持仓修改、报告发布永远禁止。
+
+当前受控主链的本地 Live 入口只运行一个固定案例。Windows 本机使用 SOCKS 代理时，必须通过 Python 模块入口让 uv 的临时依赖生效：
+
+```powershell
+$env:RUN_PROTECTED_LIVE_E2E="true"
+uv run --with socksio -- python -m pytest tests/e2e/test_live_controlled_chat_chain.py -q -m live
+```
+
+GitHub 端只允许手工触发 `.github/workflows/live-e2e.yml`，并由 `protected-live-e2e` Environment 提供 secrets。显式触发但配置缺失时测试必须失败，不能以 skip 伪装通过。
 
 ## 4. 验证顺序
 

@@ -76,7 +76,14 @@ docker compose -f docker/docker-compose.offline.yml down -v --remove-orphans
 
 Live 测试报告只保存脱敏的版本、trace_id、数据日期、耗时、断言和错误摘要，不保存真实 Token、原始敏感 Prompt/响应或用户数据。
 
-当前仓库的离线 Compose 会启动临时 PostgreSQL、真实 FastAPI、生产构建的 Vue/Nginx 和测试执行器；聊天服务仅在 `tests/e2e/offline_app.py` 中被测试装配替换为 Fake，生产入口不会导入它。真实 Live E2E 需要单独的 `workflow_dispatch`、受保护 Environment、固定只读案例、预算、超时、隔离写租户和清理证据。
+当前仓库的离线 Compose 会启动临时 PostgreSQL、真实 FastAPI、生产构建的 Vue/Nginx 和测试执行器；`tests/e2e/offline_app.py` 只替换外部 Model/Tool Ports，公开入口、Application、受控 Orchestrator、Trace Adapter 与 PostgreSQL Repository 都是真实实现。真实 Live E2E 使用单独的 `workflow_dispatch`、受保护 Environment、固定只读案例、预算、超时、临时 SQLite 和脱敏证据。
+
+本地显式 Live 命令如下；它会产生真实模型费用并读取 Tushare，默认 CI 绝不运行。若 Windows 使用 SOCKS 代理，必须保留 `python -m pytest` 入口，不能直接调用虚拟环境中的 `pytest.exe`：
+
+```powershell
+$env:RUN_PROTECTED_LIVE_E2E="true"
+uv run --with socksio -- python -m pytest tests/e2e/test_live_controlled_chat_chain.py -q -m live
+```
 
 ## 7. 提交 PR
 
