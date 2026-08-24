@@ -15,7 +15,15 @@ class StateTransitionError(ConversationError, RuntimeError):
     """状态机发生越级、回退或重复终止。"""
 
 
-class ToolTimeoutError(ConversationError, TimeoutError):
+class ToolTransientError(ConversationError, RuntimeError):
+    """只读 Provider 的限流、连接抖动等可重试瞬时错误。"""
+
+
+class ToolPermanentError(ConversationError, RuntimeError):
+    """参数、权限或稳定下游拒绝等不可重试工具错误。"""
+
+
+class ToolTimeoutError(ToolTransientError, TimeoutError):
     """只读工具在单次调用预算内发生瞬时超时。"""
 
 

@@ -567,7 +567,10 @@ Router/WS Presenter
   - Completed: 2026-08-24
   - Evidence: 权威实体解析、两阶段路由、三路 typed Rewrite、约束/回答偏好、Skill 快照与渐进视图已接入单一 Workflow；M3 focused/eval/E2E `35 passed`，全量默认测试 `100 passed, 6 skipped, 4 deselected, 1 xfailed`，离线 Compose `51 passed, 1 xfailed` 且容器/网络/卷已清理。
   - Limitation: 公开 REST/WS、Planner/Executor/Evidence/Synthesis 和真实 LLM/Tushare 尚未迁移；高置信 SOP 在工具调用前以 `UNSUPPORTED` 诚实终止。固定离线案例全通过不等于生产准确率。
-- [ ] Milestone 4: Planner, Validator, Executor, and Tool Governance Migration
+- [x] Milestone 4: Planner, Validator, Executor, and Tool Governance Migration
+  - Completed: 2026-08-24
+  - Evidence: 新增只读工具治理目录、冻结权限快照、强类型计划参数、DAG 校验和有界执行器；M4 focused `42 passed`，默认全量 `108 passed, 3 skipped, 4 deselected, 1 xfailed`，离线 Compose `56 passed, 1 xfailed` 且容器/网络/卷已清理。
+  - Limitation: 公开 REST/WS 尚未切换；M4 仍使用 M2 的 Evidence/Controller/Synthesis 基线，实体缺失的 SOP 会在工具执行后诚实返回 `UNSUPPORTED`；真实 LLM/Tushare 尚未调用。
 - [ ] Milestone 5: Evidence, Controller, Replanner, and Synthesis Migration
 - [ ] Milestone 6: Persistence, REST/WebSocket Cutover, and Legacy Removal
 - [ ] Milestone 7: Observability, Eval, CI, and Real Compose E2E Closure
@@ -597,6 +600,9 @@ Router/WS Presenter
 | 2026-08-24 | M3 在两次窄修复后停止，不提交未通过的分支 | 新增 Workflow 测试证明状态机不允许诚实的 M3/M4 边界终止；企业级门禁优先于“先同步不完整代码” | small-step failure cap + Issue #9 |
 | 2026-08-24 | M3 恢复时只允许 `REWRITTEN -> SYNTHESIZING` 并增加状态机合同测试 | 支持“理解完成、执行未迁移”时经受控总结返回 `UNSUPPORTED`，同时禁止绕过 Planner 直接执行工具 | Resumed small-step review + focused E2E |
 | 2026-08-24 | Stage1 只消费 Skill 冻结元数据，工具白名单和引用按选中 Skill 渐进暴露 | 避免 Router 越权读取执行细节，并让请求内路由和权限版本可复现 | M3 contract/eval evidence |
+| 2026-08-24 | M4 用静态版本化 Tool Governance Catalog 与 Skill 执行白名单求交，生成请求级冻结权限快照 | 工具 Schema、只读属性和权限来源可审计，且不会让 Planner 或 Executor 自行扩大能力 | Issue #11 + M4 contract/eval evidence |
+| 2026-08-24 | Executor 只接受 `ValidatedToolPlan`，按拓扑层执行并在执行边界再次去重 | 从类型和运行时两层禁止未校验计划、越权调用、重复 action 和依赖未满足执行 | M4 unit/E2E evidence |
+| 2026-08-24 | M4 采用确定性 requirement-to-tool 映射，不直接复制历史 scheduler/planner Runtime | 复用历史业务意图但移除 `dict[str, Any]`、Registry 耦合和隐式运行态，保持当前主链为唯一真相源 | Finance comparison + M4 implementation |
 
 ## 17. Surprises & Discoveries
 
@@ -621,13 +627,15 @@ Router/WS Presenter
 | Compose 启动旧数据库初始化逻辑会重复执行 `ALTER TABLE` 并在 PostgreSQL 输出事务中止错误，应用仍健康且测试通过 | 暴露既有初始化幂等性/日志噪声问题，不属于 M2 新代码 | 记录为基础设施技术债；禁止在 M2 越界改 Schema 初始化 |
 | M2 转换表只允许 `REWRITTEN -> PLANNED/NEEDS_CLARIFICATION/FAILED` | M3 高置信 SOP 曾无法在 Rewrite 后以 `UNSUPPORTED` 诚实停在未迁移执行边界 | 已增加并测试 `REWRITTEN -> SYNTHESIZING -> UNSUPPORTED`；仍不允许绕过 Planner 执行工具 |
 | 本地 `python -m pytest` 与 CI `pytest` 控制台入口的仓库根路径行为不同 | 四个新 eval 在首轮 Linux CI 无法导入 `tests.evals.runner`，业务断言尚未执行 | eval 测试显式注入 `PROJECT_ROOT`，并在本地增加与 CI 完全一致的命令复验；不降低 CI 规则 |
+| M4 前 planner/executor eval 通过跳过不存在的历史模块而显示为 skip | 评测门禁没有实际运行受控 Planner/Executor | 重写为直接执行 `ControlledPlanner`、`PlanValidator` 和 `BoundedToolExecutor`；eval-smoke 从 6 passed/4 skipped 收敛为 9 passed/1 skipped |
+| 工程文档引用 `observability-standard.md`，仓库实际文件为 `observability.md` | 自动导航和新手查找可能混淆，但不影响运行时 | 本里程碑读取并遵循实际文档；记录为文档命名债务，不越界新增重复真相源 |
 
 ## 18. Outcomes & Retrospective
 
-- **What changed:** M0/M1 已冻结安全和旧行为基线；M2 建立 Typed Contracts 和完整离线纵向基线；M3 已把权威实体解析、两阶段路由、三路 Rewrite、约束/偏好和不可变 Skill snapshot 接入同一 Workflow。
-- **What was verified:** M2 四条纵向路径继续通过；M3 的 24 条固定 entity/route/rewrite/skill activation 案例和理解链边界全部通过。全量默认测试为 `100 passed, 6 skipped, 4 deselected, 1 xfailed`，Compose 为 `51 passed, 1 xfailed`。
-- **What remains risky:** 公开 REST/WS 未切换；M4/M5 的计划、执行、证据和总结仍是 M2 基线；真实 Model/Tushare adapter、数据库 Repository 和生产 Trace adapter 尚未闭环。旧 WS 泄露、全仓静态债务、数据库初始化噪声和弃用警告仍存在。
-- **What should be improved next:** M4 只迁移 Planner、Validator、Executor 和 Tool Governance，确保所有工具调用来自冻结权限内的 Validated DAG；不得提前混入入口切换或生产 Live 测试。
+- **What changed:** M0/M1 已冻结安全和旧行为基线；M2 建立 Typed Contracts 和完整离线纵向基线；M3 完成理解链；M4 已把版本化只读工具目录、冻结权限快照、强类型计划、DAG 校验和有界执行接入同一 Workflow。
+- **What was verified:** 权限、Schema、非法/循环 DAG、预算、去重、依赖、超时、瞬时/永久失败和批次并发均有离线证据。全量默认测试为 `108 passed, 3 skipped, 4 deselected, 1 xfailed`，Compose 为 `56 passed, 1 xfailed`。
+- **What remains risky:** 公开 REST/WS 未切换；M5 的 Evidence/Controller/Replanner/Synthesis 仍为 M2 单实体基线，M4 真实 Provider adapter 尚未闭环。旧 WS 泄露、全仓静态债务、数据库初始化噪声和弃用警告仍存在。
+- **What should be improved next:** M5 只迁移 Evidence、Verifier、Controller、有界补证和 Synthesis，证明证据不足不强答、重试/补证有限终止；不得提前切公开入口或加入 Live 调用。
 
 ## 19. Deferred Work
 
@@ -643,6 +651,6 @@ Router/WS Presenter
 
 ## 20. Handoff to Small-step Implementation
 
-Milestone 3 已完成本地实现和全部离线/Compose 验收，待完成 Issue #9 的 commit、PR、CI、Review 和 squash merge 后交接。
+Milestone 4 已完成本地实现和全部离线/Compose 验收，待完成 Issue #11 的 commit、PR、CI、Review 和 squash merge 后交接。
 
-下一个执行单元仅为 Milestone 4：Planner、Validator、Executor 和 Tool Governance。开始前必须从最新 `main` 创建新 Issue 和短分支，保持公开 REST/WS、Schema、依赖与真实外部服务不变；先写越权、非法 DAG、预算、去重、超时和失败分类测试，再迁移实现。
+下一个执行单元仅为 Milestone 5：Evidence、Controller、Replanner 和 Synthesis。开始前必须从最新 `main` 创建新 Issue 和短分支，保持公开 REST/WS、Schema、依赖与真实外部服务不变；先写空证据、错实体、过期、冲突、缺维度、有限终止和未验收证据隔离测试，再迁移实现。

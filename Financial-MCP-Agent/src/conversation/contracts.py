@@ -88,8 +88,12 @@ class ErrorCode(StrEnum):
     ROUTE_CONFIRMATION_REQUIRED = "ROUTE_CONFIRMATION_REQUIRED"
     REWRITE_CLARIFICATION_REQUIRED = "REWRITE_CLARIFICATION_REQUIRED"
     TOOL_TIMEOUT = "TOOL_TIMEOUT"
+    TOOL_TRANSIENT_FAILURE = "TOOL_TRANSIENT_FAILURE"
     TOOL_EXECUTION_FAILED = "TOOL_EXECUTION_FAILED"
     TOOL_INVALID_RESULT = "TOOL_INVALID_RESULT"
+    TOOL_DEPENDENCY_FAILED = "TOOL_DEPENDENCY_FAILED"
+    DUPLICATE_TOOL_ACTION = "DUPLICATE_TOOL_ACTION"
+    EXECUTION_BUDGET_EXHAUSTED = "EXECUTION_BUDGET_EXHAUSTED"
     PLAN_INVALID = "PLAN_INVALID"
     EVIDENCE_MISSING = "EVIDENCE_MISSING"
     STEP_BUDGET_EXHAUSTED = "STEP_BUDGET_EXHAUSTED"
@@ -163,10 +167,22 @@ class PreferenceOperation(StrEnum):
 
 
 class EvidenceDimension(StrEnum):
-    """单股快照切片可请求和验收的证据维度。"""
+    """跨 Planner、Executor 和 Evidence 的稳定证据维度。"""
 
     BASIC_PROFILE = "basic_profile"
     MARKET_SNAPSHOT = "market_snapshot"
+    FINANCIAL_INDICATOR = "financial_indicator"
+    INCOME_STATEMENT = "income_statement"
+    BALANCE_SHEET = "balance_sheet"
+    CASHFLOW_STATEMENT = "cashflow_statement"
+    FUND_BASIC = "fund_basic"
+    ETF_BASIC = "etf_basic"
+    FUND_NAV = "fund_nav"
+    FUND_MARKET = "fund_market"
+    FUND_SHARE = "fund_share"
+    INDEX_DAILY = "index_daily"
+    SECTOR_SNAPSHOT = "sector_snapshot"
+    SECTOR_CONSTITUENTS = "sector_constituents"
 
 
 class StepStatus(StrEnum):
@@ -174,6 +190,23 @@ class StepStatus(StrEnum):
 
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
+    SKIPPED = "SKIPPED"
+
+
+class ToolArgumentKind(StrEnum):
+    """工具参数 Schema 支持的有限标量类型。"""
+
+    STRING = "string"
+    INTEGER = "integer"
+    NUMBER = "number"
+    BOOLEAN = "boolean"
+
+
+class ToolSideEffect(StrEnum):
+    """工具副作用等级；当前受控主链只允许只读工具。"""
+
+    READ = "READ"
+    WRITE = "WRITE"
 
 
 class EvidenceStatus(StrEnum):
@@ -209,6 +242,14 @@ class ValidationIssueCode(StrEnum):
     CYCLIC_DEPENDENCY = "CYCLIC_DEPENDENCY"
     ENTITY_MISMATCH = "ENTITY_MISMATCH"
     MISSING_REQUIRED_EVIDENCE = "MISSING_REQUIRED_EVIDENCE"
+    EMPTY_PLAN = "EMPTY_PLAN"
+    STEP_LIMIT_EXCEEDED = "STEP_LIMIT_EXCEEDED"
+    ARGUMENT_UNKNOWN = "ARGUMENT_UNKNOWN"
+    ARGUMENT_REQUIRED = "ARGUMENT_REQUIRED"
+    ARGUMENT_TYPE_MISMATCH = "ARGUMENT_TYPE_MISMATCH"
+    ARGUMENT_OUT_OF_RANGE = "ARGUMENT_OUT_OF_RANGE"
+    DUPLICATE_ACTION = "DUPLICATE_ACTION"
+    WRITE_TOOL_FORBIDDEN = "WRITE_TOOL_FORBIDDEN"
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,14 +260,30 @@ class RunBudget:
         max_steps: 一轮最多记录的业务阶段数，不含终止事件。
         max_tool_attempts: 单个只读工具发生瞬时超时时的总尝试次数。
         max_replans: 后续里程碑可使用的最大重规划次数；M2 不执行重规划。
+        max_plan_steps: 单个工具 DAG 允许的最大节点数。
+        max_concurrency: 同一 DAG 层允许的最大并发只读调用数。
+        per_tool_timeout_ms: 单次工具调用的超时毫秒数。
+        total_tool_timeout_ms: 整个工具计划的总耗时预算毫秒数。
     """
 
     max_steps: int = 16
     max_tool_attempts: int = 2
     max_replans: int = 1
+    max_plan_steps: int = 8
+    max_concurrency: int = 4
+    per_tool_timeout_ms: int = 8_000
+    total_tool_timeout_ms: int = 25_000
 
     def __post_init__(self) -> None:
-        if self.max_steps < 1 or self.max_tool_attempts < 1 or self.max_replans < 0:
+        if (
+            self.max_steps < 1
+            or self.max_tool_attempts < 1
+            or self.max_replans < 0
+            or self.max_plan_steps < 1
+            or self.max_concurrency < 1
+            or self.per_tool_timeout_ms < 1
+            or self.total_tool_timeout_ms < self.per_tool_timeout_ms
+        ):
             raise ContractViolationError("run budget values are outside the allowed range")
 
 
@@ -566,40 +623,114 @@ class SkillMatch:
     reason: str
 
 
+ToolArgumentValue = str | int | float | bool
+
+
+@dataclass(frozen=True, slots=True)
+class ToolArgument:
+    """单个已结构化工具参数，不允许嵌套任意字典进入核心状态。"""
+
+    name: str
+    value: ToolArgumentValue
+
+
+@dataclass(frozen=True, slots=True)
+class ToolInputSpec:
+    """Validator 使用的工具输入字段合同。"""
+
+    name: str
+    kind: ToolArgumentKind
+    required: bool = False
+    minimum: float | None = None
+    maximum: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ToolPolicy:
+    """从治理目录冻结到请求内的单工具只读执行政策。"""
+
+    tool_name: str
+    evidence_dimension: EvidenceDimension
+    supported_entity_types: tuple[EntityType, ...]
+    input_fields: tuple[ToolInputSpec, ...]
+    api_family: str
+    retryable: bool
+    side_effect: ToolSideEffect = ToolSideEffect.READ
+
+
 @dataclass(frozen=True, slots=True)
 class ToolPermissionSnapshot:
-    """Planner 可见的请求级只读工具权限快照。"""
+    """Planner 与 Executor 共享的请求级只读工具权限快照。"""
 
-    allowed_tools: tuple[str, ...]
+    permissions: tuple[ToolPolicy, ...]
     source: str
     version: str
     snapshot_hash: str
+
+    @property
+    def allowed_tools(self) -> tuple[str, ...]:
+        """返回排序稳定的工具名，供 Planner 和 Trace 使用。"""
+        return tuple(item.tool_name for item in self.permissions)
+
+    def require(self, tool_name: str) -> ToolPolicy:
+        """读取已冻结政策；未授权工具以合同错误拒绝。"""
+        for item in self.permissions:
+            if item.tool_name == tool_name:
+                return item
+        raise ContractViolationError(f"tool is not permitted: {tool_name}")
 
     @classmethod
     def create(
         cls,
         *,
-        allowed_tools: tuple[str, ...],
+        permissions: tuple[ToolPolicy, ...],
         source: str,
         version: str,
     ) -> ToolPermissionSnapshot:
-        """创建排序稳定且带 hash 的权限快照。
+        """创建排序、去重且包含参数 Schema 的权限快照。
 
         Args:
-            allowed_tools: 本轮允许执行的只读工具名。
+            permissions: 从治理目录选择出的只读工具政策。
             source: 权限规则来源，必须是稳定低基数字符串。
-            version: 工具合同或注册表版本。
+            version: 工具治理合同版本。
 
         Returns:
-            可在计划和 Trace 中复核的权限快照。
+            可在计划、校验、执行和 Trace 中复核的不可变快照。
+
+        Raises:
+            ContractViolationError: 来源/版本为空、工具重名或包含写工具。
         """
-        normalized = tuple(sorted(set(allowed_tools)))
-        raw = "|".join((source, version, *normalized)).encode()
+        if not source.strip() or not version.strip():
+            raise ContractViolationError("permission source and version must not be blank")
+        ordered = tuple(sorted(permissions, key=lambda item: item.tool_name))
+        names = tuple(item.tool_name for item in ordered)
+        if len(names) != len(set(names)) or any(not name.strip() for name in names):
+            raise ContractViolationError("permission snapshot contains duplicate or blank tools")
+        if any(item.side_effect is not ToolSideEffect.READ for item in ordered):
+            raise ContractViolationError("controlled conversation permits read-only tools only")
+        raw = "\n".join(
+            "|".join(
+                (
+                    item.tool_name,
+                    item.evidence_dimension.value,
+                    ",".join(entity.value for entity in item.supported_entity_types),
+                    ",".join(
+                        f"{field.name}:{field.kind.value}:{int(field.required)}:{field.minimum}:{field.maximum}"
+                        for field in item.input_fields
+                    ),
+                    item.api_family,
+                    str(int(item.retryable)),
+                    item.side_effect.value,
+                )
+            )
+            for item in ordered
+        )
+        payload = "|".join((source, version, raw)).encode()
         return cls(
-            allowed_tools=normalized,
+            permissions=ordered,
             source=source,
             version=version,
-            snapshot_hash=hashlib.sha256(raw).hexdigest(),
+            snapshot_hash=hashlib.sha256(payload).hexdigest(),
         )
 
 
@@ -620,6 +751,8 @@ class ToolPlanStep:
     symbol: str
     evidence_dimension: EvidenceDimension
     required: bool
+    arguments: tuple[ToolArgument, ...] = ()
+    idempotency_key: str = ""
     depends_on: tuple[str, ...] = ()
 
 
@@ -628,9 +761,13 @@ class ToolPlan:
     """未经校验、绝不允许直接执行的结构化工具计划。"""
 
     plan_id: str
-    entity: Entity
+    entity: Entity | None
     steps: tuple[ToolPlanStep, ...]
     requirements: tuple[EvidenceRequirement, ...]
+    trace_id: str = ""
+    route_family: RouteFamily = RouteFamily.TUSHARE_DATA
+    objective: str = ""
+    entities: tuple[Entity, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -647,7 +784,13 @@ class ValidatedToolPlan:
     """通过权限、实体、DAG 和证据覆盖校验的可执行计划。"""
 
     plan: ToolPlan
-    permission_hash: str
+    permissions: ToolPermissionSnapshot
+    execution_layers: tuple[tuple[str, ...], ...]
+
+    @property
+    def permission_hash(self) -> str:
+        """返回校验时冻结的权限 hash。"""
+        return self.permissions.snapshot_hash
 
 
 @dataclass(frozen=True, slots=True)
@@ -667,6 +810,8 @@ class ToolCall:
     tool_name: str
     symbol: str
     evidence_dimension: EvidenceDimension
+    arguments: tuple[ToolArgument, ...] = ()
+    idempotency_key: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -701,6 +846,9 @@ class ExecutionResult:
 
     observations: tuple[ToolObservation, ...]
     tool_call_count: int
+    batch_count: int = 0
+    deduplicated_count: int = 0
+    failed_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
