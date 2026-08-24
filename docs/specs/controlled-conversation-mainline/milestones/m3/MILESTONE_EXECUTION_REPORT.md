@@ -68,6 +68,8 @@
 
 恢复执行后，只扩展这一条显式转换并增加状态机测试。定点 E2E 与 unit 均通过，随后所有分层回归和 Compose 门禁通过。转换仍必须经过 `SYNTHESIZING` 才能到 `UNSUPPORTED`，没有允许 Rewrite 绕过 Planner 直接执行工具。
 
+首轮 GitHub CI 的 Python 任务发现 Linux 下 `pytest` 控制台入口没有自动把仓库根目录放入 `sys.path`，四个新 eval 文件因此无法导入 `tests.evals.runner`；同轮前端、Compose 配置和 Offline Compose E2E 均通过。修复仅为在 eval 测试启动段显式注入 `PROJECT_ROOT`，随后使用与 CI 完全相同的 `uv run --locked pytest tests/evals ...` 和 `uv run --locked pytest -q` 本地复验通过，未改变生产代码或降低门禁。
+
 ## 7. Trace and Failure Semantics
 
 - 所有 M3 路径沿用 M2 的同一 trace/run 标识、连续阶段事件和唯一终态。

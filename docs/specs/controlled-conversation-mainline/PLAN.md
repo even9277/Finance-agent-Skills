@@ -620,6 +620,7 @@ Router/WS Presenter
 | M2 Compose E2E 在容器内执行了新 Orchestrator 测试，但公开 HTTP 请求仍由旧 offline Chat Service 处理 | 已证明容器环境可运行新链，不等于公开入口已经切换 | M6 切换 REST/WS，M7 移除替换整个 Chat Service 的 offline 装配后再做真正公开全链验收 |
 | Compose 启动旧数据库初始化逻辑会重复执行 `ALTER TABLE` 并在 PostgreSQL 输出事务中止错误，应用仍健康且测试通过 | 暴露既有初始化幂等性/日志噪声问题，不属于 M2 新代码 | 记录为基础设施技术债；禁止在 M2 越界改 Schema 初始化 |
 | M2 转换表只允许 `REWRITTEN -> PLANNED/NEEDS_CLARIFICATION/FAILED` | M3 高置信 SOP 曾无法在 Rewrite 后以 `UNSUPPORTED` 诚实停在未迁移执行边界 | 已增加并测试 `REWRITTEN -> SYNTHESIZING -> UNSUPPORTED`；仍不允许绕过 Planner 执行工具 |
+| 本地 `python -m pytest` 与 CI `pytest` 控制台入口的仓库根路径行为不同 | 四个新 eval 在首轮 Linux CI 无法导入 `tests.evals.runner`，业务断言尚未执行 | eval 测试显式注入 `PROJECT_ROOT`，并在本地增加与 CI 完全一致的命令复验；不降低 CI 规则 |
 
 ## 18. Outcomes & Retrospective
 

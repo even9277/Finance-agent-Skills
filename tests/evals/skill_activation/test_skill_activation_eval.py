@@ -3,9 +3,11 @@ import sys
 
 import pytest
 
-AGENT_ROOT = Path(__file__).resolve().parents[3] / "Financial-MCP-Agent"
-if str(AGENT_ROOT) not in sys.path:
-    sys.path.insert(0, str(AGENT_ROOT))
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+AGENT_ROOT = PROJECT_ROOT / "Financial-MCP-Agent"
+for import_root in (PROJECT_ROOT, AGENT_ROOT):
+    if str(import_root) not in sys.path:
+        sys.path.insert(0, str(import_root))
 
 from src.conversation.skill_discovery import SkillDiscovery  # noqa: E402
 from src.skills.skill_registry import SkillRegistry  # noqa: E402
