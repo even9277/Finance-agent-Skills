@@ -17,6 +17,7 @@ REQUIRED_MODULES = {
     "context_gateway",
     "working_state",
     "rolling_summary",
+    "redis_cache",
     "candidate_governance",
     "memory_governance",
     "hybrid_retrieval",
@@ -43,7 +44,7 @@ def test_memory_characterization_dataset_is_versioned_and_complete() -> None:
 
     evidence_tests = [str(case["evidence_test"]) for case in cases]
 
-    assert len(cases) == 13
+    assert len(cases) == 14
     assert len(case_ids) == len(set(case_ids))
     assert len(evidence_tests) == len(set(evidence_tests))
     assert {case["dataset_version"] for case in cases} == {DATASET_VERSION}
@@ -70,7 +71,7 @@ def test_memory_characterization_baseline_distinguishes_support_from_target_gaps
     supported = [case for case in cases if case["expected_current_status"] == "supported"]
     target_gaps = [case for case in cases if case["expected_current_status"] == "target_gap"]
 
-    assert len(supported) == 7
+    assert len(supported) == 8
     assert len(target_gaps) == 6
     assert all(case.get("issue") == "#24" for case in target_gaps)
     assert all(case.get("target_milestone") in {"M2", "M3", "M5", "M6", "M7", "M8"} for case in target_gaps)

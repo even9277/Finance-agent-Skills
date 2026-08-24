@@ -44,3 +44,36 @@ def test_non_positive_stm_runtime_settings_are_rejected(
     """会破坏预算或 Worker 活性的非正配置不得进入运行期。"""
     with pytest.raises(ValidationError, match=field_name):
         invalid_settings()
+
+
+def test_redis_cache_defaults_to_optional_and_uses_bounded_settings() -> None:
+    """Redis 默认关闭，启用后的 TTL、租约、等待和超时均为有限正值。"""
+    configured = Settings()
+
+    assert configured.enable_redis_cache is False
+    assert configured.redis_url.startswith("redis://")
+    assert configured.redis_cache_ttl_sec > configured.redis_cache_lease_sec > 0
+    assert configured.redis_singleflight_wait_ms > 0
+    assert configured.redis_connect_timeout_sec > 0
+    assert configured.redis_socket_timeout_sec > 0
+
+
+@pytest.mark.parametrize(
+    "invalid_settings",
+    (
+        lambda: Settings(redis_cache_ttl_sec=0),
+        lambda: Settings(redis_cache_lease_sec=0),
+        lambda: Settings(redis_singleflight_wait_ms=0),
+        lambda: Settings(redis_connect_timeout_sec=0),
+        lambda: Settings(redis_socket_timeout_sec=0),
+        lambda: Settings(redis_max_connections=0),
+        lambda: Settings(redis_url="http://localhost:6379"),
+        lambda: Settings(redis_cache_namespace="bad namespace"),
+    ),
+)
+def test_redis_cache_rejects_unsafe_settings(
+    invalid_settings: Callable[[], Settings],
+) -> None:
+    """不安全的 Redis 运行参数必须在应用启动前 fail-fast。"""
+    with pytest.raises(ValidationError):
+        invalid_settings()

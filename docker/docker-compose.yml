@@ -1,4 +1,18 @@
 services:
+  # Redis 只保存可重建热缓存，不挂载数据卷，也不承担 Outbox/恢复职责。
+  redis:
+    image: redis:7.4.10-alpine@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2
+    container_name: finance_redis
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    expose:
+      - "6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   # ─────────────────────────────────────────
   # PostgreSQL + pgvector（Phase 3 LTM 依赖）
   # Phase 1 使用 SQLite，此服务可选启动
@@ -42,6 +56,8 @@ services:
       - PG_USER=finance
       - PG_PASSWORD=finance123
       - FINANCE_MCP_SERVER_DIR=/app/a-share-mcp-is-just-i-need
+      - ENABLE_REDIS_CACHE=${ENABLE_REDIS_CACHE:-true}
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
     volumes:
       - ../Financial-MCP-Agent/logs:/app/Financial-MCP-Agent/logs
       - ../Financial-MCP-Agent/reports:/app/Financial-MCP-Agent/reports

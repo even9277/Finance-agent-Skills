@@ -480,6 +480,23 @@ class SummaryCompactionWorker:
             await db.refresh(session)
             await refresh_session_context_metrics(db, session)
             await db.commit()
+            # 摘要版本已权威提交后再失效派生尾窗；Redis 故障不得改变任务终态。
+            from backend.infrastructure.memory.runtime import get_memory_cache
+
+            cache = get_memory_cache()
+            if cache is not None:
+                try:
+                    await cache.invalidate_context(task.user_id, payload.session_id)
+                except Exception as exc:
+                    logger.warning(
+                        "memory_cache_invalidate_failed trace_id=%s stage=%s status=%s "
+                        "error_code=%s error_type=%s",
+                        compaction_input.trace_id,
+                        "memory.cache.invalidate",
+                        "DEGRADED",
+                        "UNAVAILABLE",
+                        type(exc).__name__,
+                    )
             return _ApplyStatus.APPLIED
 
     async def _cancel_stale_after_rollback(

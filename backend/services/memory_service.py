@@ -18,11 +18,31 @@ _AGENT_ROOT = Path(__file__).resolve().parent.parent.parent / "Financial-MCP-Age
 if str(_AGENT_ROOT) not in sys.path:
     sys.path.insert(0, str(_AGENT_ROOT))
 
-from src.utils.logging_config import setup_logger
-from src.memory.memory_service import MemoryService
-from src.memory.mem0_schema import MemorySource
+from src.utils.logging_config import setup_logger  # noqa: E402
+from src.memory.memory_service import MemoryService  # noqa: E402
+from src.memory.mem0_schema import MemorySource  # noqa: E402
 
 logger = setup_logger("backend.memory_service", log_dir=str(_AGENT_ROOT / "logs"))
+
+
+async def _invalidate_profile_cache(user_id: str) -> None:
+    """在权威画像写路径完成后删除可丢弃紧凑画像缓存。"""
+    from backend.infrastructure.memory.runtime import get_memory_cache
+
+    cache = get_memory_cache()
+    if cache is not None:
+        try:
+            await cache.invalidate_profile(user_id)
+        except Exception as exc:
+            # 权威画像写已经完成；派生缓存失败只能降级，不能改写 API 成败。
+            logger.warning(
+                "memory_cache_invalidate_failed stage=%s status=%s error_code=%s "
+                "error_type=%s",
+                "memory.cache.invalidate",
+                "DEGRADED",
+                "UNAVAILABLE",
+                type(exc).__name__,
+            )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -37,8 +57,11 @@ async def get_user_profile(user_id: str, db=None) -> dict[str, Any]:
     """
     profile = await MemoryService.get_structured_profile(user_id, db_session=db)
 
-    logger.debug(f"[memory_service] get_user_profile: user={user_id}, profile={profile}")
-    print(f"[memory_service] get_user_profile: user={user_id[:8]}...")
+    logger.debug(
+        "memory_profile_read stage=%s status=%s",
+        "memory.profile.read",
+        "SUCCEEDED",
+    )
 
     # 兼容 Phase 1 API 字段名映射
     return {
@@ -81,8 +104,13 @@ async def update_risk_profile(user_id: str, risk_profile: str, db=None) -> bool:
         source=MemorySource.UI,
         db_session=db,
     )
-    logger.info(f"[memory_service] update_risk_profile: user={user_id}, value={risk_profile}")
-    print(f"[memory_service] 更新风险偏好: user={user_id[:8]}..., value={risk_profile}")
+    await _invalidate_profile_cache(user_id)
+    logger.info(
+        "memory_profile_write stage=%s status=%s field=%s",
+        "memory.profile.write",
+        "SUCCEEDED",
+        "risk_level",
+    )
     return True
 
 
@@ -95,8 +123,13 @@ async def update_sectors(user_id: str, sectors: list[str], db=None) -> bool:
         source=MemorySource.UI,
         db_session=db,
     )
-    logger.info(f"[memory_service] update_sectors: user={user_id}, sectors={sectors}")
-    print(f"[memory_service] 更新关注板块: user={user_id[:8]}..., sectors={sectors}")
+    await _invalidate_profile_cache(user_id)
+    logger.info(
+        "memory_profile_write stage=%s status=%s field=%s",
+        "memory.profile.write",
+        "SUCCEEDED",
+        "sectors",
+    )
     return True
 
 
@@ -131,8 +164,13 @@ async def update_return_expectation(
             source=MemorySource.UI,
             db_session=db,
         )
-    logger.info(f"[memory_service] update_return_expectation: user={user_id}, min={value}, max={return_max}")
-    print(f"[memory_service] 更新期望收益: user={user_id[:8]}..., min={value}%")
+    await _invalidate_profile_cache(user_id)
+    logger.info(
+        "memory_profile_write stage=%s status=%s field=%s",
+        "memory.profile.write",
+        "SUCCEEDED",
+        "return_expectation",
+    )
     return True
 
 
@@ -145,6 +183,7 @@ async def update_response_pref(user_id: str, pref: str, db=None) -> bool:
         source=MemorySource.UI,
         db_session=db,
     )
+    await _invalidate_profile_cache(user_id)
     return True
 
 
@@ -162,7 +201,12 @@ async def get_memory_items(
     result = await MemoryService.get_all_memories(
         user_id, page=page, page_size=size, db_session=db
     )
-    logger.debug(f"[memory_service] get_memory_items: user={user_id}, total={result.get('total')}")
+    logger.debug(
+        "memory_items_read stage=%s status=%s item_count=%s",
+        "memory.items.read",
+        "SUCCEEDED",
+        result.get("total"),
+    )
     return result
 
 
@@ -178,7 +222,12 @@ async def add_memory_item(
     metadata.setdefault("source", MemorySource.UI.value)
     metadata.setdefault("confidence", 1.0)
     result = await MemoryService.add_memory(user_id, content, metadata)
-    logger.info(f"[memory_service] add_memory_item: user={user_id}, category={category}")
+    logger.info(
+        "memory_item_write stage=%s status=%s operation=%s",
+        "memory.item.write",
+        "SUCCEEDED",
+        "add",
+    )
     return result
 
 
@@ -191,22 +240,37 @@ async def update_memory_item(
 ) -> bool:
     """编辑记忆条目。"""
     ok = await MemoryService.update_memory(user_id, memory_id, content, metadata)
-    logger.info(f"[memory_service] update_memory_item: user={user_id}, id={memory_id}")
+    logger.info(
+        "memory_item_write stage=%s status=%s operation=%s",
+        "memory.item.write",
+        "SUCCEEDED" if ok else "FAILED",
+        "update",
+    )
     return ok
 
 
 async def delete_memory_item(user_id: str, memory_id: str, db=None) -> bool:
     """删除记忆条目（软删除：标记 active=False）。"""
     ok = await MemoryService.delete_memory(user_id, memory_id, db_session=db)
-    logger.info(f"[memory_service] delete_memory_item: user={user_id}, id={memory_id}")
+    logger.info(
+        "memory_item_write stage=%s status=%s operation=%s",
+        "memory.item.write",
+        "SUCCEEDED" if ok else "FAILED",
+        "delete",
+    )
     return ok
 
 
 async def delete_all_memories(user_id: str, db=None) -> bool:
     """清空所有记忆（Mem0 全清 + user_invest_profiles 重置）。"""
     await MemoryService.delete_all(user_id, db_session=db)
-    logger.warning(f"[memory_service] delete_all_memories: user={user_id}")
-    print(f"[memory_service] 清空所有记忆: user={user_id[:8]}...")
+    await _invalidate_profile_cache(user_id)
+    logger.warning(
+        "memory_items_write stage=%s status=%s operation=%s",
+        "memory.items.write",
+        "SUCCEEDED",
+        "delete_all",
+    )
     return True
 
 
@@ -229,8 +293,14 @@ async def cold_start(user_id: str, preferences: Optional[dict], db=None) -> bool
         return True
 
     await MemoryService.cold_start(user_id, tags=preferences, db_session=db)
-    logger.info(f"[memory_service] cold_start: user={user_id}, prefs={list(preferences.keys())}")
-    print(f"[memory_service] cold_start 完成: user={user_id[:8]}..., keys={list(preferences.keys())}")
+    await _invalidate_profile_cache(user_id)
+    logger.info(
+        "memory_profile_write stage=%s status=%s operation=%s field_count=%s",
+        "memory.profile.write",
+        "SUCCEEDED",
+        "cold_start",
+        len(preferences),
+    )
     return True
 
 
@@ -272,5 +342,16 @@ async def get_memory_evidence(user_id: str, memory_id: str, db=None) -> dict[str
             "evidence": [],  # TODO: 按 evidence_ref 查 messages 表返回原文
         }
     except Exception as exc:
-        logger.warning(f"[memory_service] get_memory_evidence 失败: {exc}")
-        return {"memory_id": memory_id, "evidence": [], "error": str(exc)}
+        logger.warning(
+            "memory_evidence_read_failed stage=%s status=%s error_code=%s "
+            "error_type=%s",
+            "memory.evidence.read",
+            "FAILED",
+            "UNEXPECTED_ERROR",
+            type(exc).__name__,
+        )
+        return {
+            "memory_id": memory_id,
+            "evidence": [],
+            "error": "MEMORY_EVIDENCE_READ_FAILED",
+        }

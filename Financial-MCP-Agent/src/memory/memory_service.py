@@ -34,8 +34,8 @@ _AGENT_SRC = _MEMORY_DIR.parent
 if str(_AGENT_SRC) not in sys.path:
     sys.path.insert(0, str(_AGENT_SRC))
 
-from src.utils.logging_config import setup_logger
-from src.memory.mem0_schema import MemorySource, SOURCE_PRIORITY
+from src.memory.mem0_schema import MemorySource  # noqa: E402
+from src.utils.logging_config import setup_logger  # noqa: E402
 
 logger = setup_logger("memory_service")
 
@@ -172,7 +172,7 @@ class MemoryService:
         """
         if db_session is not None:
             # FastAPI SQLAlchemy 模式
-            from sqlalchemy import select, text
+            from sqlalchemy import text
             try:
                 result = await db_session.execute(
                     text(
@@ -221,8 +221,6 @@ class MemoryService:
                 return []
 
             client = get_mem0_client()
-            filters = {"user_id": user_id, "metadata": {"active": True}}
-
             raw_results = await client.search(
                 query=query,
                 user_id=user_id,
@@ -306,10 +304,10 @@ class MemoryService:
             profile_task, semantic_task, return_exceptions=True
         )
 
-        if isinstance(profile, Exception):
+        if isinstance(profile, BaseException):
             logger.warning(f"[MemoryService] get_structured_profile 异常: {profile}")
             profile = _empty_profile()
-        if isinstance(semantic_memories, Exception):
+        if isinstance(semantic_memories, BaseException):
             logger.warning(f"[MemoryService] search_semantic 异常: {semantic_memories}")
             semantic_memories = []
 
@@ -401,8 +399,11 @@ class MemoryService:
             db_session=db_session,
         )
         logger.info(
-            f"[MemoryService] update_profile_and_enqueue: "
-            f"user={user_id}, field={field}, source={source.value}"
+            "memory_profile_enqueue stage=%s status=%s field=%s source=%s",
+            "memory.profile.enqueue",
+            "SUCCEEDED",
+            field,
+            source.value,
         )
 
     @staticmethod
@@ -416,7 +417,11 @@ class MemoryService:
             payload=payload,
             db_session=db_session,
         )
-        logger.info(f"[MemoryService] enqueue_explicit_delete: user={user_id}, memory_id={memory_id}")
+        logger.info(
+            "memory_delete_enqueue stage=%s status=%s",
+            "memory.delete.enqueue",
+            "SUCCEEDED",
+        )
 
     @staticmethod
     async def cold_start(
@@ -473,10 +478,12 @@ class MemoryService:
             db_session=db_session,
         )
         logger.info(
-            f"[MemoryService] cold_start: user={user_id}, fields={list(clean_tags.keys())}, "
-            f"watchlist={watchlist}"
+            "memory_cold_start stage=%s status=%s field_count=%s watchlist_count=%s",
+            "memory.cold_start",
+            "SUCCEEDED",
+            len(clean_tags),
+            len(watchlist),
         )
-        print(f"[MemoryService] cold_start 完成: user={user_id[:8]}..., fields={list(clean_tags.keys())}")
 
     # ── 直接操作接口（/api/memory/items 端点调用）────────────
 
@@ -689,11 +696,24 @@ class MemoryService:
                 if results_list:
                     memory_id = results_list[0].get("id", "")
 
-            logger.info(f"[MemoryService] add_memory: user={user_id}, id={memory_id}")
+            logger.info(
+                "memory_item_write stage=%s status=%s operation=%s",
+                "memory.item.write",
+                "SUCCEEDED",
+                "add",
+            )
             return {"id": memory_id, "content": content, "metadata": metadata}
 
         except Exception as exc:
-            logger.error(f"[MemoryService] add_memory 失败: {exc}", exc_info=True)
+            logger.error(
+                "memory_item_write_failed stage=%s status=%s operation=%s "
+                "error_type=%s",
+                "memory.item.write",
+                "FAILED",
+                "add",
+                type(exc).__name__,
+                exc_info=True,
+            )
             return {"id": "", "content": content, "error": str(exc)}
 
     @staticmethod
@@ -705,10 +725,22 @@ class MemoryService:
                 return False
             client = get_mem0_client()
             await client.update(memory_id, content, metadata=metadata)
-            logger.info(f"[MemoryService] update_memory: user={user_id}, id={memory_id}")
+            logger.info(
+                "memory_item_write stage=%s status=%s operation=%s",
+                "memory.item.write",
+                "SUCCEEDED",
+                "update",
+            )
             return True
         except Exception as exc:
-            logger.warning(f"[MemoryService] update_memory 失败: {exc}")
+            logger.warning(
+                "memory_item_write_failed stage=%s status=%s operation=%s "
+                "error_type=%s",
+                "memory.item.write",
+                "FAILED",
+                "update",
+                type(exc).__name__,
+            )
             return False
 
     @staticmethod
@@ -729,14 +761,33 @@ class MemoryService:
             if is_mem0_available():
                 client = get_mem0_client()
                 await client.delete_all(user_id=user_id)
-                logger.info(f"[MemoryService] delete_all Mem0: user={user_id}")
+                logger.info(
+                    "memory_items_write stage=%s status=%s operation=%s target=%s",
+                    "memory.items.write",
+                    "SUCCEEDED",
+                    "delete_all",
+                    "mem0",
+                )
         except Exception as exc:
-            logger.warning(f"[MemoryService] delete_all Mem0 失败: {exc}")
+            logger.warning(
+                "memory_items_write_failed stage=%s status=%s operation=%s "
+                "target=%s error_type=%s",
+                "memory.items.write",
+                "DEGRADED",
+                "delete_all",
+                "mem0",
+                type(exc).__name__,
+            )
 
         # 重置 user_invest_profiles
         await _reset_profile(user_id, db_session)
-        print(f"[MemoryService] delete_all 完成: user={user_id[:8]}...")
-        logger.info(f"[MemoryService] delete_all 完成: user={user_id}")
+        logger.info(
+            "memory_items_write stage=%s status=%s operation=%s target=%s",
+            "memory.items.write",
+            "SUCCEEDED",
+            "delete_all",
+            "authoritative_profile",
+        )
 
     @staticmethod
     async def get_memory_stats(user_id: str, db_session=None) -> dict:
@@ -883,12 +934,22 @@ async def _upsert_profile_field(
                 )
             await db_session.commit()
         except Exception as exc:
-            logger.error(f"[MemoryService] _upsert_profile_field SQLAlchemy 失败: {exc}", exc_info=True)
+            logger.error(
+                "memory_profile_store_failed stage=%s status=%s error_code=%s "
+                "error_type=%s target=%s",
+                "memory.profile.store",
+                "FAILED",
+                "DATABASE_WRITE_FAILED",
+                type(exc).__name__,
+                "sqlalchemy",
+            )
         return
 
     # 直连模式
     try:
-        import aiosqlite, uuid as _uuid
+        import uuid as _uuid
+
+        import aiosqlite
         db_path = _get_db_path()
         async with aiosqlite.connect(db_path) as db:
             row = await db.execute(
@@ -910,7 +971,8 @@ async def _upsert_profile_field(
                 )
             await db.commit()
     except ImportError:
-        import sqlite3, uuid as _uuid
+        import sqlite3
+        import uuid as _uuid
         db_path = _get_db_path()
         conn = sqlite3.connect(db_path)
         cur = conn.execute("SELECT id FROM user_invest_profiles WHERE user_id = ?", (user_id,))
@@ -931,7 +993,15 @@ async def _upsert_profile_field(
         conn.commit()
         conn.close()
     except Exception as exc:
-        logger.error(f"[MemoryService] _upsert_profile_field 失败: {exc}", exc_info=True)
+        logger.error(
+            "memory_profile_store_failed stage=%s status=%s error_code=%s "
+            "error_type=%s target=%s",
+            "memory.profile.store",
+            "FAILED",
+            "DATABASE_WRITE_FAILED",
+            type(exc).__name__,
+            "sqlite",
+        )
 
 
 async def _enqueue_task(
@@ -956,7 +1026,14 @@ async def _enqueue_task(
             )
             await db_session.commit()
         except Exception as exc:
-            logger.error(f"[MemoryService] _enqueue_task SQLAlchemy 失败: {exc}", exc_info=True)
+            logger.error(
+                "memory_task_enqueue_failed stage=%s status=%s error_code=%s "
+                "error_type=%s",
+                "memory.task.enqueue",
+                "FAILED",
+                "DATABASE_WRITE_FAILED",
+                type(exc).__name__,
+            )
         return
 
     # 直连模式
@@ -988,7 +1065,14 @@ async def _reset_profile(user_id: str, db_session=None) -> None:
             )
             await db_session.commit()
         except Exception as exc:
-            logger.error(f"[MemoryService] _reset_profile 失败: {exc}", exc_info=True)
+            logger.error(
+                "memory_profile_reset_failed stage=%s status=%s error_code=%s "
+                "error_type=%s",
+                "memory.profile.reset",
+                "FAILED",
+                "DATABASE_WRITE_FAILED",
+                type(exc).__name__,
+            )
         return
 
     await _db_execute(

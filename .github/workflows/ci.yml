@@ -41,14 +41,16 @@ jobs:
           uv run --locked ruff check
           backend/application/chat backend/infrastructure/chat
           backend/application/memory backend/infrastructure/memory
-          backend/config.py
+          backend/config.py backend/main.py
           backend/db/database.py backend/db/migration_runner.py
           backend/db/models.py backend/migrations
           backend/routers/chat.py backend/schemas/chat.py
+          backend/services/memory_service.py
           backend/services/stm_compaction_worker.py
           backend/services/stm_context_service.py
           Financial-MCP-Agent/src/conversation
           Financial-MCP-Agent/src/memory/contracts.py
+          Financial-MCP-Agent/src/memory/memory_service.py
           Financial-MCP-Agent/src/memory/policy.py
           Financial-MCP-Agent/src/memory/working_state.py
           Financial-MCP-Agent/src/prompts/chat/registry.py
@@ -58,14 +60,16 @@ jobs:
           uv run --locked pyright
           backend/application/chat backend/infrastructure/chat
           backend/application/memory backend/infrastructure/memory
-          backend/config.py
+          backend/config.py backend/main.py
           backend/db/database.py backend/db/migration_runner.py
           backend/db/models.py backend/migrations
           backend/routers/chat.py backend/schemas/chat.py
+          backend/services/memory_service.py
           backend/services/stm_compaction_worker.py
           backend/services/stm_context_service.py
           Financial-MCP-Agent/src/conversation
           Financial-MCP-Agent/src/memory/contracts.py
+          Financial-MCP-Agent/src/memory/memory_service.py
           Financial-MCP-Agent/src/memory/policy.py
           Financial-MCP-Agent/src/memory/working_state.py
           Financial-MCP-Agent/src/prompts/chat/registry.py
@@ -112,12 +116,26 @@ jobs:
         run: touch Financial-MCP-Agent/.env backend/.env
       - name: Validate Compose file
         run: docker compose -f docker/docker-compose.yml config --quiet
+      - name: Verify Redis cache rollback override
+        env:
+          ENABLE_REDIS_CACHE: "false"
+        run: |
+          docker compose -f docker/docker-compose.yml config --format json > /tmp/compose.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          config = json.loads(Path("/tmp/compose.json").read_text())
+          backend = config["services"]["backend"]
+          assert backend["environment"]["ENABLE_REDIS_CACHE"] == "false"
+          assert "redis" not in backend.get("depends_on", {})
+          PY
       - name: Build production backend image
         run: docker build -f docker/Dockerfile.backend -t finance-agent-backend-ci:local .
       - name: Verify production migration dependency
         run: >-
           docker run --rm --entrypoint python finance-agent-backend-ci:local
-          -c "import alembic; from backend.db.migration_runner import upgrade_database; from backend.infrastructure.memory.summary import build_summary_model_provider; from backend.services.stm_compaction_worker import build_stm_compaction_worker; print(alembic.__version__)"
+          -c "import alembic, redis; from backend.db.migration_runner import upgrade_database; from backend.infrastructure.memory.summary import build_summary_model_provider; from backend.infrastructure.memory.redis_cache import RedisMemoryHotCache; from backend.infrastructure.memory.runtime import get_memory_cache; from backend.services.stm_compaction_worker import build_stm_compaction_worker; print(alembic.__version__, redis.__version__)"
 
   offline-compose-e2e:
     name: Offline Compose E2E

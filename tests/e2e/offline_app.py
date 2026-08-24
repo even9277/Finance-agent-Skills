@@ -6,6 +6,7 @@ from backend.application.chat.use_case import ControlledChatUseCase
 from backend.infrastructure.chat.repository import SqlAlchemyConversationRepository
 from backend.infrastructure.chat.testing import FakeModelProvider, FakeToolProvider
 from backend.infrastructure.chat.trace import SkillTraceSink
+from backend.infrastructure.memory.runtime import get_memory_cache
 from backend.main import app
 from backend.routers import chat as chat_router
 from src.conversation.workflow import ControlledConversationWorkflow
@@ -23,7 +24,7 @@ def build_offline_chat_use_case(db: AsyncSession) -> ControlledChatUseCase:
             trace=SkillTraceSink(),
             skill_catalog=SkillRegistry().conversation_snapshot(),
         ),
-        repository=SqlAlchemyConversationRepository(db),
+        repository=SqlAlchemyConversationRepository(db, cache=get_memory_cache()),
     )
 
 

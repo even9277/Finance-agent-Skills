@@ -8,6 +8,7 @@ from sqlalchemy import select, update as update_row
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.application.memory.cache import CacheLookupStatus, MemoryHotCache
 from backend.db.models import (
     MemoryOutboxTaskRow,
     MemoryStateEventRow,
@@ -44,8 +45,9 @@ class MemoryRepositoryError(RuntimeError):
 class SqlAlchemyMemoryRepository:
     """复用调用方 AsyncSession，保证状态、消息与 Outbox 同事务。"""
 
-    def __init__(self, db: AsyncSession) -> None:
+    def __init__(self, db: AsyncSession, cache: MemoryHotCache | None = None) -> None:
         self._db = db
+        self._cache = cache
 
     async def load_or_create_working_state(
         self,
@@ -83,11 +85,27 @@ class SqlAlchemyMemoryRepository:
             source_message_id=source_message_id,
         )
 
+        # 先用最小权威版本查询验证 Redis 快照；命中时不读取大型 JSON 字段。
+        state_version = await self._db.scalar(
+            select(MemoryWorkingStateRow.state_version)
+            .where(MemoryWorkingStateRow.session_id == session_id)
+            .with_for_update()
+        )
+        if state_version is not None and self._cache is not None:
+            cached = await self._cache.get_working_state(
+                user_id,
+                session_id,
+                expected_state_version=int(state_version),
+            )
+            if cached.status is CacheLookupStatus.HIT and cached.value is not None:
+                return cached.value
+
         row = await self._db.scalar(
             select(MemoryWorkingStateRow)
             .where(MemoryWorkingStateRow.session_id == session_id)
             .with_for_update()
         )
+        created = row is None
         if row is None:
             row = MemoryWorkingStateRow(
                 session_id=session_id,
@@ -102,7 +120,11 @@ class SqlAlchemyMemoryRepository:
             )
             self._db.add(row)
             await self._db.flush()
-        return self._to_working_state(row)
+        state = self._to_working_state(row)
+        # 已存在行是已提交事实，可以在当前事务提交前安全回填可丢弃缓存。
+        if self._cache is not None and not created:
+            await self._cache.set_working_state(user_id, session_id, state)
+        return state
 
     async def apply_working_state(
         self,

@@ -10,6 +10,7 @@ from backend.infrastructure.chat.providers import (
 )
 from backend.infrastructure.chat.repository import SqlAlchemyConversationRepository
 from backend.infrastructure.chat.trace import SkillTraceSink
+from backend.infrastructure.memory.runtime import get_memory_cache
 from src.conversation.workflow import ControlledConversationWorkflow
 from src.skills.skill_registry import SkillRegistry
 
@@ -19,7 +20,7 @@ from .use_case import ControlledChatUseCase
 
 def build_chat_use_case(db: AsyncSession) -> ControlledChatUseCase:
     """为一个请求数据库 Session 装配唯一受控聊天用例。"""
-    repository = SqlAlchemyConversationRepository(db)
+    repository = SqlAlchemyConversationRepository(db, cache=get_memory_cache())
     workflow = ControlledConversationWorkflow(
         model=OpenAICompatibleModelProvider(),
         tool=TushareToolProvider(),
@@ -31,4 +32,6 @@ def build_chat_use_case(db: AsyncSession) -> ControlledChatUseCase:
 
 def build_chat_session_use_case(db: AsyncSession) -> ChatSessionUseCase:
     """为一个请求数据库 Session 装配会话管理用例。"""
-    return ChatSessionUseCase(SqlAlchemyConversationRepository(db))
+    return ChatSessionUseCase(
+        SqlAlchemyConversationRepository(db, cache=get_memory_cache())
+    )

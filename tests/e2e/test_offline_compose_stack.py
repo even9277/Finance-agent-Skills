@@ -359,6 +359,8 @@ def test_frontend_proxy_reaches_backend_and_fake_chat_chain() -> None:
     assert response.status == 200
     assert health["status"] == "ok"
     assert health["version"]
+    assert health["components"]["memory_cache"]["enabled"] is True
+    assert health["components"]["memory_cache"]["status"] == "UP"
 
     init_request = Request(
         f"{base_url}/api/user/init",
@@ -495,6 +497,26 @@ def test_frontend_proxy_reaches_backend_and_fake_chat_chain() -> None:
     assert compressed_count == source_message_count
     assert raw_count >= 2
     assert compressed_count + raw_count == 6
+
+    # 用独立会话验证第二轮复用缓存，避免改变上述摘要边界的确定性样例。
+    cache_seed = _send_chat_request(
+        base_url,
+        user_id="offline-user",
+        message="缓存验收会话：查询 000001.SZ",
+    )
+    follow_up = _send_chat_request(
+        base_url,
+        user_id="offline-user",
+        session_id=cache_seed["session_id"],
+        message="继续说明它的风险点",
+    )
+    assert follow_up["session_id"] == cache_seed["session_id"]
+    with urlopen(f"{base_url}/api/health", timeout=10) as response:  # noqa: S310
+        cache_health = json.loads(response.read().decode("utf-8"))["components"][
+            "memory_cache"
+        ]
+    assert cache_health["status"] == "UP"
+    assert cache_health["metrics"]["hits"] >= 1
 
     # 在同一个 tmpfs PostgreSQL 上验证核心约束，并做 downgrade/re-upgrade。
     asyncio.run(_assert_postgres_schema_contract())
