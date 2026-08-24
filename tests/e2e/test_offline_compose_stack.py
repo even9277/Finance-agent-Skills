@@ -91,6 +91,9 @@ async def _load_memory_transaction_evidence(
                     SELECT task_kind, status, schema_version, payload_json
                     FROM memory_outbox_tasks
                     WHERE session_id = :session_id
+                      AND task_kind = 'TURN_COMMITTED'
+                    ORDER BY created_at ASC
+                    LIMIT 1
                     """
                 ),
                 {"session_id": session_id},
@@ -253,7 +256,11 @@ async def _load_concurrency_evidence(session_id: str) -> dict[str, int]:
                           (SELECT count(*) FROM memory_working_states
                            WHERE session_id = :session_id) AS state_count,
                           (SELECT count(*) FROM memory_outbox_tasks
-                           WHERE session_id = :session_id) AS outbox_count,
+                           WHERE session_id = :session_id
+                             AND task_kind = 'TURN_COMMITTED') AS turn_outbox_count,
+                          (SELECT count(*) FROM memory_outbox_tasks
+                           WHERE session_id = :session_id
+                             AND task_kind = 'SUMMARY_COMPACT') AS summary_outbox_count,
                           (SELECT turn_count FROM sessions WHERE id = :session_id)
                             AS turn_count
                         """
@@ -262,6 +269,57 @@ async def _load_concurrency_evidence(session_id: str) -> dict[str, int]:
                 )
             ).mappings().one()
             return {key: int(value) for key, value in row.items()}
+    finally:
+        await engine.dispose()
+
+
+async def _wait_for_summary_evidence(session_id: str) -> dict[str, object]:
+    """等待后台摘要任务终态并返回安全边界证据。"""
+    engine = create_async_engine(os.environ["TEST_DATABASE_URL"])
+    try:
+        for _ in range(50):
+            async with engine.connect() as connection:
+                row = (
+                    await connection.execute(
+                        text(
+                            """
+                            SELECT s.summary_version,
+                                   s.running_summary,
+                                   t.status AS task_status,
+                                   m.source_start_message_id,
+                                   m.source_end_message_id,
+                                   m.source_message_count,
+                                   CAST(
+                                     t.payload_json ->> 'protected_tail_start_message_id'
+                                     AS INTEGER
+                                   ) AS protected_tail_start_message_id,
+                                   (SELECT count(*) FROM messages
+                                    WHERE session_id = :session_id
+                                      AND is_compressed = true) AS compressed_count,
+                                   (SELECT count(*) FROM messages
+                                    WHERE session_id = :session_id
+                                      AND is_compressed = false) AS raw_count
+                            FROM sessions s
+                            JOIN memory_outbox_tasks t
+                              ON t.session_id = s.id
+                             AND t.task_kind = 'SUMMARY_COMPACT'
+                             AND t.status = 'SUCCEEDED'
+                             AND CAST(
+                               t.payload_json ->> 'expected_summary_version' AS INTEGER
+                             ) + 1 = s.summary_version
+                            LEFT JOIN memory_summary_metadata m
+                              ON m.session_id = s.id
+                             AND m.summary_version = s.summary_version
+                            WHERE s.id = :session_id
+                            """
+                        ),
+                        {"session_id": session_id},
+                    )
+                ).mappings().one_or_none()
+            if row is not None and row["task_status"] == OutboxTaskStatus.SUCCEEDED.value:
+                return dict(row)
+            await asyncio.sleep(0.2)
+        raise AssertionError("summary worker did not reach SUCCEEDED within 10 seconds")
     finally:
         await engine.dispose()
 
@@ -338,7 +396,7 @@ def test_frontend_proxy_reaches_backend_and_fake_chat_chain() -> None:
     state, outbox = asyncio.run(_load_memory_transaction_evidence(chat["session_id"]))
     assert state["session_id"] == chat["session_id"]
     assert state["schema_version"] == MEMORY_SCHEMA_VERSION
-    assert state["state_version"] == 0
+    assert state["state_version"] == 1
     assert state["source_message_id"] == history["messages"][0]["id"]
     assert outbox["task_kind"] == OutboxTaskKind.TURN_COMMITTED.value
     assert outbox["status"] == OutboxTaskStatus.PENDING.value
@@ -347,7 +405,7 @@ def test_frontend_proxy_reaches_backend_and_fake_chat_chain() -> None:
         "session_id": chat["session_id"],
         "user_message_id": history["messages"][0]["id"],
         "assistant_message_id": history["messages"][1]["id"],
-        "state_version": 0,
+        "state_version": 1,
     }
 
     other_user_request = Request(
@@ -409,12 +467,34 @@ def test_frontend_proxy_reaches_backend_and_fake_chat_chain() -> None:
 
     concurrent_results = asyncio.run(send_concurrent_turns())
     assert all(item["session_id"] == chat["session_id"] for item in concurrent_results)
-    assert asyncio.run(_load_concurrency_evidence(str(chat["session_id"]))) == {
-        "message_count": 6,
-        "state_count": 1,
-        "outbox_count": 3,
-        "turn_count": 3,
-    }
+    concurrency_evidence = asyncio.run(
+        _load_concurrency_evidence(str(chat["session_id"]))
+    )
+    assert concurrency_evidence["message_count"] == 6
+    assert concurrency_evidence["state_count"] == 1
+    assert concurrency_evidence["turn_outbox_count"] == 3
+    assert concurrency_evidence["summary_outbox_count"] >= 1
+    assert concurrency_evidence["turn_count"] == 3
+    summary_evidence = asyncio.run(_wait_for_summary_evidence(str(chat["session_id"])))
+    assert summary_evidence["summary_version"] == 1
+    assert summary_evidence["running_summary"]
+    source_message_count = summary_evidence["source_message_count"]
+    assert isinstance(source_message_count, int)
+    assert source_message_count >= 2
+    source_end_message_id = summary_evidence["source_end_message_id"]
+    protected_tail_start_message_id = summary_evidence[
+        "protected_tail_start_message_id"
+    ]
+    assert isinstance(source_end_message_id, int)
+    assert isinstance(protected_tail_start_message_id, int)
+    assert source_end_message_id < protected_tail_start_message_id
+    compressed_count = summary_evidence["compressed_count"]
+    raw_count = summary_evidence["raw_count"]
+    assert isinstance(compressed_count, int)
+    assert isinstance(raw_count, int)
+    assert compressed_count == source_message_count
+    assert raw_count >= 2
+    assert compressed_count + raw_count == 6
 
     # 在同一个 tmpfs PostgreSQL 上验证核心约束，并做 downgrade/re-upgrade。
     asyncio.run(_assert_postgres_schema_contract())

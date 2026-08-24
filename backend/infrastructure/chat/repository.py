@@ -16,9 +16,17 @@ from backend.application.chat.contracts import (
     ChatSummaryRecord,
     PreparedChatTurn,
 )
+from backend.application.memory.context import ContextBudgetPolicy, ContextTextItem
 from backend.application.memory.ports import TransactionalMemoryRepository
 from backend.config import settings
-from backend.db.models import Message, Session, SessionSummary, UserInvestProfile
+from backend.application.memory.summary import SUMMARY_PROMPT_VERSION
+from backend.db.models import (
+    MemoryOutboxTaskRow,
+    Message,
+    Session,
+    SessionSummary,
+    UserInvestProfile,
+)
 from backend.infrastructure.memory.repository import SqlAlchemyMemoryRepository
 from backend.services.stm_context_service import (
     build_context_window_payload,
@@ -29,8 +37,11 @@ from src.conversation.contracts import ConversationRequest, ConversationResult
 from src.memory.contracts import (
     NewOutboxTask,
     OutboxTaskKind,
+    OutboxTaskStatus,
+    SummaryCompactPayload,
     TurnCommittedPayload,
     WorkingState,
+    build_summary_outbox_key,
     build_turn_outbox_key,
 )
 
@@ -82,6 +93,25 @@ class SqlAlchemyConversationRepository:
             .limit(max(1, int(settings.stm_keep_recent)))
         )
         recent = list(reversed(list(history_result.scalars().all())))
+        packed = ContextBudgetPolicy(
+            model_window_tokens=max(1, int(settings.stm_context_budget_tokens)),
+            output_reserve_tokens=max(0, int(settings.stm_response_reserve_tokens)),
+            safety_margin_tokens=max(
+                0,
+                int(settings.stm_context_safety_margin_tokens),
+            ),
+            stage_overhead_tokens=max(0, int(settings.stm_stage_overhead_tokens)),
+        ).pack(
+            current_message=command.message,
+            recent_messages=tuple(
+                ContextTextItem(
+                    message_id=item.id,
+                    text=f"{item.role}: {item.content}",
+                )
+                for item in recent
+            ),
+            running_summary=session.running_summary,
+        )
         token_count, _ = count_message_tokens("user", command.message)
         user_message = Message(
             session_id=session.id,
@@ -104,8 +134,8 @@ class SqlAlchemyConversationRepository:
 
         return PreparedChatTurn(
             session_id=session.id,
-            recent_messages=tuple(f"{item.role}: {item.content}" for item in recent),
-            running_summary=session.running_summary,
+            recent_messages=tuple(item.text for item in packed.recent_messages),
+            running_summary=packed.running_summary,
             memory_profile=await self._load_memory_profile(command.user_id),
             working_state=working_state,
         )
@@ -165,6 +195,127 @@ class SqlAlchemyConversationRepository:
             )
         )
         return ChatContextWindowData(**context.model_dump())
+
+    async def apply_working_state(
+        self,
+        request: ConversationRequest,
+        result: ConversationResult,
+    ) -> WorkingState:
+        """在前台事务中以 CAS 暂存本轮状态和字段审计事件。"""
+        current = self._prepared_working_states.get(request.session_id)
+        source_message_id = self._prepared_user_message_ids.get(request.session_id)
+        if current is None or source_message_id is None:
+            raise RuntimeError("prepared working-state context is missing")
+        if result.working_state_update is None:
+            return current
+        transition = await self._memory.apply_working_state(
+            current=current,
+            update=result.working_state_update,
+            session_id=request.session_id,
+            source_message_id=source_message_id,
+            trace_id=result.context.trace_id,
+        )
+        self._prepared_working_states[request.session_id] = transition.state
+        return transition.state
+
+    async def maybe_enqueue_compaction(
+        self,
+        request: ConversationRequest,
+        result: ConversationResult,
+    ) -> bool:
+        """按预算与 protected tail 幂等暂存 Rolling Summary 任务。
+
+        该方法只在前台轮次已经提交后调用。失败会由 Application 回滚这次
+        后台排队事务，不能影响已经返回所需的聊天结果。
+        """
+        if not settings.enable_stm:
+            return False
+        session = await self._owned_session(request.session_id, request.user_id, lock=True)
+        if session is None:
+            raise RuntimeError("committed chat session is missing")
+        await refresh_session_context_metrics(self._db, session)
+
+        messages = list(
+            (
+                await self._db.execute(
+                    select(Message)
+                    .where(
+                        Message.session_id == request.session_id,
+                        Message.is_compressed.is_(False),
+                    )
+                    .order_by(Message.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not self._should_compact(session, len(messages)):
+            return False
+        keep_recent = max(1, int(settings.stm_keep_recent))
+        if len(messages) <= keep_recent:
+            return False
+
+        active_task = await self._db.scalar(
+            select(MemoryOutboxTaskRow.id).where(
+                MemoryOutboxTaskRow.session_id == request.session_id,
+                MemoryOutboxTaskRow.task_kind == OutboxTaskKind.SUMMARY_COMPACT.value,
+                MemoryOutboxTaskRow.status.in_(
+                    (
+                        OutboxTaskStatus.PENDING.value,
+                        OutboxTaskStatus.PROCESSING.value,
+                        OutboxTaskStatus.RETRY.value,
+                    )
+                ),
+            )
+        )
+        if active_task is not None:
+            return False
+
+        source_messages = messages[:-keep_recent]
+        protected_tail = messages[-keep_recent:]
+        payload = SummaryCompactPayload(
+            session_id=request.session_id,
+            expected_summary_version=int(session.summary_version or 0),
+            source_start_message_id=source_messages[0].id,
+            source_end_message_id=source_messages[-1].id,
+            source_message_count=len(source_messages),
+            protected_tail_start_message_id=protected_tail[0].id,
+            input_token_estimate=sum(
+                max(0, int(message.token_count or 0)) for message in source_messages
+            ),
+            prompt_version=SUMMARY_PROMPT_VERSION,
+        )
+        await self._memory.enqueue_outbox(
+            NewOutboxTask(
+                user_id=request.user_id,
+                session_id=request.session_id,
+                aggregate_type="chat_session",
+                aggregate_id=request.session_id,
+                task_kind=OutboxTaskKind.SUMMARY_COMPACT,
+                idempotency_key=build_summary_outbox_key(
+                    request.session_id,
+                    payload.expected_summary_version,
+                    payload.source_end_message_id,
+                ),
+                payload=payload,
+                trace_id=result.context.trace_id,
+            )
+        )
+        session.compression_status = "queued"
+        return True
+
+    @staticmethod
+    def _should_compact(session: Session, uncompressed_count: int) -> bool:
+        """按配置策略判断是否达到压缩水位，不执行外部调用。"""
+        if settings.stm_compression_strategy == "legacy_count":
+            return uncompressed_count >= int(settings.stm_legacy_count_threshold)
+        budget = max(1, int(session.context_budget_tokens or settings.stm_context_budget_tokens))
+        projected = (
+            int(session.context_token_count or 0)
+            + int(settings.stm_response_reserve_tokens)
+            + int(settings.stm_memory_reserve_tokens)
+        )
+        return projected >= int(round(budget * float(settings.stm_context_target_ratio)))
 
     async def commit(self) -> None:
         """提交完整一轮事务。"""

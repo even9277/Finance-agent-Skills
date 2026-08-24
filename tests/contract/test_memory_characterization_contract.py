@@ -138,7 +138,6 @@ def test_prepared_turn_exposes_typed_working_state() -> None:
 
 
 @pytest.mark.contract
-@TARGET_GAP
 def test_chat_use_case_enqueues_compaction_after_a_committed_turn() -> None:
     """目标触发器：聊天用例必须在提交后进入压缩任务应用边界。"""
     source = dedent(inspect.getsource(ControlledChatUseCase.execute))

@@ -6,9 +6,9 @@
 """
 
 from pathlib import Path
-from typing import List
+from typing import List, Self
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 _BACKEND_DIR = Path(__file__).resolve().parent
@@ -72,11 +72,17 @@ class Settings(BaseSettings):
     stm_context_hard_ratio: float = 0.85
     stm_response_reserve_tokens: int = 1200
     stm_memory_reserve_tokens: int = 600
+    stm_context_safety_margin_tokens: int = 1000
+    stm_stage_overhead_tokens: int = 600
     stm_keep_recent: int = 4
     stm_legacy_count_threshold: int = 10
     stm_worker_interval_sec: int = 3
     stm_worker_batch_size: int = 10
     stm_worker_max_retries: int = 3
+    stm_summary_provider: str = "openai"
+    stm_summary_timeout_sec: int = 30
+    # 必须覆盖一次模型调用及提交尾延迟，避免合法调用被过早回收并重复计费。
+    stm_worker_lease_sec: int = 60
 
     # ── Mem0 / pgvector 配置（Phase 3）────────────────────
     # PostgreSQL 连接（Mem0 向量库使用，SQLite 环境下这些配置被忽略）
@@ -139,6 +145,44 @@ class Settings(BaseSettings):
             if normalized in {"debug", "dev", "development"}:
                 return True
         return value
+
+    @field_validator("stm_summary_provider")
+    @classmethod
+    def _validate_stm_summary_provider(cls, value: str) -> str:
+        """限制摘要 Provider 为生产模型或显式离线实现。"""
+        normalized = value.strip().lower()
+        if normalized not in {"openai", "deterministic"}:
+            raise ValueError("stm_summary_provider must be openai or deterministic")
+        return normalized
+
+    @field_validator(
+        "stm_context_budget_tokens",
+        "stm_keep_recent",
+        "stm_legacy_count_threshold",
+        "stm_worker_interval_sec",
+        "stm_worker_batch_size",
+        "stm_worker_max_retries",
+        "stm_summary_timeout_sec",
+        "stm_worker_lease_sec",
+    )
+    @classmethod
+    def _validate_positive_stm_integer(cls, value: int) -> int:
+        """拒绝会关闭预算、轮询、重试或租约保护的非正整数。"""
+        if value < 1:
+            raise ValueError("STM integer settings must be positive")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_stm_worker_timing(self) -> Self:
+        """确保一次合法摘要调用不会在正常超时前丢失任务所有权。"""
+        safety_margin_sec = 5
+        minimum_lease = self.stm_summary_timeout_sec + safety_margin_sec
+        if self.stm_worker_lease_sec <= minimum_lease:
+            raise ValueError(
+                "stm_worker_lease_sec must be greater than "
+                "stm_summary_timeout_sec + 5 seconds"
+            )
+        return self
 
     model_config = {
         "env_file": [

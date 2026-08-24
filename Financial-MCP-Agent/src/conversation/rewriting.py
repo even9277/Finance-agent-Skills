@@ -5,6 +5,7 @@ from __future__ import annotations
 from .constraints import ConstraintExtractor
 from .contracts import (
     ConstraintSet,
+    ConstraintOperation,
     ContextPacket,
     Entity,
     EntityResolutionResult,
@@ -13,6 +14,7 @@ from .contracts import (
     FallbackRewriteResult,
     RewriteResult,
     ReplyPreference,
+    PreferenceOperation,
     RouteDecision,
     RouteFamily,
     SkillCatalogSnapshot,
@@ -61,6 +63,24 @@ class RouteAwareRewriter:
             entities = (entity_result.entity,)
         constraints = self._constraints.extract(packet.current_message)
         preference = self._preferences.extract(packet.current_message)
+        if (
+            constraints.operation is ConstraintOperation.NO_UPDATE
+            and packet.confirmed_constraints
+        ):
+            constraints = ConstraintSet(
+                items=packet.confirmed_constraints,
+                operation=ConstraintOperation.NO_UPDATE,
+                confidence=1.0,
+            )
+        if (
+            preference.operation is PreferenceOperation.NO_UPDATE
+            and packet.reply_preference_hint
+        ):
+            preference = ReplyPreference(
+                hint=packet.reply_preference_hint,
+                operation=PreferenceOperation.NO_UPDATE,
+                confidence=1.0,
+            )
         time_scope = _infer_time_scope(packet.current_message)
 
         if route.family is RouteFamily.FINANCIAL_SOP:

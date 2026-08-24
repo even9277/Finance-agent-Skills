@@ -21,6 +21,11 @@ class ConstraintExtractor:
         Returns:
             去重且保持规则顺序的约束集合和更新语义。
         """
+        if re.search(r"(取消|清除|不要).{0,6}(之前|当前)?.{0,4}(约束|限制)", text or ""):
+            return ConstraintSet(
+                operation=ConstraintOperation.CLEAR,
+                confidence=0.9,
+            )
         items: list[str] = []
         market = _MARKET_PATTERN.search(text or "")
         if market:

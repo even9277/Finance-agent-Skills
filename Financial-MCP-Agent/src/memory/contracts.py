@@ -41,6 +41,7 @@ class WorkingStateField(StrEnum):
     """Working State 允许变更的有限字段。"""
 
     ACTIVE_ENTITY = "active_entity"
+    CANDIDATE_ENTITIES = "candidate_entities"
     CONSTRAINTS = "constraints"
     REPLY_PREFERENCE_HINT = "reply_preference_hint"
 
@@ -241,6 +242,42 @@ class WorkingState:
         if len(self.reply_preference_hint) > 220:
             raise MemoryContractError("reply_preference_hint exceeds 220 characters")
         _require_nonblank(self.schema_version, "schema_version")
+
+
+@dataclass(frozen=True, slots=True)
+class WorkingStateUpdate:
+    """表示受控工作流本轮允许提交的窄状态更新意图。
+
+    `NOOP` 字段不会刷新版本；实体继承也应保持 `NOOP`，避免把旧证据
+    伪装成本轮新事实。`CLEAR` 只清理对应字段，不级联清理其他状态。
+    """
+
+    active_entity: WorkingEntity | None = None
+    candidate_entities: tuple[WorkingEntity, ...] = ()
+    active_entity_operation: StateOperation = StateOperation.NOOP
+    candidate_entities_operation: StateOperation = StateOperation.NOOP
+    constraints: tuple[str, ...] = ()
+    constraints_operation: StateOperation = StateOperation.NOOP
+    reply_preference_hint: str = ""
+    reply_preference_operation: StateOperation = StateOperation.NOOP
+    source: MemorySource = MemorySource.USER_MESSAGE
+    confidence: float = 1.0
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.confidence <= 1.0:
+            raise MemoryContractError("working-state confidence must be between 0 and 1")
+        if len(self.constraints) > 8 or any(not item.strip() for item in self.constraints):
+            raise MemoryContractError("working-state update has invalid constraints")
+        if len(self.reply_preference_hint) > 220:
+            raise MemoryContractError("working-state reply preference exceeds 220 characters")
+
+
+@dataclass(frozen=True, slots=True)
+class WorkingStateTransition:
+    """返回一次确定性归并后的快照和同版本字段事件。"""
+
+    state: WorkingState
+    events: tuple[WorkingStateEvent, ...]
 
 
 StateValue = WorkingEntity | tuple[WorkingEntity, ...] | tuple[str, ...] | str | None
@@ -468,6 +505,41 @@ class TurnCommittedPayload:
 
 
 @dataclass(frozen=True, slots=True)
+class SummaryCompactPayload:
+    """冻结一次 Rolling Summary 任务的来源边界和乐观版本。"""
+
+    session_id: str
+    expected_summary_version: int
+    source_start_message_id: int
+    source_end_message_id: int
+    source_message_count: int
+    protected_tail_start_message_id: int
+    input_token_estimate: int
+    prompt_version: str
+
+    def __post_init__(self) -> None:
+        _require_nonblank(self.session_id, "session_id")
+        _require_nonblank(self.prompt_version, "prompt_version")
+        if min(
+            self.expected_summary_version,
+            self.source_start_message_id,
+            self.source_end_message_id,
+            self.source_message_count,
+            self.protected_tail_start_message_id,
+            self.input_token_estimate,
+        ) < 0:
+            raise MemoryContractError("summary compact counters must be non-negative")
+        if self.source_start_message_id <= 0 or self.source_end_message_id <= 0:
+            raise MemoryContractError("summary source message ids must be positive")
+        if self.source_start_message_id > self.source_end_message_id:
+            raise MemoryContractError("summary source boundary is reversed")
+        if self.source_message_count <= 0:
+            raise MemoryContractError("summary source message count must be positive")
+        if self.source_end_message_id >= self.protected_tail_start_message_id:
+            raise MemoryContractError("summary source overlaps protected tail")
+
+
+@dataclass(frozen=True, slots=True)
 class NewOutboxTask:
     """表示尚未持久化、必须与业务状态同事务写入的任务意图。"""
 
@@ -476,7 +548,7 @@ class NewOutboxTask:
     aggregate_id: str
     task_kind: OutboxTaskKind
     idempotency_key: str
-    payload: TurnCommittedPayload
+    payload: TurnCommittedPayload | SummaryCompactPayload
     session_id: str | None = None
     trace_id: str | None = None
     schema_version: str = MEMORY_SCHEMA_VERSION
@@ -491,6 +563,8 @@ class NewOutboxTask:
         ):
             _require_nonblank(value, field_name)
         if self.task_kind is OutboxTaskKind.TURN_COMMITTED:
+            if not isinstance(self.payload, TurnCommittedPayload):
+                raise MemoryContractError("turn-committed task requires its typed payload")
             if self.session_id is None:
                 raise MemoryContractError("turn-committed task requires session_id")
             if self.session_id != self.payload.session_id:
@@ -509,6 +583,15 @@ class NewOutboxTask:
                 raise MemoryContractError(
                     "outbox idempotency_key must match the committed user message"
                 )
+        if self.task_kind is OutboxTaskKind.SUMMARY_COMPACT:
+            if not isinstance(self.payload, SummaryCompactPayload):
+                raise MemoryContractError("summary task requires its typed payload")
+            if self.session_id != self.payload.session_id:
+                raise MemoryContractError("summary task session_id must match payload")
+            if self.aggregate_type != "chat_session":
+                raise MemoryContractError("summary aggregate_type must be chat_session")
+            if self.aggregate_id != self.payload.session_id:
+                raise MemoryContractError("summary aggregate_id must match payload session")
 
 
 @dataclass(frozen=True, slots=True)
@@ -641,3 +724,18 @@ def build_turn_outbox_key(session_id: str, user_message_id: int) -> str:
     if user_message_id <= 0:
         raise MemoryContractError("user_message_id must be positive")
     return f"memory:turn-committed:{session_id}:{user_message_id}"
+
+
+def build_summary_outbox_key(
+    session_id: str,
+    expected_summary_version: int,
+    source_end_message_id: int,
+) -> str:
+    """构造同一摘要版本与来源边界唯一的任务幂等键。"""
+    _require_nonblank(session_id, "session_id")
+    if expected_summary_version < 0 or source_end_message_id <= 0:
+        raise MemoryContractError("summary outbox key contains invalid counters")
+    return (
+        f"memory:summary-compact:{session_id}:"
+        f"{expected_summary_version}:{source_end_message_id}"
+    )

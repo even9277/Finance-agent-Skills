@@ -34,6 +34,7 @@ from src.conversation.contracts import (  # noqa: E402
     ConversationResult,
 )
 from src.conversation.workflow import ControlledConversationWorkflow  # noqa: E402
+from src.memory.contracts import StateOperation, WorkingEntity, WorkingState  # noqa: E402
 
 
 @dataclass(slots=True)
@@ -65,6 +66,7 @@ class _RecordingWorkflow(ControlledConversationWorkflow):
         *,
         recent_messages: tuple[str, ...] = (),
         running_summary: str | None = None,
+        working_state: WorkingState | None = None,
     ) -> ConversationResult:
         """记录历史参数并复用真实工作流实现。"""
         self.received_recent_messages = recent_messages
@@ -73,7 +75,36 @@ class _RecordingWorkflow(ControlledConversationWorkflow):
             request,
             recent_messages=recent_messages,
             running_summary=running_summary,
+            working_state=working_state,
         )
+
+
+@dataclass(slots=True)
+class _FailingCompactionRepository(InMemoryConversationRepository):
+    """模拟前台已提交后，后台摘要排队事务失败。"""
+
+    commit_count: int = 0
+    durable_saved_count: int = 0
+
+    async def commit(self) -> None:
+        """把首次提交视为已持久化前台轮次。"""
+        self.commit_count += 1
+        self.committed = True
+        self.durable_saved_count = len(self.saved)
+
+    async def maybe_enqueue_compaction(
+        self,
+        request: ConversationRequest,
+        result: ConversationResult,
+    ) -> bool:
+        """确认提交顺序后模拟后台持久任务排队失败。"""
+        del request, result
+        assert self.commit_count == 1
+        raise RuntimeError("fixture compaction enqueue failure")
+
+    async def rollback(self) -> None:
+        """只回滚第二个事务，不撤销已提交的前台快照。"""
+        self.rolled_back = True
 
 
 @pytest.mark.unit
@@ -181,5 +212,188 @@ def test_current_message_wins_over_conflicting_summary_and_profile_is_not_eviden
             "fixture:get_stock_basic_info:v1",
             "fixture:get_market_bars:v1",
         }
+
+    asyncio.run(run_case())
+
+
+@pytest.mark.unit
+def test_compaction_enqueue_failure_does_not_reverse_committed_foreground_turn() -> None:
+    """摘要任务排队失败只能降级，已提交回答仍必须返回且可恢复。"""
+
+    async def run_case() -> None:
+        repository = _FailingCompactionRepository()
+        outcome = await ControlledChatUseCase(
+            workflow=ControlledConversationWorkflow(
+                model=FakeModelProvider(),
+                tool=FakeToolProvider(),
+                trace=InMemoryTraceSink(),
+            ),
+            repository=repository,
+        ).execute(
+            ChatCommand(
+                user_id="fixture-user-memory",
+                session_id="fixture-session-memory",
+                message="查询贵州茅台 600519.SH 的近期走势",
+            )
+        )
+
+        assert outcome.reply
+        assert repository.commit_count == 1
+        assert repository.durable_saved_count == 1
+        assert repository.rolled_back is True
+
+    asyncio.run(run_case())
+
+
+@pytest.mark.unit
+def test_follow_up_inherits_typed_working_entity_before_ambiguous_raw_history() -> None:
+    """指代追问优先继承权威状态，不从含多个实体的原文窗口盲猜。"""
+
+    async def run_case() -> None:
+        workflow = ControlledConversationWorkflow(
+            model=FakeModelProvider(),
+            tool=FakeToolProvider(),
+            trace=InMemoryTraceSink(),
+        )
+        result = await workflow.run(
+            ConversationRequest(
+                user_id="fixture-user-memory",
+                session_id="fixture-session-memory",
+                message="它最近走势怎么样",
+            ),
+            recent_messages=(
+                "user: 我之前还看过宁德时代 300750.SZ",
+                "assistant: 当前主线已经切换到贵州茅台 600519.SH",
+            ),
+            working_state=WorkingState(
+                active_entity=WorkingEntity(
+                    symbol="600519.SH",
+                    name="贵州茅台",
+                    entity_type="stock",
+                ),
+                state_version=2,
+            ),
+        )
+
+        assert result.entity is not None
+        assert result.entity.symbol == "600519.SH"
+        assert result.working_state_update is not None
+        assert result.working_state_update.active_entity_operation is StateOperation.NOOP
+        assert result.tool_call_count == 1
+
+    asyncio.run(run_case())
+
+
+@pytest.mark.unit
+def test_explicit_switch_returns_a_narrow_working_state_update() -> None:
+    """当前轮明确切换实体时，工作流只返回可审计的窄状态更新。"""
+
+    async def run_case() -> None:
+        workflow = ControlledConversationWorkflow(
+            model=FakeModelProvider(),
+            tool=FakeToolProvider(),
+            trace=InMemoryTraceSink(),
+        )
+        result = await workflow.run(
+            ConversationRequest(
+                user_id="fixture-user-memory",
+                session_id="fixture-session-memory",
+                message="换成贵州茅台 600519.SH，先给结论，不要给买卖点，看看近期走势",
+            ),
+            working_state=WorkingState(
+                active_entity=WorkingEntity(
+                    symbol="300750.SZ",
+                    name="宁德时代",
+                    entity_type="stock",
+                ),
+                state_version=2,
+            ),
+        )
+
+        update = result.working_state_update
+        assert update is not None
+        assert update.active_entity is not None
+        assert update.active_entity.symbol == "600519.SH"
+        assert update.active_entity_operation is StateOperation.SET
+        assert update.constraints == ("不提供直接买卖建议",)
+        assert update.constraints_operation is StateOperation.MERGE
+        assert update.reply_preference_hint == "先给结论，再展开"
+
+    asyncio.run(run_case())
+
+
+@pytest.mark.unit
+def test_explicit_clear_signals_do_not_mutate_unaddressed_entity() -> None:
+    """清除临时约束和回答偏好时仍保留当前明确实体。"""
+
+    async def run_case() -> None:
+        workflow = ControlledConversationWorkflow(
+            model=FakeModelProvider(),
+            tool=FakeToolProvider(),
+            trace=InMemoryTraceSink(),
+        )
+        result = await workflow.run(
+            ConversationRequest(
+                user_id="fixture-user-memory",
+                session_id="fixture-session-memory",
+                message="贵州茅台 600519.SH 按默认回答，取消之前的约束，看看近期走势",
+            ),
+            working_state=WorkingState(
+                active_entity=WorkingEntity(
+                    symbol="600519.SH",
+                    name="贵州茅台",
+                    entity_type="stock",
+                ),
+                constraints=("只看A股口径",),
+                reply_preference_hint="回答简洁",
+                state_version=2,
+            ),
+        )
+
+        update = result.working_state_update
+        assert update is not None
+        assert update.constraints_operation is StateOperation.CLEAR
+        assert update.reply_preference_operation is StateOperation.CLEAR
+
+    asyncio.run(run_case())
+
+
+@pytest.mark.unit
+def test_new_topic_expires_previous_segment_state_before_inheritance() -> None:
+    """明确新话题是确定性段边界，旧实体、约束和偏好不得继续注入。"""
+
+    async def run_case() -> None:
+        workflow = ControlledConversationWorkflow(
+            model=FakeModelProvider(),
+            tool=FakeToolProvider(),
+            trace=InMemoryTraceSink(),
+        )
+        result = await workflow.run(
+            ConversationRequest(
+                user_id="fixture-user-memory",
+                session_id="fixture-session-memory",
+                message="重新开始一个新话题，查询宁德时代 300750.SZ 的近期走势",
+            ),
+            working_state=WorkingState(
+                active_entity=WorkingEntity(
+                    symbol="600519.SH",
+                    name="贵州茅台",
+                    entity_type="stock",
+                ),
+                constraints=("不提供直接买卖建议",),
+                reply_preference_hint="回答简洁",
+                state_version=4,
+            ),
+        )
+
+        update = result.working_state_update
+        assert result.entity is not None
+        assert result.entity.symbol == "300750.SZ"
+        assert update is not None
+        assert update.active_entity is not None
+        assert update.active_entity.symbol == "300750.SZ"
+        assert update.active_entity_operation is StateOperation.SET
+        assert update.constraints_operation is StateOperation.EXPIRE
+        assert update.reply_preference_operation is StateOperation.EXPIRE
 
     asyncio.run(run_case())

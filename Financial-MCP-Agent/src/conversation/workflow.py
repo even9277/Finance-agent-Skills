@@ -8,22 +8,34 @@ import uuid
 from dataclasses import dataclass, replace
 from datetime import date
 
+from src.memory.contracts import (
+    MemorySource,
+    StateOperation,
+    WorkingEntity,
+    WorkingState,
+    WorkingStateUpdate,
+)
+
 from .context import ContextBuilder
 from .contracts import (
     AnswerContextPack,
     ControllerAction,
     ControllerDecision,
     ControllerRuntimeState,
+    ConstraintOperation,
     ConversationRequest,
     ConversationResult,
     ConversationRunContext,
     ConversationState,
     Entity,
+    EntityResolutionResult,
     ErrorCode,
     EventAttribute,
     ExecutedPlanStep,
     RouteDecision,
     RouteFamily,
+    PreferenceOperation,
+    RewriteResult,
     RunBudget,
     RunPhase,
     StageName,
@@ -51,6 +63,86 @@ from .validation import PlanValidator
 from .verification import EvidenceVerifier
 
 logger = logging.getLogger(__name__)
+
+
+def _build_working_state_update(
+    entity_result: EntityResolutionResult,
+    rewrite: RewriteResult | None = None,
+    *,
+    reset_segment: bool = False,
+) -> WorkingStateUpdate:
+    """把理解链结果收敛为 Memory 域允许持久化的窄更新。"""
+    resolved = entity_result.resolved_entities or (
+        (entity_result.entity,) if entity_result.entity is not None else ()
+    )
+    candidates = entity_result.candidates or resolved
+    if entity_result.entity is not None and not entity_result.inherited:
+        active_operation = StateOperation.SET
+    else:
+        active_operation = (
+            StateOperation.EXPIRE if reset_segment else StateOperation.NOOP
+        )
+    if candidates and not entity_result.inherited:
+        candidate_operation = StateOperation.SET
+    else:
+        candidate_operation = (
+            StateOperation.EXPIRE if reset_segment else StateOperation.NOOP
+        )
+    constraint_operation = (
+        StateOperation.EXPIRE if reset_segment else StateOperation.NOOP
+    )
+    constraints: tuple[str, ...] = ()
+    preference_operation = (
+        StateOperation.EXPIRE if reset_segment else StateOperation.NOOP
+    )
+    preference_hint = ""
+    confidence = entity_result.confidence
+    if rewrite is not None:
+        constraints = rewrite.constraints.items
+        if rewrite.constraints.operation is ConstraintOperation.MERGE:
+            constraint_operation = (
+                StateOperation.SET if reset_segment else StateOperation.MERGE
+            )
+        elif rewrite.constraints.operation is ConstraintOperation.CLEAR:
+            constraint_operation = StateOperation.CLEAR
+        preference_hint = rewrite.reply_preference.hint
+        if rewrite.reply_preference.operation is PreferenceOperation.REPLACE:
+            preference_operation = StateOperation.SET
+        elif rewrite.reply_preference.operation is PreferenceOperation.CLEAR:
+            preference_operation = StateOperation.CLEAR
+        confidence = max(
+            confidence,
+            rewrite.constraints.confidence,
+            rewrite.reply_preference.confidence,
+        )
+
+    return WorkingStateUpdate(
+        active_entity=(
+            WorkingEntity(
+                symbol=entity_result.entity.symbol,
+                name=entity_result.entity.name,
+                entity_type=entity_result.entity.entity_type.value,
+            )
+            if entity_result.entity is not None
+            else None
+        ),
+        candidate_entities=tuple(
+            WorkingEntity(
+                symbol=item.symbol,
+                name=item.name,
+                entity_type=item.entity_type.value,
+            )
+            for item in candidates
+        ),
+        active_entity_operation=active_operation,
+        candidate_entities_operation=candidate_operation,
+        constraints=constraints,
+        constraints_operation=constraint_operation,
+        reply_preference_hint=preference_hint,
+        reply_preference_operation=preference_operation,
+        source=MemorySource.USER_MESSAGE,
+        confidence=confidence,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +203,7 @@ class ControlledConversationWorkflow:
         *,
         recent_messages: tuple[str, ...] = (),
         running_summary: str | None = None,
+        working_state: WorkingState | None = None,
     ) -> ConversationResult:
         """执行一轮受控对话并返回唯一终态。
 
@@ -118,6 +211,7 @@ class ControlledConversationWorkflow:
             request: 已由调用边界构造并校验的请求。
             recent_messages: 可选、已裁剪的会话尾窗。
             running_summary: 可选会话摘要；当前轮问题始终优先。
+            working_state: 当前会话版本化热状态；仅作为受门控继承候选。
 
         Returns:
             包含阶段事件、证据门控和终态的不可变结果。
@@ -139,6 +233,7 @@ class ControlledConversationWorkflow:
                 request,
                 recent_messages=recent_messages,
                 running_summary=running_summary,
+                working_state=working_state,
             )
             state.transition(RunPhase.PREFLIGHTED)
             self._emit(events, context, StageName.CONTEXT, StageStatus.SUCCEEDED, started)
@@ -189,6 +284,10 @@ class ControlledConversationWorkflow:
                     events=tuple(events),
                     controller=decision,
                     error_code=entity_result.error_code,
+                    working_state_update=_build_working_state_update(
+                        entity_result,
+                        reset_segment=packet.reset_working_segment,
+                    ),
                 )
 
             started = time.perf_counter()
@@ -242,6 +341,10 @@ class ControlledConversationWorkflow:
                     route=route,
                     controller=decision,
                     error_code=ErrorCode.ROUTE_CONFIRMATION_REQUIRED,
+                    working_state_update=_build_working_state_update(
+                        entity_result,
+                        reset_segment=packet.reset_working_segment,
+                    ),
                 )
 
             started = time.perf_counter()
@@ -290,6 +393,11 @@ class ControlledConversationWorkflow:
                     route=route,
                     controller=decision,
                     error_code=ErrorCode.REWRITE_CLARIFICATION_REQUIRED,
+                    working_state_update=_build_working_state_update(
+                        entity_result,
+                        rewrite,
+                        reset_segment=packet.reset_working_segment,
+                    ),
                 )
 
             if route.family is RouteFamily.FALLBACK:
@@ -311,6 +419,11 @@ class ControlledConversationWorkflow:
                     events=tuple(events),
                     entity=rewrite.entity,
                     route=route,
+                    working_state_update=_build_working_state_update(
+                        entity_result,
+                        rewrite,
+                        reset_segment=packet.reset_working_segment,
+                    ),
                 )
 
             if rewrite.entity is None and route.family is RouteFamily.TUSHARE_DATA:
@@ -623,6 +736,11 @@ class ControlledConversationWorkflow:
                     item.value for item in verification.missing_dimensions
                 ),
                 tool_call_count=total_tool_calls,
+                working_state_update=_build_working_state_update(
+                    entity_result,
+                    rewrite,
+                    reset_segment=packet.reset_working_segment,
+                ),
             )
         except StepBudgetExceededError:
             return self._failed_result(

@@ -41,7 +41,12 @@ services:
       LANGFUSE_PUBLIC_KEY: ""
       LANGFUSE_SECRET_KEY: ""
       ENABLE_MEMORY: "false"
-      ENABLE_STM: "false"
+      ENABLE_STM: "true"
+      STM_SUMMARY_PROVIDER: deterministic
+      STM_COMPRESSION_STRATEGY: legacy_count
+      STM_LEGACY_COUNT_THRESHOLD: "4"
+      STM_KEEP_RECENT: "2"
+      STM_WORKER_INTERVAL_SEC: "1"
       ENABLE_TRACE: "true"
       CHAT_TRACE_JSONL_PATH: /test-artifacts/chat_traces.jsonl
     volumes:
@@ -88,7 +93,11 @@ services:
       LANGFUSE_PUBLIC_KEY: ""
       LANGFUSE_SECRET_KEY: ""
       ENABLE_MEMORY: "false"
-      ENABLE_STM: "false"
+      ENABLE_STM: "true"
+      STM_SUMMARY_PROVIDER: deterministic
+      STM_COMPRESSION_STRATEGY: legacy_count
+      STM_LEGACY_COUNT_THRESHOLD: "4"
+      STM_KEEP_RECENT: "2"
       OFFLINE_TRACE_PATH: /test-artifacts/chat_traces.jsonl
     volumes:
       - trace-e2e:/test-artifacts:ro
