@@ -381,7 +381,7 @@ export type WsControlFrame =
   | { type: 'compress_start'; session_id: string; progress: number; eta_seconds: number }
   | { type: 'compress_done'; session_id: string; progress: number; eta_seconds: number; elapsed_seconds: number; snapshot_id?: number; compressed_message_count?: number; total_message_count?: number; percent?: number }
   | { type: 'compress_skip'; session_id: string; progress: number; eta_seconds: number }
-  | { type: 'error'; message: string }
+  | { type: 'error'; code?: string; message: string }
 
 /**
  * 解析 WebSocket 收到的帧：

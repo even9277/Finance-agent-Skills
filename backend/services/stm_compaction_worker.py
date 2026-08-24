@@ -138,7 +138,11 @@ async def _retry_task(task_id: int, *, retry_count: int, error_msg: str = "") ->
 
 
 async def _process_task(task_id: int) -> None:
-    from backend.services import chat_service
+    from backend.services.stm_compaction_support import (
+        SUMMARIZE_CONVERSATION_PROMPT,
+        build_compaction_model,
+        extract_profile_from_summary,
+    )
 
     async with AsyncSessionFactory() as db:
         task = await db.get(StmCompactionTask, task_id)
@@ -185,10 +189,10 @@ async def _process_task(task_id: int) -> None:
 
         from langchain_core.messages import HumanMessage, SystemMessage
 
-        llm = chat_service._get_llm()
+        llm = build_compaction_model()
         response = await llm.ainvoke(
             [
-                SystemMessage(content=chat_service._SUMMARIZE_CONVERSATION_PROMPT),
+                SystemMessage(content=SUMMARIZE_CONVERSATION_PROMPT),
                 HumanMessage(content=f"请压缩以下对话历史：\n\n{chr(10).join(compress_parts)}"),
             ]
         )
@@ -243,7 +247,7 @@ async def _process_task(task_id: int) -> None:
         await refresh_session_context_metrics(db, session)
         await db.commit()
         if settings.enable_memory and session.user_id:
-            await chat_service._extract_from_summary(
+            await extract_profile_from_summary(
                 session_id=task.session_id,
                 user_id=session.user_id,
                 summary=new_summary,

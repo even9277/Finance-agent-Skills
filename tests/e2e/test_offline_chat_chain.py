@@ -2,7 +2,7 @@
 
 import sys
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -13,18 +13,25 @@ if str(ROOT) not in sys.path:
 
 from backend.config import settings  # noqa: E402
 from backend.main import app  # noqa: E402
-from backend.services import chat_service  # noqa: E402
+from backend.routers import chat as chat_router  # noqa: E402
+from backend.application.chat.contracts import ChatOutcome  # noqa: E402
+from src.conversation.contracts import TerminalStatus  # noqa: E402
 
 
 @pytest.mark.e2e
 def test_offline_chat_request_reaches_fake_provider_and_returns_response() -> None:
-    fake_result = ("fake-provider: answer", "offline-session", None, None)
+    use_case = Mock()
+    use_case.execute = AsyncMock(
+        return_value=ChatOutcome(
+            reply="fake-provider: answer",
+            session_id="offline-session",
+            status=TerminalStatus.SUCCEEDED,
+        )
+    )
 
     with patch.object(settings, "auth_enabled", False), patch.object(
-        chat_service,
-        "chat_single_turn",
-        new=AsyncMock(return_value=fake_result),
-    ) as fake_provider:
+        chat_router, "build_chat_use_case", return_value=use_case
+    ):
         response = TestClient(app, raise_server_exceptions=False).post(
             "/api/chat/message",
             json={"user_id": "offline-user", "message": "请给出固定的离线回答"},
@@ -32,15 +39,15 @@ def test_offline_chat_request_reaches_fake_provider_and_returns_response() -> No
 
     assert response.status_code == 200
     assert response.json()["reply"] == "fake-provider: answer"
-    fake_provider.assert_awaited_once()
+    use_case.execute.assert_awaited_once()
 
 
 @pytest.mark.e2e
 def test_offline_chat_provider_failure_returns_non_success_contract() -> None:
+    use_case = Mock()
+    use_case.execute = AsyncMock(side_effect=RuntimeError("fake provider timeout"))
     with patch.object(settings, "auth_enabled", False), patch.object(
-        chat_service,
-        "chat_single_turn",
-        new=AsyncMock(side_effect=RuntimeError("fake provider timeout")),
+        chat_router, "build_chat_use_case", return_value=use_case
     ):
         response = TestClient(app, raise_server_exceptions=False).post(
             "/api/chat/message",

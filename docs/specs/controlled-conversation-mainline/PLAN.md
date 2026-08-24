@@ -575,7 +575,10 @@ Router/WS Presenter
   - Completed: 2026-08-24
   - Evidence: 新增统一 Evidence Envelope、五维验收评分、稳定拒绝码、required/optional 与逐实体 coverage、有界备用工具补证、accepted-only AnswerContextPack 和 `chat-synthesis-v2`；M5 focused `26 passed`，默认全量 `116 passed, 2 skipped, 4 deselected, 1 xfailed`，离线 Compose `63 passed, 1 xfailed` 且资源已清理。
   - Limitation: 公开 REST/WS 仍未切换；真实 Model/Tushare adapter 和 Live E2E 尚未验收；Skill 级细化 degrade policy 当前由统一 claim-level 边界表达，后续不得把历史指标当成当前测量值。
-- [ ] Milestone 6: Persistence, REST/WebSocket Cutover, and Legacy Removal
+- [x] Milestone 6: Persistence, REST/WebSocket Cutover, and Legacy Removal
+  - Completed: 2026-08-24
+  - Evidence: REST/WS 已同时切换到唯一事务型 Chat Use Case；新增 SQLAlchemy、OpenAI-compatible、Tushare 生产适配器并删除旧 `chat_service.py` 双编排。M6 聚焦 `26 passed`，默认全量 `122 passed, 2 skipped, 4 deselected`，离线 Compose 真实经过 Nginx/FastAPI/Workflow/PostgreSQL 且容器内 `70 passed`。
+  - Limitation: 真实 LLM/Tushare Live E2E 和 JSONL/Langfuse 完整阶段 Trace 属于 M7；WS 当前保持兼容文本帧但不是 Provider token streaming。
 - [ ] Milestone 7: Observability, Eval, CI, and Real Compose E2E Closure
 - [ ] Milestone 8: Verification, Narrow Fixes, Documentation, and Handoff
 
@@ -609,6 +612,9 @@ Router/WS Presenter
 | 2026-08-24 | M5 统一使用 `EvidenceVerifier` 验收主体、时效、维度、角色、质量和冲突，并把 claim level 收敛为 ANALYTICAL/DESCRIPTIVE/REFUSE | 将“工具成功”与“证据可用”解耦，直接映射面试口径且让下游机器可判定 | Issue #13 + interview docs + M5 tests |
 | 2026-08-24 | AnswerContextPack 只携带 accepted facts；rejected evidence 只转成没有事实值的 rejection summary | Synthesis 仍能解释限制，但无法从被拒绝 payload 恢复或引用错误事实 | M5 isolation unit/eval evidence |
 | 2026-08-24 | 有界 Replanner 只补 missing requirement、沿用原权限快照、选择不同 action fingerprint，默认最多一次 | 保留 workflow-style 主链，仅在执行后形成可证明终止的窄反馈环 | M5 controller/replan E2E evidence |
+| 2026-08-24 | REST/WS 同时切到 `ControlledChatUseCase`，Application 独占 commit/rollback | 消除入口双轨，保证同步/流式核心语义和一轮消息事务一致 | Issue #15 + M6 contract/integration evidence |
+| 2026-08-24 | 删除旧 `chat_service.py`，STM worker 只迁移必要压缩支持 | 禁止兼容转发壳，同时保留未被替代的后台压缩职责 | M6 legacy removal audit |
+| 2026-08-24 | Compose 只 Fake Model/Tool/Trace Ports | 公开 E2E 必须真实经过新 Workflow、Repository 和 PostgreSQL | M6 Compose evidence |
 
 ## 17. Surprises & Discoveries
 
@@ -637,13 +643,15 @@ Router/WS Presenter
 | 工程文档引用 `observability-standard.md`，仓库实际文件为 `observability.md` | 自动导航和新手查找可能混淆，但不影响运行时 | 本里程碑读取并遵循实际文档；记录为文档命名债务，不越界新增重复真相源 |
 | M5 前 Verifier eval 依赖不存在的历史 `src.agents.verifier` 并整体 skip，Synthesis eval 只检查静态 prediction | 证据与总结门禁没有执行目标主链实现 | 两套 eval 都改为实际执行 M5 Verifier/Synthesizer；eval-smoke 达到 `10 passed`、无 M5 skip |
 | 最小 Tushare 权限快照原本只含首选行情工具，无法在不越权的前提下证明备用工具补证 | Controller 即使决定 replan 也没有安全新动作 | 仅对股票行情需求把治理内 `get_daily_bars` 作为备用权限候选；首轮 Planner 仍选 `get_market_bars`，Replanner 才可使用备用项 |
+| 旧 `chat_service.py` 同时拥有协议无关业务、事务、模型、工具、记忆和流式分支 | 无法证明公开入口走新受控链，且 REST/WS 易漂移 | M6 删除旧文件；Router 只映射同一 `ChatOutcome`，事务下沉到 Application + Repository |
+| 旧 Compose 通过替换整个 Chat Service 返回固定四元组 | HTTP 200 不能证明新工作流、持久化和会话读取 | M6 改为只 Fake 外部 Ports，并验证 PostgreSQL 中 user/assistant 一对消息 |
 
 ## 18. Outcomes & Retrospective
 
-- **What changed:** M0/M1 冻结基线；M2 建立 Typed Contracts；M3 完成理解链；M4 完成受控工具执行；M5 已把统一 Evidence、Verifier、Controller、有界 Replanner 和 accepted-only Synthesis 接入同一 Workflow。
-- **What was verified:** 空结果、错主体、过期、冲突、缺维度、逐实体 requirement、一次备用工具补证、无新增信息降级和 rejected facts 隔离均有离线证据。全量默认测试为 `116 passed, 2 skipped, 4 deselected, 1 xfailed`，Compose 为 `63 passed, 1 xfailed`。
-- **What remains risky:** 公开 REST/WS 尚未切换，因此用户入口仍使用旧 Chat Service；真实 Provider/Repository/Trace adapter、旧编排删除和受保护 Live E2E 尚未闭环。旧 WS 泄露、数据库初始化噪声与弃用警告仍存在。
-- **What should be improved next:** M6 同时切换 REST/WS 到单一 Chat Use Case，收拢事务与事件映射并删除被替代旧编排；不得保留兼容壳或长期双轨。
+- **What changed:** M0/M1 冻结基线；M2-M5 建立完整受控 Workflow；M6 已把 REST/WS 同时切到唯一事务型 Chat Use Case，并删除旧 Chat Service 编排。
+- **What was verified:** 理解、执行、证据、补证、总结、公开协议、事务回滚、用户隔离和 PostgreSQL Compose 均有离线证据。全量默认测试为 `122 passed, 2 skipped, 4 deselected`，Compose 为 `70 passed`。
+- **What remains risky:** 真实 Model/Tushare 调用、JSONL/Langfuse 完整 Trace、受保护 Live E2E 和面试口径最终逐模块核对尚未闭环；WS 不是 Provider token streaming。
+- **What should be improved next:** M7 只闭环观测、评测、CI、真实 Compose/Live 证据，不回改 M6 已冻结的入口事务和协议。
 
 ## 19. Deferred Work
 
@@ -659,6 +667,6 @@ Router/WS Presenter
 
 ## 20. Handoff to Small-step Implementation
 
-Milestone 5 已完成本地实现和全部离线/Compose 验收，待完成 Issue #13 的 commit、PR、CI、Review 和 squash merge 后交接。
+Milestone 6 已完成本地实现和全部离线/Compose 验收，待完成 Issue #15 的 commit、PR、CI、Review 和 squash merge 后交接。
 
-下一个执行单元仅为 Milestone 6：Persistence、REST/WebSocket Cutover 和 Legacy Removal。开始前必须从最新 `main` 创建新 Issue 和短分支；先重新确认旧入口调用方、事务边界和 WS 帧合同，再一次性切换同步/流式入口并删除被替代编排，不保留转发壳或永久开关。
+下一个执行单元仅为 Milestone 7：Observability、Eval、CI 和真实 Compose/Live E2E 闭环。开始前必须从最新 `main` 创建新 Issue 和短分支；真实调用只允许只读 Tushare 和用户授权的 LLM API，证据必须脱敏且禁止生产写。
