@@ -1,2 +1,8 @@
 {"case_id":"route_smoke_001","turns":[{"role":"user","content":"华安黄金 ETF 和博时黄金 ETF 哪个适合我"}],"gold":{"final_route":"financial-sop","skill_id":"fund-compare"},"labels":["sop_fund_compare"]}
 {"case_id":"route_smoke_002","turns":[{"role":"user","content":"ETF 和 LOF 有什么区别"}],"gold":{"final_route":"fallback"},"labels":["fallback_concept"]}
+{"case_id":"route_smoke_003","turns":[{"role":"user","content":"查询贵州茅台 600519.SH 的基础信息和近期行情"}],"gold":{"final_route":"tushare-data","skill_id":null},"labels":["stage2_current_facts"]}
+{"case_id":"route_smoke_004","turns":[{"role":"user","content":"帮我筛选三只半导体 ETF"}],"gold":{"final_route":"financial-sop","skill_id":"etf-screen"},"labels":["sop_etf_screen"]}
+{"case_id":"route_smoke_005","turns":[{"role":"user","content":"贵州茅台 600519.SH 现在还能买吗"}],"gold":{"final_route":"financial-sop","skill_id":"stock-first-pass"},"labels":["sop_stock_first_pass"]}
+{"case_id":"route_smoke_006","turns":[{"role":"user","content":"新能源板块今天为什么突然拉升"}],"gold":{"final_route":"financial-sop","skill_id":"market-move-explain"},"labels":["sop_market_move"]}
+{"case_id":"route_smoke_007","turns":[{"role":"user","content":"半导体板块最近热点和龙头有哪些"}],"gold":{"final_route":"financial-sop","skill_id":"sector-hotspot-brief"},"labels":["sop_sector_hotspot"]}
+{"case_id":"route_smoke_008","turns":[{"role":"user","content":"红利 ETF 推荐几个适合长期配置的候选"}],"gold":{"final_route":"financial-sop","skill_id":"etf-screen"},"labels":["sop_etf_screen","constraints"]}

@@ -73,3 +73,22 @@ def test_clarification_is_a_valid_early_terminal() -> None:
 
     assert state.phase is RunPhase.NEEDS_CLARIFICATION
     assert state.terminal_status is TerminalStatus.NEEDS_CLARIFICATION
+
+
+@pytest.mark.unit
+def test_rewritten_request_can_stop_before_unmigrated_execution() -> None:
+    """确认理解链完成后可经总结阶段诚实结束，而不是伪造执行成功。"""
+    state = ConversationState()
+    for phase in (
+        RunPhase.PREFLIGHTED,
+        RunPhase.ENTITY_RESOLVED,
+        RunPhase.ROUTED,
+        RunPhase.REWRITTEN,
+        RunPhase.SYNTHESIZING,
+    ):
+        state.transition(phase)
+
+    state.terminate(TerminalStatus.UNSUPPORTED)
+
+    assert state.phase is RunPhase.UNSUPPORTED
+    assert state.terminal_status is TerminalStatus.UNSUPPORTED

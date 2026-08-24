@@ -31,6 +31,7 @@ from src.conversation.contracts import (  # noqa: E402
     TerminalStatus,
 )
 from src.conversation.workflow import ControlledConversationWorkflow  # noqa: E402
+from src.skills.skill_registry import SkillRegistry  # noqa: E402
 
 CASES_PATH = ROOT / "tests" / "fixtures" / "conversation" / "vertical_slice_cases.json"
 
@@ -192,5 +193,123 @@ def test_trace_sink_failure_does_not_block_business_result() -> None:
         )
 
         assert result.status is TerminalStatus.SUCCEEDED
+
+    asyncio.run(run_case())
+
+
+@pytest.mark.e2e
+def test_low_confidence_skill_route_clarifies_before_tools() -> None:
+    """确认 Stage1 低置信命中在任何工具或模型调用前停止。"""
+
+    async def run_case() -> None:
+        model = FakeModelProvider()
+        tool = FakeToolProvider()
+        trace = InMemoryTraceSink()
+        workflow = ControlledConversationWorkflow(
+            model=model,
+            tool=tool,
+            trace=trace,
+            skill_catalog=SkillRegistry().conversation_snapshot(),
+        )
+        result = await ControlledChatUseCase(
+            workflow=workflow,
+            repository=InMemoryConversationRepository(),
+        ).execute(
+            ConversationRequest(
+                user_id="user-m3",
+                session_id="session-route-confirm",
+                request_id="request-route-confirm",
+                message="分析一下贵州茅台 600519.SH",
+            )
+        )
+
+        assert result.status is TerminalStatus.NEEDS_CLARIFICATION
+        assert result.error_code is ErrorCode.ROUTE_CONFIRMATION_REQUIRED
+        assert result.tool_call_count == 0
+        assert model.calls == []
+        assert tool.calls == []
+        assert [event.stage.value for event in trace.events] == [
+            "context",
+            "entity_resolution",
+            "route",
+            "controller",
+            "termination",
+        ]
+
+    asyncio.run(run_case())
+
+
+@pytest.mark.e2e
+def test_m3_sop_understanding_stops_before_unmigrated_execution() -> None:
+    """确认高置信 SOP 已生成 Rewrite，但不会冒充 M4/M5 执行完成。"""
+
+    async def run_case() -> None:
+        model = FakeModelProvider()
+        tool = FakeToolProvider()
+        trace = InMemoryTraceSink()
+        workflow = ControlledConversationWorkflow(
+            model=model,
+            tool=tool,
+            trace=trace,
+            skill_catalog=SkillRegistry().conversation_snapshot(),
+        )
+        result = await ControlledChatUseCase(
+            workflow=workflow,
+            repository=InMemoryConversationRepository(),
+        ).execute(
+            ConversationRequest(
+                user_id="user-m3",
+                session_id="session-sop-boundary",
+                request_id="request-sop-boundary",
+                message="贵州茅台 600519.SH 现在还能买吗",
+            )
+        )
+
+        assert result.status is TerminalStatus.UNSUPPORTED
+        assert result.route is not None and result.route.skill_name == "stock-first-pass"
+        assert result.tool_call_count == 0
+        assert model.calls == []
+        assert tool.calls == []
+        assert [event.stage.value for event in trace.events] == [
+            "context",
+            "entity_resolution",
+            "route",
+            "rewrite",
+            "synthesis",
+            "termination",
+        ]
+
+    asyncio.run(run_case())
+
+
+@pytest.mark.e2e
+def test_invalid_explicit_sop_subject_clarifies_before_planning() -> None:
+    """确认显式选择 Skill 也必须通过 Rewrite 主体合同。"""
+
+    async def run_case() -> None:
+        tool = FakeToolProvider()
+        workflow = ControlledConversationWorkflow(
+            model=FakeModelProvider(),
+            tool=tool,
+            trace=InMemoryTraceSink(),
+            skill_catalog=SkillRegistry().conversation_snapshot(),
+        )
+        result = await ControlledChatUseCase(
+            workflow=workflow,
+            repository=InMemoryConversationRepository(),
+        ).execute(
+            ConversationRequest(
+                user_id="user-m3",
+                session_id="session-sop-subject",
+                request_id="request-sop-subject",
+                message="比较一下华安黄金 ETF",
+                explicit_skill="fund-compare",
+            )
+        )
+
+        assert result.status is TerminalStatus.NEEDS_CLARIFICATION
+        assert result.error_code is ErrorCode.REWRITE_CLARIFICATION_REQUIRED
+        assert tool.calls == []
+        assert result.route is not None and result.route.skill_name == "fund-compare"
 
     asyncio.run(run_case())

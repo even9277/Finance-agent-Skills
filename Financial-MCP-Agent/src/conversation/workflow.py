@@ -20,24 +20,26 @@ from .contracts import (
     ErrorCode,
     EventAttribute,
     RouteDecision,
+    RouteFamily,
     RunBudget,
     RunPhase,
     StageName,
     StageStatus,
+    SkillCatalogSnapshot,
     TerminalStatus,
     ToolPlan,
     VerificationResult,
     WorkflowEvent,
 )
 from .control import RuleController
-from .entity import DeterministicEntityResolver
+from .entity import AuthoritativeEntityResolver
 from .errors import StepBudgetExceededError
 from .execution import ControlledExecutor
 from .permissions import DeterministicPermissionResolver
 from .planning import DeterministicPlanner
 from .ports import ModelPort, ToolPort, TraceSink
-from .rewriting import DeterministicRewriter
-from .routing import DeterministicRouter
+from .rewriting import RouteAwareRewriter
+from .routing import TwoStageRouter
 from .synthesis import ControlledSynthesizer
 from .validation import PlanValidator
 from .verification import EvidenceVerifier
@@ -50,9 +52,9 @@ class _WorkflowServices:
     """集中保存无运行态的阶段实现，避免在流程中临时构造依赖。"""
 
     context: ContextBuilder
-    entity: DeterministicEntityResolver
-    router: DeterministicRouter
-    rewriter: DeterministicRewriter
+    entity: AuthoritativeEntityResolver
+    router: TwoStageRouter
+    rewriter: RouteAwareRewriter
     permissions: DeterministicPermissionResolver
     planner: DeterministicPlanner
     validator: PlanValidator
@@ -72,14 +74,16 @@ class ControlledConversationWorkflow:
         tool: ToolPort,
         trace: TraceSink,
         budget: RunBudget | None = None,
+        skill_catalog: SkillCatalogSnapshot | None = None,
     ) -> None:
         self._trace = trace
         self._budget = budget or RunBudget()
+        catalog = skill_catalog or SkillCatalogSnapshot.empty()
         self._services = _WorkflowServices(
             context=ContextBuilder(),
-            entity=DeterministicEntityResolver(),
-            router=DeterministicRouter(),
-            rewriter=DeterministicRewriter(),
+            entity=AuthoritativeEntityResolver(),
+            router=TwoStageRouter(catalog),
+            rewriter=RouteAwareRewriter(catalog),
             permissions=DeterministicPermissionResolver(),
             planner=DeterministicPlanner(),
             validator=PlanValidator(),
@@ -176,7 +180,11 @@ class ControlledConversationWorkflow:
                 )
 
             started = time.perf_counter()
-            route = self._services.router.route(packet, entity_result)
+            route = self._services.router.route(
+                packet,
+                entity_result,
+                explicit_skill=request.explicit_skill,
+            )
             state.transition(RunPhase.ROUTED)
             self._emit(
                 events,
@@ -190,24 +198,38 @@ class ControlledConversationWorkflow:
                 ),
             )
 
-            if route.family.value == "fallback":
-                state.transition(RunPhase.SYNTHESIZING)
-                state.terminate(TerminalStatus.UNSUPPORTED)
-                reply = "当前 M2 离线切片只实现单股只读快照；概念问答由后续入口切换保留原链路。"
+            if route.requires_confirmation:
+                state.terminate(TerminalStatus.NEEDS_CLARIFICATION)
+                decision = ControllerDecision(
+                    action=ControllerAction.CLARIFY,
+                    reason="low-confidence SOP route requires user confirmation",
+                    terminal_status=TerminalStatus.NEEDS_CLARIFICATION,
+                    retries_remaining=context.budget.max_tool_attempts,
+                    replans_remaining=context.budget.max_replans,
+                )
                 self._emit(
                     events,
                     context,
-                    StageName.SYNTHESIS,
-                    StageStatus.SKIPPED,
+                    StageName.CONTROLLER,
+                    StageStatus.SUCCEEDED,
                     time.perf_counter(),
+                    attributes=(EventAttribute(key="action", value=decision.action.value),),
                 )
-                self._emit_terminal(events, context, TerminalStatus.UNSUPPORTED, None)
+                self._emit_terminal(
+                    events,
+                    context,
+                    TerminalStatus.NEEDS_CLARIFICATION,
+                    ErrorCode.ROUTE_CONFIRMATION_REQUIRED,
+                )
                 return ConversationResult(
-                    status=TerminalStatus.UNSUPPORTED,
-                    reply=reply,
+                    status=TerminalStatus.NEEDS_CLARIFICATION,
+                    reply="我理解这可能是专业分析任务。请确认是否使用该分析 Skill 后继续。",
                     context=context,
                     events=tuple(events),
+                    entity=entity_result.entity,
                     route=route,
+                    controller=decision,
+                    error_code=ErrorCode.ROUTE_CONFIRMATION_REQUIRED,
                 )
 
             started = time.perf_counter()
@@ -223,6 +245,82 @@ class ControlledConversationWorkflow:
                     EventAttribute(key="dimension_count", value=len(rewrite.requested_dimensions)),
                 ),
             )
+            if rewrite.needs_clarification:
+                state.terminate(TerminalStatus.NEEDS_CLARIFICATION)
+                decision = ControllerDecision(
+                    action=ControllerAction.CLARIFY,
+                    reason=rewrite.entity_conflict or rewrite.route_mismatch,
+                    terminal_status=TerminalStatus.NEEDS_CLARIFICATION,
+                    retries_remaining=context.budget.max_tool_attempts,
+                    replans_remaining=context.budget.max_replans,
+                )
+                self._emit(
+                    events,
+                    context,
+                    StageName.CONTROLLER,
+                    StageStatus.SUCCEEDED,
+                    time.perf_counter(),
+                    error_code=ErrorCode.REWRITE_CLARIFICATION_REQUIRED,
+                    attributes=(EventAttribute(key="action", value=decision.action.value),),
+                )
+                self._emit_terminal(
+                    events,
+                    context,
+                    TerminalStatus.NEEDS_CLARIFICATION,
+                    ErrorCode.REWRITE_CLARIFICATION_REQUIRED,
+                )
+                return ConversationResult(
+                    status=TerminalStatus.NEEDS_CLARIFICATION,
+                    reply=rewrite.clarification_question,
+                    context=context,
+                    events=tuple(events),
+                    entity=rewrite.entity,
+                    route=route,
+                    controller=decision,
+                    error_code=ErrorCode.REWRITE_CLARIFICATION_REQUIRED,
+                )
+
+            if route.family is RouteFamily.FALLBACK:
+                state.transition(RunPhase.SYNTHESIZING)
+                state.terminate(TerminalStatus.UNSUPPORTED)
+                reply = "当前受控数据链不处理静态知识问答；公开入口切换前继续由既有回答链处理。"
+                self._emit(
+                    events,
+                    context,
+                    StageName.SYNTHESIS,
+                    StageStatus.SKIPPED,
+                    time.perf_counter(),
+                )
+                self._emit_terminal(events, context, TerminalStatus.UNSUPPORTED, None)
+                return ConversationResult(
+                    status=TerminalStatus.UNSUPPORTED,
+                    reply=reply,
+                    context=context,
+                    events=tuple(events),
+                    entity=rewrite.entity,
+                    route=route,
+                )
+
+            if route.family is RouteFamily.FINANCIAL_SOP:
+                state.transition(RunPhase.SYNTHESIZING)
+                state.terminate(TerminalStatus.UNSUPPORTED)
+                self._emit(
+                    events,
+                    context,
+                    StageName.SYNTHESIS,
+                    StageStatus.SKIPPED,
+                    time.perf_counter(),
+                )
+                self._emit_terminal(events, context, TerminalStatus.UNSUPPORTED, None)
+                return ConversationResult(
+                    status=TerminalStatus.UNSUPPORTED,
+                    reply="专业 Skill 的理解合同已生成；其执行与证据链将在后续里程碑接入。",
+                    context=context,
+                    events=tuple(events),
+                    entity=rewrite.entity,
+                    route=route,
+                )
+
             if rewrite.entity is None:
                 return self._failed_result(
                     state=state,
