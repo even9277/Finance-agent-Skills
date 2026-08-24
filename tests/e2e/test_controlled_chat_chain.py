@@ -18,6 +18,7 @@ if str(AGENT_ROOT) not in sys.path:
     sys.path.insert(0, str(AGENT_ROOT))
 
 from backend.application.chat.use_case import ControlledChatUseCase  # noqa: E402
+from backend.application.chat.contracts import ChatCommand  # noqa: E402
 from backend.infrastructure.chat.testing import (  # noqa: E402
     FakeModelProvider,
     FakeToolProvider,
@@ -26,7 +27,6 @@ from backend.infrastructure.chat.testing import (  # noqa: E402
 )
 from src.conversation.contracts import (  # noqa: E402
     ClaimLevel,
-    ConversationRequest,
     ErrorCode,
     EvidenceStatus,
     RunBudget,
@@ -57,14 +57,16 @@ def test_controlled_chat_vertical_slice_reaches_expected_terminal(case: dict[str
         trace = InMemoryTraceSink()
         workflow = ControlledConversationWorkflow(model=model, tool=tool, trace=trace)
         use_case = ControlledChatUseCase(workflow=workflow, repository=repository)
-        request = ConversationRequest(
+        request = ChatCommand(
             user_id="user-m2",
             session_id=f"session-{case['case_id']}",
             request_id=f"request-{case['case_id']}",
             message=str(case["message"]),
         )
 
-        result = await use_case.execute(request)
+        outcome = await use_case.execute(request)
+        assert outcome.workflow_result is not None
+        result = outcome.workflow_result
 
         assert result.status is TerminalStatus(str(case["expected_status"]))
         assert len(tool.calls) == int(case["expected_tool_calls"])
@@ -154,7 +156,7 @@ def test_workflow_stops_when_total_stage_budget_is_exhausted() -> None:
             workflow=workflow,
             repository=InMemoryConversationRepository(),
         ).execute(
-            ConversationRequest(
+            ChatCommand(
                 user_id="user-m2",
                 session_id="session-budget",
                 request_id="request-budget",
@@ -192,7 +194,7 @@ def test_trace_sink_failure_does_not_block_business_result() -> None:
         )
 
         result = await use_case.execute(
-            ConversationRequest(
+            ChatCommand(
                 user_id="user-m2",
                 session_id="session-trace-failure",
                 request_id="request-trace-failure",
@@ -223,7 +225,7 @@ def test_low_confidence_skill_route_clarifies_before_tools() -> None:
             workflow=workflow,
             repository=InMemoryConversationRepository(),
         ).execute(
-            ConversationRequest(
+            ChatCommand(
                 user_id="user-m3",
                 session_id="session-route-confirm",
                 request_id="request-route-confirm",
@@ -265,7 +267,7 @@ def test_m4_sop_runs_validated_tools_before_baseline_evidence_stages() -> None:
             workflow=workflow,
             repository=InMemoryConversationRepository(),
         ).execute(
-            ConversationRequest(
+            ChatCommand(
                 user_id="user-m3",
                 session_id="session-sop-boundary",
                 request_id="request-sop-boundary",
@@ -312,7 +314,7 @@ def test_m5_missing_market_uses_one_alternative_then_succeeds() -> None:
             workflow=ControlledConversationWorkflow(model=model, tool=tool, trace=trace),
             repository=InMemoryConversationRepository(),
         ).execute(
-            ConversationRequest(
+            ChatCommand(
                 user_id="user-m5",
                 session_id="session-m5-replan",
                 request_id="request-m5-replan",
@@ -346,7 +348,7 @@ def test_m5_replan_without_new_evidence_terminates_partial() -> None:
             workflow=ControlledConversationWorkflow(model=model, tool=tool, trace=trace),
             repository=InMemoryConversationRepository(),
         ).execute(
-            ConversationRequest(
+            ChatCommand(
                 user_id="user-m5",
                 session_id="session-m5-bounded",
                 request_id="request-m5-bounded",
@@ -387,7 +389,7 @@ def test_invalid_explicit_sop_subject_clarifies_before_planning() -> None:
             workflow=workflow,
             repository=InMemoryConversationRepository(),
         ).execute(
-            ConversationRequest(
+            ChatCommand(
                 user_id="user-m3",
                 session_id="session-sop-subject",
                 request_id="request-sop-subject",

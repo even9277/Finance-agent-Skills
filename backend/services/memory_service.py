@@ -63,7 +63,7 @@ async def get_memory_context_for_chat(
     query: str,
     db=None,
 ) -> dict[str, Any]:
-    """供 chat_service 调用：获取完整 memory_context（画像+语义记忆）。"""
+    """供聊天应用层调用：获取完整 memory_context（画像+语义记忆）。"""
     return await MemoryService.get_memory_context(user_id, query, db_session=db)
 
 

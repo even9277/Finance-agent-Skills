@@ -7,7 +7,6 @@ lifespan 新增：
 """
 
 import asyncio
-import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -20,9 +19,7 @@ from backend.db.database import AsyncSessionFactory, init_db
 from backend.middleware.auth import AuthMiddleware
 from backend.routers import auth, chat, memory, portfolio, report, user
 
-_AGENT_ROOT = Path(__file__).resolve().parent.parent / "Financial-MCP-Agent"
-if str(_AGENT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_AGENT_ROOT))
+_AGENT_ROOT = settings.agent_root
 
 from src.utils.logging_config import setup_logger
 from src.tools.skill_trace import flush_trace_exporters, initialize_trace_runtime

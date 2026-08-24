@@ -3,13 +3,27 @@
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class ChatMessageRequest(BaseModel):
-    user_id: str = Field(..., description="用户唯一标识")
-    message: str = Field(..., description="用户消息内容")
+    user_id: str = Field(..., min_length=1, description="用户唯一标识")
+    message: str = Field(..., min_length=1, max_length=10_000, description="用户消息内容")
     session_id: Optional[str] = Field(None, description="会话ID，为空则创建新会话")
+
+    @field_validator("user_id", "message", mode="before")
+    @classmethod
+    def _strip_required_text(cls, value: object) -> object:
+        """在长度校验前去除边界空白，避免空白请求进入业务层。"""
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("session_id", mode="before")
+    @classmethod
+    def _normalize_optional_session_id(cls, value: object) -> object:
+        """把空白 session_id 视为新会话，保持旧客户端兼容。"""
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
 
 
 class ChatContextWindow(BaseModel):

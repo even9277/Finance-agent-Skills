@@ -17,6 +17,12 @@ from src.conversation.contracts import (
 )
 from src.conversation.errors import ContractViolationError, ToolTimeoutError
 
+from backend.application.chat.contracts import (
+    ChatCommand,
+    ChatContextWindowData,
+    PreparedChatTurn,
+)
+
 
 @dataclass(slots=True)
 class FakeModelProvider:
@@ -93,17 +99,33 @@ class SavedConversation:
 
 @dataclass(slots=True)
 class InMemoryConversationRepository:
-    """不连接数据库的 M2 Repository Port。"""
+    """不连接数据库的事务型 Repository Port。"""
 
     saved: list[SavedConversation] = field(default_factory=list)
+    committed: bool = False
+    rolled_back: bool = False
+
+    async def prepare_turn(self, command: ChatCommand) -> PreparedChatTurn:
+        """为离线案例返回固定或调用方指定的会话标识。"""
+        return PreparedChatTurn(session_id=command.session_id or "session-offline")
 
     async def save_result(
         self,
         request: ConversationRequest,
         result: ConversationResult,
-    ) -> None:
+    ) -> ChatContextWindowData:
         """把一轮唯一终态保存到测试进程内。"""
         self.saved.append(SavedConversation(request=request, result=result))
+        return ChatContextWindowData()
+
+    async def commit(self) -> None:
+        """记录 Application 已决定提交。"""
+        self.committed = True
+
+    async def rollback(self) -> None:
+        """记录 Application 已决定回滚。"""
+        self.rolled_back = True
+        self.saved.clear()
 
 
 @dataclass(slots=True)
