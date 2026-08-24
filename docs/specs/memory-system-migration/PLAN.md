@@ -580,7 +580,9 @@ Before implementation, rollback is simply discarding the unexecuted plan. During
 - [x] Milestone 0: Safety, Toolchain, Dependency, and Baseline Check
   - Completed: 2026-08-24
   - Evidence: `uv lock --check`, both Compose config checks, and `uv run --locked python -m pytest --collect-only -q` succeeded; 128/133 tests collected and 5 live tests were deselected.
-- [ ] Milestone 1: Characterization Contracts and Memory Evaluation Baseline
+- [x] Milestone 1: Characterization Contracts and Memory Evaluation Baseline
+  - Completed: 2026-08-24
+  - Evidence: M1 focused Ruff/Pyright passed with zero findings; focused tests reported 8 passed/8 intentional assertion-only strict xfails; controlled-conversation regression reported 44 passed; offline eval reported 14 passed; root regression reported 134 passed, 2 skipped, 5 live deselected, and 8 intentional strict xfails.
 - [ ] Milestone 2: Typed Memory Domain, Versioned Migrations, and Transactional Outbox Foundation
 - [ ] Milestone 3: Working State, Token Budget, and Rolling Summary Mainline
 - [ ] Milestone 4: Redis Hot-State Cache and Worker Coordination
@@ -612,6 +614,8 @@ Before implementation, rollback is simply discarding the unexecuted plan. During
 | 2026-08-24 | Keep real holdings/positions exclusively in the Portfolio/account domain | Memory must not become a second authority for account facts; only labelled, expiring user-reported context is permitted | PR #23 second independent review |
 | 2026-08-24 | Freeze development retention defaults while deferring production legal/SLA policy | Reproducible tests need concrete values, but the project cannot invent compliance guarantees | PR #23 second independent review |
 | 2026-08-24 | Model memory commands as a branch before the ordinary controlled workflow | Mutation/confirmation must not accidentally continue into financial planning, while ordinary requests retain permission/validation/controller stages | PR #23 second independent review |
+| 2026-08-24 | Freeze dataset `memory-characterization-v1` with 13 cases: 5 current contracts and 8 target tripwires | A versioned case inventory keeps interview narrative, current evidence, and later implementation status distinguishable | Milestone 1 / Issue #24 |
+| 2026-08-24 | Represent only confirmed missing target seams as `strict=True, raises=AssertionError` xfail, labelled `tripwire` and assigned to an owning milestone | A future implementation becomes XPASS while import/setup/provider failures remain real failures; the owning milestone must replace the tripwire with behavioral acceptance | Milestone 1 / Issue #24, independent review |
 
 ## 17. Surprises & Discoveries
 
@@ -628,13 +632,16 @@ Before implementation, rollback is simply discarding the unexecuted plan. During
 | Docker Engine/Compose are available, but Docker Hub manifest inspection stalled | Later image pulls may repeat the user's prior authorization/network failure | Recheck registry access at the first milestone that changes Compose; prefer pinned images and document a registry mirror/local-cache fallback without changing real Docker settings silently |
 | Test collection reports a Starlette/httpx deprecation warning | Baseline is usable but future dependency changes could turn it into a failure | Track the warning; do not broaden Milestone 0 into an unrelated dependency upgrade |
 | Independent review found five P1 and three P2 contract gaps before merge | The plan was not yet safely executable despite green CI | Correct stage order, dependency timing, report scope, authority matrix, static gates, data rollback, pending-command state, and immutable Redis image requirements in PR #23 |
+| Current `update_profile_field(..., source="chat_inferred")` can directly write `risk_level` | The existing path violates the frozen confirmation-only boundary for high-impact profile fields | Keep a strict xfail regression; replace with candidate governance in Milestone 5 |
+| Current Mem0 update trusts `memory_id`, targeted deletion returns only a boolean, and provider search results are not authoritatively post-filtered by returned user scope | Provider behavior or a boolean cannot prove tenant ownership and lifecycle consistency | Keep owner-update/delete-lifecycle/cross-user-result assertion-only tripwires; implement behavioral authoritative records/post-filter in Milestones 5-6 |
+| PowerShell test output renders Chinese xfail reasons with mojibake while source files remain valid UTF-8 | Local terminal readability is reduced, but test status and CI semantics remain correct | Preserve UTF-8 source; rely on stable node IDs/report text and verify Linux CI output later |
 
 ## 18. Outcomes & Retrospective
 
-- What changed: Planning and Milestone 0 documentation only; no runtime, dependency, database, API, Docker, frontend, or secret file changed.
-- What was verified: Branch/worktree baseline, Python/uv/Node/npm/Docker/Compose availability, current lock validity, both Compose schemas, safe example-key inspection, frontend script inventory, Python 3.12 package-metadata viability, and pytest collection. No test body or external provider was executed.
-- What remains risky: Combined dependency resolution is deferred to the dependency-owning milestone; Docker Hub reachability was not confirmed within 30 seconds; provider compatibility, migrations, concurrency, deletion reconciliation, extraction quality, and live cleanup remain unimplemented.
-- What should be improved next: Execute Milestone 1 only to lock memory characterization and offline evaluation cases before production behavior changes.
+- What changed: Milestone 1 added only memory characterization tests and a versioned offline case inventory. No runtime, dependency, database, API, Docker, frontend, or secret/config file changed.
+- What was verified: Five preserved current contracts, eight explicit target tripwires, changed-scope Ruff/Pyright, controlled-conversation unit/contract regressions, all offline eval smoke tests, root regression, and fixture/secret boundaries. The dataset verifies unique evidence mappings to real test nodes. No external provider or paid/live test was executed.
+- What remains risky: Typed Working State, durable compaction, candidate governance, owner-scoped provider mutation/deletion lifecycle, authoritative retrieval post-filter, natural-language commands, and memory trace stages are deliberately still unimplemented. M1 tripwires expose their missing seams but do not replace the behavioral/integration acceptance owned by M2-M8. Existing deprecation warnings and Docker registry reachability remain unchanged risks.
+- What should be improved next: Execute Milestone 2 only to add the typed memory domain, Alembic schema, and transactional outbox foundation while converting only the M1 gaps it genuinely satisfies.
 
 ## 19. Deferred Work
 
@@ -650,4 +657,4 @@ Before implementation, rollback is simply discarding the unexecuted plan. During
 
 ## 20. Handoff to Small-step Implementation
 
-Milestone 0 is complete. The first unchecked milestone is Milestone 1. Execute only its characterization contracts and memory evaluation baseline, keep production behavior unchanged, produce the M1 execution report, update Sections 15-18, and stop before Milestone 2.
+Milestones 0 and 1 are complete. The first unchecked milestone is Milestone 2. Execute only the typed memory domain, versioned migrations, and transactional outbox foundation; do not install Redis/Mem0/pgvector dependencies early, and stop before Milestone 3.
