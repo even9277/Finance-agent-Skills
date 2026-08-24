@@ -1,8 +1,82 @@
+[project]
+name = "finance-agent-skills"
+version = "0.1.0"
+description = "Finance Agent controlled-mainline workspace"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "uvicorn[standard]>=0.30,<1",
+  "pydantic>=2.10,<3",
+  "pydantic-settings>=2.6,<3",
+  "python-dotenv>=1.0,<2",
+  "SQLAlchemy>=2.0,<3",
+  "aiosqlite>=0.20,<1",
+  "asyncpg>=0.30,<1",
+  "PyJWT>=2.9,<3",
+  "langgraph>=0.4,<2",
+  "langchain-core>=0.3,<2",
+  "langchain-openai>=0.3,<2",
+  "langchain-mcp-adapters>=0.1,<1",
+  "openai>=1.58,<3",
+  "google-genai>=1.0,<2",
+  "backoff>=2.2,<3",
+  "cachetools>=5.5,<7",
+  "tenacity>=9.0,<10",
+  "PyYAML>=6.0,<7",
+  "tushare>=1.4,<2",
+  "langfuse>=2.57,<3",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=9,<10",
+  "ruff>=0.12,<0.13",
+  "pyright>=1.1,<2",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+extend-exclude = [
+  "Financial-MCP-Agent/logs",
+  "Financial-MCP-Agent/reports",
+  "tests/evals/_runs",
+  "tests/evals/history",
+]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+[tool.pyright]
+include = ["tests", "backend", "Financial-MCP-Agent/src"]
+exclude = ["**/__pycache__", "Financial-MCP-Agent/logs", "Financial-MCP-Agent/reports"]
+extraPaths = ["Financial-MCP-Agent"]
+pythonVersion = "3.12"
+typeCheckingMode = "basic"
+reportMissingImports = "warning"
+reportMissingTypeStubs = "none"
+
 [tool.pytest.ini_options]
-testpaths = ["backend", "Financial-MCP-Agent", "tests/evals"]
+testpaths = [
+  "backend",
+  "Financial-MCP-Agent",
+  "tests/unit",
+  "tests/contract",
+  "tests/integration",
+  "tests/e2e",
+  "tests/evals",
+]
 addopts = "-m \"not live\""
 markers = [
   "live: 需要真实模型/外部服务与凭证的验收测试，默认跳过；显式加 -m live 运行",
   "eval_smoke: 离线评测冒烟，只读取固定数据并计算指标，不允许调用外部服务",
+  "unit: 不访问外部服务的纯逻辑测试",
+  "contract: 验证 API、事件、Agent 状态或工具 Schema 契约",
+  "integration: 使用隔离基础设施的集成测试",
+  "e2e: 从真实应用入口运行的完整链路测试",
+  "slow: 运行时间较长、默认不作为快速门禁的测试",
 ]
 
