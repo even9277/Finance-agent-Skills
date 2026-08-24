@@ -1,20 +1,29 @@
-import json
-import subprocess
-import sys
 from pathlib import Path
+import sys
 
 import pytest
 
-ROOT = Path(__file__).resolve().parents[3]
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+AGENT_ROOT = PROJECT_ROOT / "Financial-MCP-Agent"
+for import_root in (PROJECT_ROOT, AGENT_ROOT):
+    if str(import_root) not in sys.path:
+        sys.path.insert(0, str(import_root))
+
+from src.conversation.skill_discovery import SkillDiscovery  # noqa: E402
+from src.skills.skill_registry import SkillRegistry  # noqa: E402
+from tests.evals.runner import load_jsonl  # noqa: E402
 
 
 @pytest.mark.eval_smoke
-def test_skill_activation_eval_smoke(tmp_path):
-    subprocess.run(
-        [sys.executable, "-m", "tests.evals.runner", "--target", "skill_activation", "--output-dir", str(tmp_path)],
-        cwd=ROOT,
-        check=True,
-    )
-    data = json.loads((tmp_path / "skill_activation_metrics.json").read_text(encoding="utf-8"))
-    assert data["count"] == 2
-    assert data["metrics"]["planned_evidence_coverage"] == 1.0
+def test_skill_activation_eval_executes_metadata_only_discovery() -> None:
+    """执行五个 Skill 激活案例，禁止依赖完整 Skill 正文或模型调用。"""
+    rows = load_jsonl(Path("tests/evals/skill_activation/data/smoke.jsonl"))
+    snapshot = SkillRegistry().conversation_snapshot()
+    discovery = SkillDiscovery(snapshot)
+
+    for row in rows:
+        match = discovery.discover(str(row["query"]), entities=())
+        assert match.skill_name == row["gold"]["skill_id"], row["case_id"]
+        assert match.confidence >= 0.85
+
+    assert len(rows) == 5

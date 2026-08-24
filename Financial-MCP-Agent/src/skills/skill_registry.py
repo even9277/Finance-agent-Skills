@@ -7,6 +7,7 @@ from typing import Any
 
 import yaml
 
+from src.conversation.contracts import SkillCatalogSnapshot, SkillDescriptor
 from src.utils.logging_config import setup_logger
 
 _SRC_ROOT = Path(__file__).resolve().parent.parent
@@ -72,16 +73,16 @@ def _parse_frontmatter(text: str) -> dict[str, Any]:
 
         if raw_line.startswith("  - ") and current_key:
             if current_list is None:
-                parsed[current_key] = []
-                current_list = parsed[current_key]
+                current_list = []
+                parsed[current_key] = current_list
                 current_map = None
             current_list.append(_parse_scalar(raw_line[4:]))
             continue
 
         if raw_line.startswith("  ") and current_key and ":" in raw_line:
             if current_map is None:
-                parsed[current_key] = {}
-                current_map = parsed[current_key]
+                current_map = {}
+                parsed[current_key] = current_map
                 current_list = None
             child_key, child_value = raw_line.strip().split(":", 1)
             current_map[child_key.strip()] = _parse_scalar(child_value)
@@ -207,6 +208,8 @@ def _query_keywords(query: str) -> list[str]:
 
 
 class SkillRegistry:
+    """加载 workspace/vendor Skill 元数据并提供受控只读视图。"""
+
     def __init__(self, skills_dir: Path | None = None, vendor_skills_dir: Path | None = None):
         self.skills_dir = skills_dir or _DEFAULT_SKILLS_DIR
         self.vendor_skills_dir = vendor_skills_dir or _DEFAULT_VENDOR_SKILLS_DIR
@@ -389,6 +392,49 @@ class SkillRegistry:
             and skill.has_skill_file
             and skill.has_skill_spec
         ]
+
+    def conversation_snapshot(self) -> SkillCatalogSnapshot:
+        """构建受控对话 Stage1 使用的不可变 Skill 快照。
+
+        Returns:
+            仅包含可发现 workspace SOP 的元数据、执行白名单和已登记引用路径；
+            不读取或暴露完整 Skill 正文。
+        """
+        descriptors: list[SkillDescriptor] = []
+        for skill in self.discoverable_sop_skills():
+            spec = self.load_skill_spec(skill.name) or {}
+            descriptors.append(
+                SkillDescriptor(
+                    name=skill.name,
+                    description=skill.description,
+                    version=str(spec.get("version") or skill.version or "unknown"),
+                    execution_mode=str(
+                        spec.get("execution_policy") or skill.execution_mode or "deterministic"
+                    ),
+                    allowed_tools=tuple(
+                        sorted(
+                            {
+                                str(item)
+                                for item in (spec.get("allowed_tools") or skill.allowed_tools)
+                                if str(item).strip()
+                            }
+                        )
+                    ),
+                    reference_paths=tuple(
+                        sorted(
+                            {
+                                str(item.get("path") or "")
+                                for item in skill.reference_index
+                                if str(item.get("path") or "").strip()
+                            }
+                        )
+                    ),
+                )
+            )
+        return SkillCatalogSnapshot.create(
+            version="workspace-skills-v1",
+            skills=tuple(descriptors),
+        )
 
     def load_skill_spec(self, name: str) -> dict[str, Any] | None:
         skill = self.get_skill(name)

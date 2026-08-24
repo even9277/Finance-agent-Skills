@@ -85,6 +85,8 @@ class ErrorCode(StrEnum):
     INVALID_REQUEST = "INVALID_REQUEST"
     AMBIGUOUS_ENTITY = "AMBIGUOUS_ENTITY"
     ENTITY_REQUIRED = "ENTITY_REQUIRED"
+    ROUTE_CONFIRMATION_REQUIRED = "ROUTE_CONFIRMATION_REQUIRED"
+    REWRITE_CLARIFICATION_REQUIRED = "REWRITE_CLARIFICATION_REQUIRED"
     TOOL_TIMEOUT = "TOOL_TIMEOUT"
     TOOL_EXECUTION_FAILED = "TOOL_EXECUTION_FAILED"
     TOOL_INVALID_RESULT = "TOOL_INVALID_RESULT"
@@ -95,9 +97,12 @@ class ErrorCode(StrEnum):
 
 
 class EntityType(StrEnum):
-    """M2 支持的最小实体类型集合。"""
+    """理解链支持的金融实体类型。"""
 
     STOCK = "stock"
+    FUND = "fund"
+    SECTOR = "sector"
+    INDEX = "index"
 
 
 class RouteFamily(StrEnum):
@@ -106,6 +111,55 @@ class RouteFamily(StrEnum):
     FINANCIAL_SOP = "financial-sop"
     TUSHARE_DATA = "tushare-data"
     FALLBACK = "fallback"
+
+
+class RouteSource(StrEnum):
+    """最终路由的可审计来源。"""
+
+    USER_EXPLICIT = "user_explicit"
+    STAGE1_HIGH = "stage1_high"
+    STAGE1_LOW = "stage1_low"
+    STAGE2 = "stage2"
+
+
+class RouteStage1Outcome(StrEnum):
+    """SOP 优先路由阶段的有限结果。"""
+
+    HIT_HIGH = "sop_hit_high"
+    HIT_LOW = "sop_hit_low"
+    MISS = "sop_miss"
+
+
+class RewriteKind(StrEnum):
+    """三路 Rewrite 的稳定判别字段。"""
+
+    FINANCIAL_SOP = "financial-sop"
+    TUSHARE_DATA = "tushare-data"
+    FALLBACK = "fallback"
+
+
+class TimeScope(StrEnum):
+    """Rewrite 从自然语言中抽取的有限时间范围。"""
+
+    UNSPECIFIED = "unspecified"
+    LATEST_TRADING_DAY = "latest_trading_day"
+    RECENT_5_TRADING_DAYS = "recent_5_trading_days"
+
+
+class ConstraintOperation(StrEnum):
+    """本轮对既有约束的更新语义。"""
+
+    MERGE = "merge"
+    CLEAR = "clear"
+    NO_UPDATE = "no_update"
+
+
+class PreferenceOperation(StrEnum):
+    """本轮回答偏好的更新语义。"""
+
+    REPLACE = "replace"
+    CLEAR = "clear"
+    NO_UPDATE = "no_update"
 
 
 class EvidenceDimension(StrEnum):
@@ -244,6 +298,7 @@ class EntityResolutionResult:
     candidates: tuple[Entity, ...]
     inherited: bool
     confidence: float
+    resolved_entities: tuple[Entity, ...] = ()
     clarification: str | None = None
     error_code: ErrorCode | None = None
 
@@ -258,16 +313,257 @@ class RouteDecision:
     reason: str
     skill_name: str | None = None
     requires_confirmation: bool = False
+    route_source: RouteSource = RouteSource.STAGE2
+    stage1_outcome: RouteStage1Outcome = RouteStage1Outcome.MISS
+    shortlist: tuple[str, ...] = ()
+    requires_current_facts: bool = False
+    fact_dimensions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
-class RewriteResult:
-    """将原问题转换为计划器可消费的确定性执行合同。"""
+class ConstraintSet:
+    """从当前轮窄抽取、可与已确认约束合并的结果。"""
+
+    items: tuple[str, ...] = ()
+    operation: ConstraintOperation = ConstraintOperation.NO_UPDATE
+    confidence: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class ReplyPreference:
+    """只影响回答结构、不改变事实或权限的表达偏好。"""
+
+    hint: str = ""
+    operation: PreferenceOperation = PreferenceOperation.NO_UPDATE
+    confidence: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class SopRewriteResult:
+    """Financial SOP 路由的结构化问题合同。"""
 
     effective_query: str
     entity: Entity | None
+    entities: tuple[Entity, ...]
     requested_dimensions: tuple[EvidenceDimension, ...]
-    clarification: str | None = None
+    skill_name: str | None
+    data_requirements: tuple[str, ...]
+    constraints: ConstraintSet
+    reply_preference: ReplyPreference
+    time_scope: TimeScope
+    needs_clarification: bool = False
+    clarification_question: str = ""
+    route_mismatch: str = ""
+    entity_conflict: str = ""
+    kind: RewriteKind = RewriteKind.FINANCIAL_SOP
+
+
+@dataclass(frozen=True, slots=True)
+class TushareRewriteResult:
+    """当前事实数据路由的结构化问题合同。"""
+
+    effective_query: str
+    entity: Entity | None
+    entities: tuple[Entity, ...]
+    requested_dimensions: tuple[EvidenceDimension, ...]
+    data_requirements: tuple[str, ...]
+    constraints: ConstraintSet
+    reply_preference: ReplyPreference
+    time_scope: TimeScope
+    skill_name: str | None = None
+    needs_clarification: bool = False
+    clarification_question: str = ""
+    route_mismatch: str = ""
+    entity_conflict: str = ""
+    kind: RewriteKind = RewriteKind.TUSHARE_DATA
+
+
+@dataclass(frozen=True, slots=True)
+class FallbackRewriteResult:
+    """无需金融工具的解释或闲聊合同。"""
+
+    effective_query: str
+    entity: Entity | None
+    entities: tuple[Entity, ...]
+    requested_dimensions: tuple[EvidenceDimension, ...]
+    constraints: ConstraintSet
+    reply_preference: ReplyPreference
+    time_scope: TimeScope
+    data_requirements: tuple[str, ...] = ()
+    skill_name: str | None = None
+    needs_clarification: bool = False
+    clarification_question: str = ""
+    route_mismatch: str = ""
+    entity_conflict: str = ""
+    kind: RewriteKind = RewriteKind.FALLBACK
+
+
+RewriteResult = SopRewriteResult | TushareRewriteResult | FallbackRewriteResult
+
+
+@dataclass(frozen=True, slots=True)
+class SkillDescriptor:
+    """从 Registry 冻结出的单个 Skill 安全元数据。"""
+
+    name: str
+    description: str
+    version: str
+    execution_mode: str
+    allowed_tools: tuple[str, ...]
+    reference_paths: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SkillRoutingDescriptor:
+    """Stage1 只可见的最小 Skill 路由视图。"""
+
+    name: str
+    description: str
+    version: str
+    execution_mode: str
+
+
+@dataclass(frozen=True, slots=True)
+class SkillExecutionView:
+    """选中 Skill 后交给后续权限阶段的执行视图。"""
+
+    name: str
+    version: str
+    execution_mode: str
+    allowed_tools: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SkillReferenceView:
+    """渐进加载的引用路径视图；按合同不包含工具权限。"""
+
+    skill_name: str
+    version: str
+    reference_paths: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SkillCatalogSnapshot:
+    """请求级不可变 Skill 元数据快照及其内容 hash。"""
+
+    version: str
+    skills: tuple[SkillDescriptor, ...]
+    snapshot_hash: str
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        version: str,
+        skills: tuple[SkillDescriptor, ...],
+    ) -> SkillCatalogSnapshot:
+        """排序、去重并创建可审计 Skill 快照。
+
+        Args:
+            version: 快照构建合同版本。
+            skills: Registry 已校验的 Skill 描述。
+
+        Returns:
+            名称排序稳定且带内容 hash 的不可变快照。
+
+        Raises:
+            ContractViolationError: 名称重复、版本为空或 Skill 名为空。
+        """
+        if not version.strip():
+            raise ContractViolationError("skill catalog version must not be blank")
+        ordered = tuple(sorted(skills, key=lambda item: item.name))
+        names = [item.name for item in ordered]
+        if any(not name.strip() for name in names) or len(names) != len(set(names)):
+            raise ContractViolationError("skill catalog contains blank or duplicate names")
+        raw = "\n".join(
+            "|".join(
+                (
+                    item.name,
+                    item.description,
+                    item.version,
+                    item.execution_mode,
+                    ",".join(item.allowed_tools),
+                    ",".join(item.reference_paths),
+                )
+            )
+            for item in ordered
+        ).encode()
+        return cls(
+            version=version,
+            skills=ordered,
+            snapshot_hash=hashlib.sha256(raw).hexdigest(),
+        )
+
+    @classmethod
+    def empty(cls) -> SkillCatalogSnapshot:
+        """创建不暴露任何 SOP Skill 的安全默认快照。"""
+        return cls.create(version="empty-v1", skills=())
+
+    def require(self, name: str) -> SkillDescriptor:
+        """返回已登记 Skill，否则以合同错误拒绝。"""
+        for item in self.skills:
+            if item.name == name:
+                return item
+        raise ContractViolationError(f"unknown skill: {name}")
+
+    def routing_view(self) -> tuple[SkillRoutingDescriptor, ...]:
+        """返回不含工具和引用正文的 Stage1 视图。"""
+        return tuple(
+            SkillRoutingDescriptor(
+                name=item.name,
+                description=item.description,
+                version=item.version,
+                execution_mode=item.execution_mode,
+            )
+            for item in self.skills
+        )
+
+    def execution_view(self, name: str) -> SkillExecutionView:
+        """返回已选 Skill 的冻结执行白名单。"""
+        item = self.require(name)
+        return SkillExecutionView(
+            name=item.name,
+            version=item.version,
+            execution_mode=item.execution_mode,
+            allowed_tools=item.allowed_tools,
+        )
+
+    def reference_view(
+        self,
+        name: str,
+        selected_paths: tuple[str, ...],
+    ) -> SkillReferenceView:
+        """只允许选择 Registry 已登记的引用路径。
+
+        Args:
+            name: 已选 Skill 名。
+            selected_paths: 基于当前问题选出的引用相对路径。
+
+        Returns:
+            不携带工具权限的引用视图。
+
+        Raises:
+            ContractViolationError: 路径不属于该 Skill 的冻结索引。
+        """
+        item = self.require(name)
+        if not set(selected_paths) <= set(item.reference_paths):
+            raise ContractViolationError("reference path is outside the skill snapshot")
+        return SkillReferenceView(
+            skill_name=item.name,
+            version=item.version,
+            reference_paths=selected_paths,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SkillMatch:
+    """Stage1 metadata-only Skill Discovery 的结构化输出。"""
+
+    skill_name: str | None
+    confidence: float
+    outcome: RouteStage1Outcome
+    shortlist: tuple[str, ...]
+    reason: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -529,7 +825,12 @@ _ALLOWED_TRANSITIONS: dict[RunPhase, frozenset[RunPhase]] = {
         }
     ),
     RunPhase.REWRITTEN: frozenset(
-        {RunPhase.PLANNED, RunPhase.NEEDS_CLARIFICATION, RunPhase.FAILED}
+        {
+            RunPhase.PLANNED,
+            RunPhase.SYNTHESIZING,
+            RunPhase.NEEDS_CLARIFICATION,
+            RunPhase.FAILED,
+        }
     ),
     RunPhase.PLANNED: frozenset({RunPhase.VALIDATED, RunPhase.FAILED}),
     RunPhase.VALIDATED: frozenset({RunPhase.EXECUTING, RunPhase.REJECTED, RunPhase.FAILED}),

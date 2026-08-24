@@ -1,2 +1,5 @@
-{"case_id":"skill_activation_001","schema_pass":true,"gold":{"final_route":"financial-sop","skill_id":"stock-first-pass","required_evidence":["stock_basic","stock_market","financial_indicator"]},"prediction":{"final_route":"financial-sop","skill_id":"stock-first-pass","planned_evidence":["stock_basic","stock_market","financial_indicator"],"latency_ms":12}}
-{"case_id":"skill_activation_002","schema_pass":true,"gold":{"final_route":"financial-sop","skill_id":"market-move-explain","required_evidence":["stock_market","web_news"]},"prediction":{"final_route":"financial-sop","skill_id":"market-move-explain","planned_evidence":["stock_market","web_news"],"latency_ms":14}}
+{"case_id":"skill_activation_001","query":"贵州茅台 600519.SH 现在还能买吗","gold":{"skill_id":"stock-first-pass"}}
+{"case_id":"skill_activation_002","query":"宁德时代今天为什么突然跌了","gold":{"skill_id":"market-move-explain"}}
+{"case_id":"skill_activation_003","query":"华安黄金 ETF 和博时黄金 ETF 哪个适合我","gold":{"skill_id":"fund-compare"}}
+{"case_id":"skill_activation_004","query":"帮我筛三只半导体 ETF","gold":{"skill_id":"etf-screen"}}
+{"case_id":"skill_activation_005","query":"半导体板块最近热点和龙头有哪些","gold":{"skill_id":"sector-hotspot-brief"}}
