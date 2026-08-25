@@ -381,7 +381,7 @@ For database changes, use an expand-first Alembic revision; validate upgrade, do
 ## 15. Progress
 
 - [x] Milestone 0: Safety and Baseline Check (Issue #38, branch `feat/38-memory-commands`, baseline captured)
-- [ ] Milestone 1: Lock or Add Tests / Reproduction
+- [x] Milestone 1: Lock or Add Tests / Reproduction (parser/result contracts and offline fixtures added; frontend runner remains a scoped follow-up)
 - [ ] Milestone 2: Implement Core Change
 - [ ] Milestone 3: Add Validation, Error Handling, and Observability
 - [ ] Milestone 4: Verification and Narrow Fixes
@@ -405,6 +405,7 @@ For database changes, use an expand-first Alembic revision; validate upgrade, do
 | Legacy memory routes still expose ad hoc CRUD and `confirm=true` delete-all | Risk of bypassing M7 safety semantics | Keep compatibility inputs but delegate touched writes to one application use case |
 | Frontend memory updates are optimistic without reliable rollback | UI can diverge from PostgreSQL after failure | Add explicit pending/success/failure/refresh states and tests |
 | Frontend currently lacks the planned unit/browser test runner | Dependency and CI scope may expand | Verify in M1; stop for approval if it cannot remain narrow |
+| Frontend `package.json` has no Vitest/Playwright and no existing test script | Adding both now would expand M1 beyond characterization scope | Keep production lint/type/build green; evaluate the smallest locked test addition in M3 |
 
 ## 18. Outcomes & Retrospective
 
