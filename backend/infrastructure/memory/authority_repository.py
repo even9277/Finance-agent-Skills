@@ -128,6 +128,8 @@ class SqlAlchemyAuthoritativeMemoryRepository:
             row.version += 1
             row.deleted_at = None
             action = MemoryAuditAction.UPDATED
+        # PostgreSQL 的复合外键要求权威记录先落入当前事务，再写审计事件。
+        await self._db.flush()
         self._audit(
             user_id=user_id,
             record_id=row.id,
@@ -136,7 +138,6 @@ class SqlAlchemyAuthoritativeMemoryRepository:
             reason_code="EXPLICIT_USER_WRITE",
             trace_id=trace_id,
         )
-        await self._db.flush()
         return _result(row)
 
     async def add_text(
@@ -166,6 +167,8 @@ class SqlAlchemyAuthoritativeMemoryRepository:
         )
         row = _record_row(record)
         self._db.add(row)
+        # 先 flush 权威行，确保随后写入的审计复合外键可解析。
+        await self._db.flush()
         self._audit(
             user_id=user_id,
             record_id=row.id,
@@ -174,7 +177,6 @@ class SqlAlchemyAuthoritativeMemoryRepository:
             reason_code="EXPLICIT_USER_WRITE",
             trace_id=trace_id,
         )
-        await self._db.flush()
         await enqueue_index_upsert(self._db, row, trace_id=trace_id)
         return _result(row, consistency_status=DerivedConsistencyStatus.PENDING)
 

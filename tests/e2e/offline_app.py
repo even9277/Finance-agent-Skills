@@ -10,6 +10,7 @@ from backend.infrastructure.memory.runtime import get_memory_cache
 from backend.infrastructure.memory.retrieval_repository import SqlAlchemyMemoryRetrievalRepository
 from backend.infrastructure.memory.semantic_provider import PgVectorSemanticProvider
 from backend.application.memory.retrieval import MemoryRetrievalUseCase
+from backend.application.memory.commands import MemoryCommandUseCase
 from backend.db.database import AsyncSessionFactory
 from backend.main import app
 from backend.routers import chat as chat_router
@@ -33,6 +34,7 @@ def build_offline_chat_use_case(db: AsyncSession) -> ControlledChatUseCase:
             SqlAlchemyMemoryRetrievalRepository(db),
             PgVectorSemanticProvider(AsyncSessionFactory),
         ),
+        memory_commands=MemoryCommandUseCase(db),
     )
 
 

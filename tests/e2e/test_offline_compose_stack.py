@@ -118,6 +118,19 @@ async def _load_memory_transaction_evidence(
         await engine.dispose()
 
 
+async def _load_record_status(record_id: str) -> str | None:
+    """读取 M7 记忆权威记录状态，不读取正文。"""
+    engine = create_async_engine(os.environ["TEST_DATABASE_URL"])
+    try:
+        async with engine.connect() as connection:
+            return await connection.scalar(
+                text("SELECT status FROM memory_records WHERE id = :record_id"),
+                {"record_id": record_id},
+            )
+    finally:
+        await engine.dispose()
+
+
 async def _assert_outbox_owner_is_authoritative(
     *,
     session_id: str,
@@ -618,6 +631,53 @@ def test_frontend_proxy_reaches_backend_and_fake_chat_chain() -> None:
         cache_health = json.loads(response.read().decode("utf-8"))["components"]["memory_cache"]
     assert cache_health["status"] == "UP"
     assert cache_health["metrics"]["hits"] >= 1
+
+    # M7 真实 HTTP 旅程：先通过兼容 API 写入合成文本记忆，再由聊天命令预览、确认并软删除。
+    memory_add_request = Request(
+        f"{base_url}/api/memory/items?user_id=offline-user",
+        data=json.dumps(
+            {
+                "category": "topic_interest",
+                "content": "离线 E2E 合成记忆，不代表真实用户偏好",
+                "metadata": {},
+            }
+        ).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urlopen(memory_add_request, timeout=10) as response:  # noqa: S310
+        assert response.status == 200
+        added_memory = json.loads(response.read().decode("utf-8"))
+    record_id = str(added_memory.get("record_id") or added_memory.get("id") or "")
+    assert record_id
+
+    forget = _send_chat_request(
+        base_url,
+        user_id="offline-user",
+        session_id=cache_seed["session_id"],
+        message="忘掉我的文本记忆",
+    )
+    assert forget["memory_command"]["status"] == "CONFIRMATION_REQUIRED"
+    assert forget["memory_command"]["pending_confirmation_id"]
+    assert "确认" in forget["reply"]
+
+    confirmed = _send_chat_request(
+        base_url,
+        user_id="offline-user",
+        session_id=cache_seed["session_id"],
+        message="确认",
+    )
+    assert confirmed["memory_command"]["status"] == "SUCCEEDED"
+    assert asyncio.run(_load_record_status(record_id)) == "INACTIVE"
+
+    replay = _send_chat_request(
+        base_url,
+        user_id="offline-user",
+        session_id=cache_seed["session_id"],
+        message="确认",
+    )
+    assert replay["memory_command"]["status"] == "REJECTED"
+    assert replay["memory_command"]["error_code"] == "CONFIRMATION_NOT_FOUND"
 
     # 在同一个 tmpfs PostgreSQL 上验证核心约束，并做 downgrade/re-upgrade。
     asyncio.run(_assert_postgres_schema_contract())

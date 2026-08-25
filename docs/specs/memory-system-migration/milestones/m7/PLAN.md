@@ -385,7 +385,7 @@ For database changes, use an expand-first Alembic revision; validate upgrade, do
 - [x] Milestone 1: Lock or Add Tests / Reproduction (parser/result contracts and offline fixtures added; frontend runner remains a scoped follow-up)
 - [x] Milestone 2: Implement Core Change (parser, pending authority/migration, chat branch, REST/WS/TS contract)
 - [x] Milestone 3: Add Validation, Error Handling, and Observability (pending lifecycle negatives, legacy delete gate, safe logs, frontend state/test harness)
-- [ ] Milestone 4: Verification and Narrow Fixes
+- [x] Milestone 4: Verification and Narrow Fixes (maintained gates and rebuilt offline Compose E2E passed; PostgreSQL flush ordering fixed)
 - [ ] Milestone 5: Documentation and Handoff
 
 ## 16. Decision Log
@@ -412,10 +412,10 @@ For database changes, use an expand-first Alembic revision; validate upgrade, do
 
 ## 18. Outcomes & Retrospective
 
-- What changed: To be filled after Milestones 2-5.
-- What was verified: To be filled with exact commands and results; no results are claimed during plan freezing.
-- What remains risky: Provider availability, migration compatibility, and any deferred live-provider behavior.
-- What should be improved next: M8 protected-live evaluation, broader language parsing, report-mode memory, and production operational hardening.
+- What changed: M7 added the deterministic Chinese memory-command branch, pending confirmation authority, safe REST/WS/frontend result mapping, lifecycle validation, and the real HTTP Compose journey. During rebuilt PostgreSQL E2E, authority records are now flushed before audit rows so the composite foreign-key boundary is respected in the same transaction.
+- What was verified: The rebuilt offline Compose stack started PostgreSQL, Redis, backend, Nginx, and the production frontend bundle. The complete suite reported `144 passed, 1 skipped, 39 deselected, 4 xfailed`; the M7 HTTP journey verified synthetic memory creation, preview-only forget, one-shot confirmation, authoritative `INACTIVE` status, and replay rejection. Focused post-fix tests reported `15 passed`.
+- What remains risky: Browser-level Playwright coverage is not installed; live Mem0/model/Tushare behavior and production HA remain explicitly deferred. Existing npm audit findings (including one critical advisory) were not upgraded in this scoped change.
+- What should be improved next: Complete M5 delivery evidence, then scope M8 protected-live evaluation, broader language parsing, report-mode memory, and production operational hardening separately.
 
 ## 19. Deferred Work
 
@@ -427,4 +427,4 @@ For database changes, use an expand-first Alembic revision; validate upgrade, do
 
 ## 20. Handoff to Small-step Implementation
 
-Start with Milestone 0 only. Run `git status --short`, confirm the changed surface and available tests, create/link the GitHub Issue and dedicated short branch, and do not edit implementation files until Milestone 1. Report evidence and update the governance sections before proceeding.
+Milestones 0-4 are complete on `feat/38-memory-commands`. M5 is the remaining delivery milestone: commit the narrow PostgreSQL/E2E fix and evidence, push the branch, open and review the PR, wait for CI, squash-merge to `main`, close Issue #38, delete the short branch, and verify a clean `main` checkout.
