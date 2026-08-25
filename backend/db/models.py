@@ -321,6 +321,7 @@ ALEMBIC_MANAGED_TABLE_NAMES = frozenset(
         "memory_outbox_tasks",
         "memory_provider_references",
         "memory_semantic_index",
+        "memory_pending_commands",
     }
 )
 
@@ -463,6 +464,40 @@ class MemoryRecordRow(Base):
             "user_id",
             name="uq_memory_record_id_user",
         ),
+    )
+
+
+class MemoryPendingCommandRow(Base):
+    """保存一次性记忆命令确认的权威快照与状态。
+
+    该表只保存规范化范围、记录 ID/版本和安全预览，不保存命令原文或记忆正文；
+    PostgreSQL 行锁负责确认消费的并发互斥，Redis 不能替代此状态。
+    """
+
+    __tablename__ = "memory_pending_commands"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    session_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    command_kind: Mapped[str] = mapped_column(String(24), nullable=False)
+    normalized_scope: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    target_record_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    target_versions: Mapped[dict[str, int]] = mapped_column(JSON, nullable=False, default=dict)
+    fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    preview_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    preview_items: Mapped[list[dict[str, object]]] = mapped_column(JSON, nullable=False, default=list)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, index=True, default="PENDING")
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "fingerprint", name="uq_memory_pending_user_fingerprint"),
     )
 
 

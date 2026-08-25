@@ -66,6 +66,7 @@ class ProfileField(StrEnum):
     SECTORS = "sectors"
     WATCHLIST = "watchlist"
     CONSTRAINTS = "constraints"
+    RESPONSE_PREF = "response_pref"
 
 
 class CandidateStatus(StrEnum):

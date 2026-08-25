@@ -25,6 +25,7 @@ from backend.schemas.chat import (
     ChatMessage,
     ChatMessageRequest,
     ChatMessageResponse,
+    MemoryCommandResultResponse,
     ChatSessionListItem,
     ChatSessionMessages,
     ChatSessionRenameRequest,
@@ -64,6 +65,24 @@ def _context_schema(value: ChatContextWindowData | None) -> ChatContextWindow | 
     })
 
 
+def _memory_command_schema(value):
+    """把应用层命令结果转换为 REST/WS 共用的安全响应模型。"""
+    if value is None:
+        return None
+    return MemoryCommandResultResponse(
+        status=value.status.value,
+        command_kind=value.command_kind.value if value.command_kind is not None else None,
+        command_ref=value.command_ref,
+        affected_count=value.affected_count,
+        affected_record_ids=list(value.affected_record_ids),
+        consistency_status=value.consistency_status,
+        pending_confirmation_id=value.pending_confirmation_id,
+        error_code=value.error_code,
+        user_message=value.user_message,
+        preview_items=list(value.preview_items),
+    )
+
+
 @router.post("/message", response_model=ChatMessageResponse, summary="发送消息（同步返回）")
 async def send_message(
     body: ChatMessageRequest,
@@ -93,6 +112,7 @@ async def send_message(
         session_id=outcome.session_id,
         memory_profile=outcome.memory_profile,
         context_window=_context_schema(outcome.context_window),
+        memory_command=_memory_command_schema(outcome.memory_command),
     )
 
 
@@ -138,6 +158,15 @@ async def chat_stream(websocket: WebSocket) -> None:
             )
 
         await websocket.send_json({"type": "session_id", "session_id": outcome.session_id})
+        memory_command = _memory_command_schema(outcome.memory_command)
+        if memory_command is not None:
+            await websocket.send_json(
+                {
+                    "type": "memory_command",
+                    "session_id": outcome.session_id,
+                    "memory_command": memory_command.model_dump(mode="json"),
+                }
+            )
         if outcome.reply:
             await websocket.send_text(outcome.reply)
         context = _context_schema(outcome.context_window)

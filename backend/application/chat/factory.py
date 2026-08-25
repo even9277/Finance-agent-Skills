@@ -14,6 +14,7 @@ from backend.infrastructure.memory.runtime import get_memory_cache
 from backend.infrastructure.memory.retrieval_repository import SqlAlchemyMemoryRetrievalRepository
 from backend.infrastructure.memory.semantic_provider import get_semantic_provider
 from backend.application.memory.retrieval import MemoryRetrievalUseCase
+from backend.application.memory.commands import MemoryCommandUseCase
 from backend.config import settings
 from src.conversation.workflow import ControlledConversationWorkflow
 from src.skills.skill_registry import SkillRegistry
@@ -48,6 +49,7 @@ def build_chat_use_case(db: AsyncSession) -> ControlledChatUseCase:
         retrieval=retrieval,
         retrieval_top_k=settings.memory_retrieval_top_k,
         retrieval_token_budget=settings.memory_retrieval_token_budget,
+        memory_commands=MemoryCommandUseCase(db) if settings.enable_memory else None,
     )
 
 

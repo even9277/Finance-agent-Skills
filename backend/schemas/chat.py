@@ -36,6 +36,21 @@ class ChatContextWindow(BaseModel):
     updated_at: Optional[datetime] = None
 
 
+class MemoryCommandResultResponse(BaseModel):
+    """聊天接口返回的安全记忆命令结果；正文只允许出现在受限 preview 中。"""
+
+    status: str
+    command_kind: Optional[str] = None
+    command_ref: Optional[str] = None
+    affected_count: int = 0
+    affected_record_ids: list[str] = Field(default_factory=list)
+    consistency_status: str = "CONSISTENT"
+    pending_confirmation_id: Optional[str] = None
+    error_code: Optional[str] = None
+    user_message: str = ""
+    preview_items: list[dict[str, object]] = Field(default_factory=list)
+
+
 class ChatMessageResponse(BaseModel):
     reply: str
     session_id: str
@@ -43,6 +58,11 @@ class ChatMessageResponse(BaseModel):
     # 前端做 null 判断；ENABLE_MEMORY=false 时为 None
     memory_profile: Optional[dict] = None
     context_window: Optional[ChatContextWindow] = None
+    memory_command: Optional[MemoryCommandResultResponse] = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description="仅在本轮识别为记忆命令时返回；普通聊天保持旧响应形状。",
+    )
 
 
 class ChatSessionRenameRequest(BaseModel):

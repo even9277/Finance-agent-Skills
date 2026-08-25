@@ -39,6 +39,7 @@ _PROFILE_COLUMN_BY_FIELD = {
     ProfileField.EXPECTED_RETURN_MAX: "expected_return_max",
     ProfileField.SECTORS: "sectors",
     ProfileField.CONSTRAINTS: "constraints",
+    ProfileField.RESPONSE_PREF: "response_pref",
 }
 
 

@@ -16,6 +16,7 @@ from src.conversation.contracts import (
     VerificationResult,
 )
 from src.memory.contracts import WorkingState
+from backend.application.memory.commands import MemoryCommandResult
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +70,7 @@ class ChatOutcome:
     working_state: WorkingState = field(default_factory=WorkingState)
     context_window: ChatContextWindowData | None = None
     workflow_result: ConversationResult | None = None
+    memory_command: MemoryCommandResult | None = None
 
     @property
     def context(self) -> ConversationRunContext:

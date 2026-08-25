@@ -23,7 +23,6 @@ def _commands_module():
 
 
 @pytest.mark.unit
-@TARGET_GAP
 def test_explicit_low_impact_update_is_parsed_without_model_call() -> None:
     """明确的低影响偏好更新应形成确定性 UPDATE 意图。"""
     module = _commands_module()
@@ -41,7 +40,6 @@ def test_explicit_low_impact_update_is_parsed_without_model_call() -> None:
 
 
 @pytest.mark.unit
-@TARGET_GAP
 def test_broad_forget_creates_confirmation_required_intent() -> None:
     """宽范围文本记忆清理必须先预览并等待一次性确认。"""
     module = _commands_module()
@@ -58,7 +56,6 @@ def test_broad_forget_creates_confirmation_required_intent() -> None:
 
 
 @pytest.mark.unit
-@TARGET_GAP
 def test_ordinary_finance_message_falls_through_as_non_command() -> None:
     """普通金融问题不能被误判为记忆命令。"""
     module = _commands_module()
@@ -72,7 +69,6 @@ def test_ordinary_finance_message_falls_through_as_non_command() -> None:
 
 
 @pytest.mark.unit
-@TARGET_GAP
 def test_command_result_has_safe_shared_status_contract() -> None:
     """命令结果必须具备 REST、WebSocket 和前端共用的稳定字段。"""
     module = _commands_module()

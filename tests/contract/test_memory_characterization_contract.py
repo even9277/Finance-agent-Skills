@@ -262,7 +262,6 @@ def test_semantic_results_are_post_filtered_by_authoritative_user_scope() -> Non
 
 
 @pytest.mark.contract
-@TARGET_GAP
 def test_natural_language_memory_command_has_an_application_owner() -> None:
     """目标触发器：聊天中的记忆指令必须有独立应用模块与公开用例。"""
     command_module = PROJECT_ROOT / "backend" / "application" / "memory" / "commands.py"
