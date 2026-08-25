@@ -17,14 +17,19 @@ for _path in (PROJECT_ROOT, AGENT_ROOT):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
-from backend.application.memory.commands import (
+from backend.application.memory.commands import (  # noqa: E402
     MemoryCommandStatus,
     MemoryCommandUseCase,
     parse_memory_command,
 )
-from backend.db.database import Base
-from backend.db.models import MemoryPendingCommandRow, MemoryRecordRow, Session, User
-from src.memory.contracts import MEMORY_POLICY_VERSION
+from backend.db.database import Base  # noqa: E402
+from backend.db.models import (  # noqa: E402
+    MemoryPendingCommandRow,
+    MemoryRecordRow,
+    Session,
+    User,
+)
+from src.memory.contracts import MEMORY_POLICY_VERSION  # noqa: E402
 
 
 async def _factory(tmp_path: Path):
