@@ -720,6 +720,48 @@ class CandidateExtractPayload:
 
 
 @dataclass(frozen=True, slots=True)
+class IndexUpsertPayload:
+    """冻结一条权威记忆的派生语义索引写入边界。"""
+
+    user_id: str
+    record_id: str
+    memory_version: int
+    kind: MemoryValueKind
+    category: str
+    content: str
+    scope: MemoryScope
+    policy_version: str
+    expires_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        for field_name, value in (
+            ("user_id", self.user_id),
+            ("record_id", self.record_id),
+            ("category", self.category),
+            ("content", self.content),
+            ("policy_version", self.policy_version),
+        ):
+            _require_nonblank(value, field_name)
+        if self.memory_version <= 0:
+            raise MemoryContractError("index upsert memory_version must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class IndexDeletePayload:
+    """冻结一条权威记忆的派生语义索引删除边界。"""
+
+    user_id: str
+    record_id: str
+    memory_version: int
+
+    def __post_init__(self) -> None:
+        _require_nonblank(self.user_id, "user_id")
+        _require_nonblank(self.record_id, "record_id")
+        if self.memory_version <= 0:
+            raise MemoryContractError("index delete memory_version must be positive")
+
+
+@dataclass(frozen=True, slots=True)
 class NewOutboxTask:
     """表示尚未持久化、必须与业务状态同事务写入的任务意图。"""
 
@@ -728,7 +770,13 @@ class NewOutboxTask:
     aggregate_id: str
     task_kind: OutboxTaskKind
     idempotency_key: str
-    payload: TurnCommittedPayload | SummaryCompactPayload | CandidateExtractPayload
+    payload: (
+        TurnCommittedPayload
+        | SummaryCompactPayload
+        | CandidateExtractPayload
+        | IndexUpsertPayload
+        | IndexDeletePayload
+    )
     session_id: str | None = None
     trace_id: str | None = None
     schema_version: str = MEMORY_SCHEMA_VERSION
@@ -789,6 +837,32 @@ class NewOutboxTask:
                 raise MemoryContractError(
                     "candidate idempotency_key must match the summary version"
                 )
+        if self.task_kind is OutboxTaskKind.INDEX_UPSERT:
+            if not isinstance(self.payload, IndexUpsertPayload):
+                raise MemoryContractError("index upsert task requires its typed payload")
+            if self.aggregate_type != "memory_record":
+                raise MemoryContractError("index upsert aggregate_type must be memory_record")
+            if self.aggregate_id != self.payload.record_id:
+                raise MemoryContractError("index upsert aggregate_id must match record")
+            if self.user_id != self.payload.user_id:
+                raise MemoryContractError("index upsert user_id must match payload")
+            if self.idempotency_key != build_index_upsert_key(
+                self.payload.record_id, self.payload.memory_version
+            ):
+                raise MemoryContractError("index upsert idempotency_key is invalid")
+        if self.task_kind is OutboxTaskKind.INDEX_DELETE:
+            if not isinstance(self.payload, IndexDeletePayload):
+                raise MemoryContractError("index delete task requires its typed payload")
+            if self.aggregate_type != "memory_record":
+                raise MemoryContractError("index delete aggregate_type must be memory_record")
+            if self.aggregate_id != self.payload.record_id:
+                raise MemoryContractError("index delete aggregate_id must match record")
+            if self.user_id != self.payload.user_id:
+                raise MemoryContractError("index delete user_id must match payload")
+            if self.idempotency_key != build_index_delete_key(
+                self.payload.record_id, self.payload.memory_version
+            ):
+                raise MemoryContractError("index delete idempotency_key is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -944,3 +1018,19 @@ def build_candidate_outbox_key(session_id: str, summary_version: int) -> str:
     if summary_version <= 0:
         raise MemoryContractError("candidate summary_version must be positive")
     return f"memory:candidate-extract:{session_id}:{summary_version}"
+
+
+def build_index_upsert_key(record_id: str, memory_version: int) -> str:
+    """构造同一权威记忆版本只能写入一次派生索引的幂等键。"""
+    _require_nonblank(record_id, "record_id")
+    if memory_version <= 0:
+        raise MemoryContractError("index upsert memory_version must be positive")
+    return f"memory:index-upsert:{record_id}:{memory_version}"
+
+
+def build_index_delete_key(record_id: str, memory_version: int) -> str:
+    """构造同一权威记忆版本只能删除一次派生索引的幂等键。"""
+    _require_nonblank(record_id, "record_id")
+    if memory_version <= 0:
+        raise MemoryContractError("index delete memory_version must be positive")
+    return f"memory:index-delete:{record_id}:{memory_version}"

@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from src.memory.contracts import WorkingState
 
-from .contracts import ContextPacket, ConversationRequest, Entity, EntityType
+from .contracts import (
+    ContextPacket,
+    ConversationRequest,
+    Entity,
+    EntityType,
+    MemoryContextItem,
+)
 
 
 class ContextBuilder:
@@ -17,6 +23,7 @@ class ContextBuilder:
         recent_messages: tuple[str, ...] = (),
         running_summary: str | None = None,
         working_state: WorkingState | None = None,
+        memory_context: tuple[MemoryContextItem, ...] = (),
     ) -> ContextPacket:
         """构造不会覆盖当前轮指令的上下文包。
 
@@ -44,6 +51,7 @@ class ContextBuilder:
                 if (item := _to_conversation_entity(candidate)) is not None
             ),
             reset_working_segment=reset_segment,
+            retrieved_memories=memory_context,
         )
 
 

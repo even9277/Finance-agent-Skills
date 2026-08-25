@@ -367,6 +367,20 @@ class ContextPacket:
     working_entity: Entity | None = None
     working_candidates: tuple[Entity, ...] = ()
     reset_working_segment: bool = False
+    # 仅允许进入上下文、改写和合成阶段，不参与证据或工具授权。
+    retrieved_memories: tuple["MemoryContextItem", ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryContextItem:
+    """表示经权威后过滤并受预算限制的历史记忆上下文。"""
+
+    record_id: str
+    category: str
+    content: str
+    score: float
+    retrieval_reasons: tuple[str, ...]
+    memory_version: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -999,6 +1013,7 @@ class AnswerContextPack:
     constraints: tuple[str, ...]
     reply_preference: str
     selected_skill: str | None
+    retrieved_memories: tuple[MemoryContextItem, ...] = ()
 
     @property
     def entity(self) -> Entity | None:
@@ -1018,6 +1033,7 @@ class AnswerContextPack:
         constraints: tuple[str, ...],
         reply_preference: str,
         selected_skill: str | None,
+        retrieved_memories: tuple[MemoryContextItem, ...] = (),
     ) -> AnswerContextPack:
         """从 Verifier 结果构造不含 rejected facts 的回答包。
 
@@ -1058,6 +1074,7 @@ class AnswerContextPack:
             constraints=constraints,
             reply_preference=reply_preference,
             selected_skill=selected_skill,
+            retrieved_memories=retrieved_memories,
         )
 
 

@@ -20,9 +20,27 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
+from sqlalchemy.types import TypeDecorator
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from backend.db.database import Base
+
+try:
+    from pgvector.sqlalchemy import Vector as _PgVector
+except ImportError:  # pragma: no cover - dependency is locked for maintained runtime
+    _PgVector = None
+
+
+class EmbeddingVectorType(TypeDecorator):
+    """在 PostgreSQL 使用 pgvector，在 SQLite 测试中使用 JSON 兼容向量。"""
+
+    impl = JSON
+    cache_ok = True
+
+    def load_dialect_impl(self, dialect):  # type: ignore[no-untyped-def]
+        if dialect.name == "postgresql" and _PgVector is not None:
+            return dialect.type_descriptor(_PgVector(1536))
+        return dialect.type_descriptor(JSON())
 
 
 def _uuid() -> str:
@@ -302,6 +320,7 @@ ALEMBIC_MANAGED_TABLE_NAMES = frozenset(
         "memory_audit_events",
         "memory_outbox_tasks",
         "memory_provider_references",
+        "memory_semantic_index",
     }
 )
 
@@ -691,6 +710,48 @@ class MemoryProviderReferenceRow(Base):
             "provider",
             "provider_record_id",
             name="uq_memory_provider_user_record",
+        ),
+    )
+
+
+class MemorySemanticIndexRow(Base):
+    """保存可重建的派生向量索引，不拥有记忆事实或生命周期。"""
+
+    __tablename__ = "memory_semantic_index"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    memory_record_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    provider: Mapped[str] = mapped_column(String(40), nullable=False)
+    provider_record_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    memory_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    schema_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    category: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    embedding_model: Mapped[str] = mapped_column(String(120), nullable=False)
+    embedding_dimensions: Mapped[int] = mapped_column(Integer, nullable=False)
+    embedding: Mapped[list[float]] = mapped_column(EmbeddingVectorType(), nullable=False)
+    metadata_json: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False, default=dict)
+    last_error_code: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now, nullable=False)
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["memory_record_id", "user_id"],
+            ["memory_records.id", "memory_records.user_id"],
+            name="fk_memory_semantic_index_record_owner",
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint(
+            "user_id",
+            "memory_record_id",
+            "provider",
+            "memory_version",
+            name="uq_memory_semantic_index_record_version",
         ),
     )
 

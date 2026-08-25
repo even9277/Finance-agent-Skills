@@ -27,9 +27,7 @@ class Settings(BaseSettings):
     port: int = 8000
 
     # ── 数据库（Phase 1 SQLite，Phase 生产切 PostgreSQL）─
-    database_url: str = (
-        f"sqlite+aiosqlite:///{_PROJECT_ROOT / 'backend' / 'finance.db'}"
-    )
+    database_url: str = f"sqlite+aiosqlite:///{_PROJECT_ROOT / 'backend' / 'finance.db'}"
 
     # ── CORS ──────────────────────────────────────────────
     cors_origins: List[str] = [
@@ -44,7 +42,7 @@ class Settings(BaseSettings):
     openai_compatible_model: str = ""
 
     # ── Feature Flags ─────────────────────────────────────
-    enable_stm: bool = False    # Phase 2 激活
+    enable_stm: bool = False  # Phase 2 激活
     enable_memory: bool = False  # Phase 3 激活
     enable_redis_cache: bool = False  # 可丢弃的记忆热缓存；PostgreSQL 始终权威
     enable_chat_skills: bool = False  # Phase 1 skill-first chat
@@ -112,6 +110,19 @@ class Settings(BaseSettings):
     embed_dims: int = 1536
     # 嵌入模型（留空则复用 OPENAI_COMPATIBLE_MODEL）
     embed_model: str = ""
+    # M6 派生语义索引：默认关闭，离线测试使用 deterministic provider。
+    memory_semantic_provider: str = "disabled"
+    memory_semantic_timeout_sec: int = 8
+    memory_semantic_top_k: int = 20
+    memory_semantic_min_score: float = 0.10
+    memory_retrieval_top_k: int = 8
+    memory_retrieval_token_budget: int = 600
+    memory_index_worker_interval_sec: int = 5
+    memory_index_worker_batch_size: int = 10
+    memory_index_worker_max_retries: int = 3
+    memory_index_worker_lease_sec: int = 60
+    memory_index_schema_version: str = "memory-index-v1"
+    memory_embedding_provider: str = "deterministic"
     # Skill Chat 模型分层
     chat_router_model: str = "kimi-k2.5"
     chat_resolver_model: str = "kimi-k2.5"
@@ -179,6 +190,24 @@ class Settings(BaseSettings):
             raise ValueError("ltm_candidate_provider must be openai or deterministic")
         return normalized
 
+    @field_validator("memory_semantic_provider")
+    @classmethod
+    def _validate_memory_semantic_provider(cls, value: str) -> str:
+        """限制语义 Provider 为关闭、离线确定性或显式 Mem0。"""
+        normalized = value.strip().lower()
+        if normalized not in {"disabled", "deterministic", "mem0"}:
+            raise ValueError("memory_semantic_provider must be disabled, deterministic or mem0")
+        return normalized
+
+    @field_validator("memory_embedding_provider")
+    @classmethod
+    def _validate_memory_embedding_provider(cls, value: str) -> str:
+        """限制嵌入实现，避免默认配置隐式调用外部模型。"""
+        normalized = value.strip().lower()
+        if normalized not in {"deterministic", "openai"}:
+            raise ValueError("memory_embedding_provider must be deterministic or openai")
+        return normalized
+
     @field_validator(
         "stm_context_budget_tokens",
         "stm_keep_recent",
@@ -197,6 +226,15 @@ class Settings(BaseSettings):
         "redis_cache_lease_sec",
         "redis_singleflight_wait_ms",
         "redis_max_connections",
+        "embed_dims",
+        "memory_semantic_timeout_sec",
+        "memory_semantic_top_k",
+        "memory_retrieval_top_k",
+        "memory_retrieval_token_budget",
+        "memory_index_worker_interval_sec",
+        "memory_index_worker_batch_size",
+        "memory_index_worker_max_retries",
+        "memory_index_worker_lease_sec",
     )
     @classmethod
     def _validate_positive_stm_integer(cls, value: int) -> int:
@@ -238,20 +276,28 @@ class Settings(BaseSettings):
         minimum_lease = self.stm_summary_timeout_sec + safety_margin_sec
         if self.stm_worker_lease_sec <= minimum_lease:
             raise ValueError(
-                "stm_worker_lease_sec must be greater than "
-                "stm_summary_timeout_sec + 5 seconds"
+                "stm_worker_lease_sec must be greater than stm_summary_timeout_sec + 5 seconds"
             )
         minimum_candidate_lease = self.ltm_candidate_timeout_sec + safety_margin_sec
         if self.ltm_worker_lease_sec <= minimum_candidate_lease:
             raise ValueError(
-                "ltm_worker_lease_sec must be greater than "
-                "ltm_candidate_timeout_sec + 5 seconds"
+                "ltm_worker_lease_sec must be greater than ltm_candidate_timeout_sec + 5 seconds"
+            )
+        minimum_index_lease = self.memory_semantic_timeout_sec + safety_margin_sec
+        if self.memory_index_worker_lease_sec <= minimum_index_lease:
+            raise ValueError(
+                "memory_index_worker_lease_sec must be greater than "
+                "memory_semantic_timeout_sec + 5 seconds"
+            )
+        if self.memory_semantic_provider == "deterministic" and self.embed_dims != 1536:
+            raise ValueError(
+                "deterministic pgvector schema memory-index-v1 requires embed_dims=1536"
             )
         return self
 
     model_config = {
         "env_file": [
-            str(_AGENT_DIR / ".env"),   # LLM 配置优先从 agent .env 读
+            str(_AGENT_DIR / ".env"),  # LLM 配置优先从 agent .env 读
             str(_BACKEND_DIR / ".env"),  # 后端覆盖
         ],
         "env_file_encoding": "utf-8",

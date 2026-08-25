@@ -11,6 +11,10 @@ from backend.infrastructure.chat.providers import (
 from backend.infrastructure.chat.repository import SqlAlchemyConversationRepository
 from backend.infrastructure.chat.trace import SkillTraceSink
 from backend.infrastructure.memory.runtime import get_memory_cache
+from backend.infrastructure.memory.retrieval_repository import SqlAlchemyMemoryRetrievalRepository
+from backend.infrastructure.memory.semantic_provider import get_semantic_provider
+from backend.application.memory.retrieval import MemoryRetrievalUseCase
+from backend.config import settings
 from src.conversation.workflow import ControlledConversationWorkflow
 from src.skills.skill_registry import SkillRegistry
 
@@ -27,11 +31,26 @@ def build_chat_use_case(db: AsyncSession) -> ControlledChatUseCase:
         trace=SkillTraceSink(),
         skill_catalog=SkillRegistry().conversation_snapshot(),
     )
-    return ControlledChatUseCase(workflow=workflow, repository=repository)
+    retrieval = None
+    if settings.enable_memory:
+        retrieval = MemoryRetrievalUseCase(
+            SqlAlchemyMemoryRetrievalRepository(
+                db,
+                semantic_timeout_sec=settings.memory_semantic_timeout_sec,
+                semantic_top_k=settings.memory_semantic_top_k,
+                semantic_min_score=settings.memory_semantic_min_score,
+            ),
+            get_semantic_provider(),
+        )
+    return ControlledChatUseCase(
+        workflow=workflow,
+        repository=repository,
+        retrieval=retrieval,
+        retrieval_top_k=settings.memory_retrieval_top_k,
+        retrieval_token_budget=settings.memory_retrieval_token_budget,
+    )
 
 
 def build_chat_session_use_case(db: AsyncSession) -> ChatSessionUseCase:
     """为一个请求数据库 Session 装配会话管理用例。"""
-    return ChatSessionUseCase(
-        SqlAlchemyConversationRepository(db, cache=get_memory_cache())
-    )
+    return ChatSessionUseCase(SqlAlchemyConversationRepository(db, cache=get_memory_cache()))
