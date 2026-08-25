@@ -9,7 +9,7 @@ from typing import Any
 from urllib.request import Request, urlopen
 
 import pytest
-from sqlalchemy import UniqueConstraint, inspect, text
+from sqlalchemy import UniqueConstraint, inspect, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -21,6 +21,8 @@ for path in (PROJECT_ROOT, AGENT_ROOT):
 from src.memory.contracts import (  # noqa: E402
     MEMORY_SCHEMA_VERSION,
     MemoryErrorCode,
+    MemoryRecordStatus,
+    MemoryValueKind,
     NewOutboxTask,
     OutboxTaskKind,
     OutboxTaskStatus,
@@ -32,7 +34,18 @@ from backend.db.migration_runner import (  # noqa: E402
     downgrade_database,
     upgrade_database,
 )
-from backend.db.models import ALEMBIC_MANAGED_TABLE_NAMES  # noqa: E402
+from backend.db.models import (  # noqa: E402
+    ALEMBIC_MANAGED_TABLE_NAMES,
+    MemoryRecordRow,
+    MemorySemanticIndexRow,
+)
+from backend.infrastructure.memory.retrieval_repository import (  # noqa: E402
+    SqlAlchemyMemoryRetrievalRepository,
+)
+from backend.infrastructure.memory.semantic_provider import (  # noqa: E402
+    PgVectorSemanticProvider,
+)
+from backend.application.memory.retrieval import MemoryRetrievalRequest  # noqa: E402
 from backend.infrastructure.memory.repository import (  # noqa: E402
     MemoryRepositoryError,
     SqlAlchemyMemoryRepository,
@@ -144,14 +157,18 @@ def _assert_schema_matches_orm(sync_connection) -> None:
     assert ALEMBIC_MANAGED_TABLE_NAMES.issubset(inspector.get_table_names())
     for table_name in ALEMBIC_MANAGED_TABLE_NAMES:
         orm_table = Base.metadata.tables[table_name]
-        actual_columns = {
-            column["name"]: column for column in inspector.get_columns(table_name)
-        }
+        actual_columns = {column["name"]: column for column in inspector.get_columns(table_name)}
         assert set(actual_columns) == set(orm_table.columns.keys())
         for column in orm_table.columns:
             actual = actual_columns[column.name]
             assert actual["nullable"] is column.nullable
-            assert actual["type"]._type_affinity is column.type._type_affinity
+            # `EmbeddingVectorType` 在 SQLite 使用 JSON，在 PostgreSQL 使用
+            # pgvector.VECTOR；两者都是同一个派生索引字段的方言实现。
+            if table_name == "memory_semantic_index" and column.name == "embedding":
+                assert actual["type"].__class__.__name__.upper() == "VECTOR"
+                assert getattr(actual["type"], "dim", None) == 1536
+            else:
+                assert actual["type"]._type_affinity is column.type._type_affinity
 
         actual_foreign_keys = {
             (
@@ -188,9 +205,16 @@ def _assert_schema_matches_orm(sync_connection) -> None:
             if not item.get("duplicates_constraint")
         }
         expected_indexes = {
-            (item.name, tuple(column.name for column in item.columns))
+            (
+                str(item.name) if item.name is not None else None,
+                tuple(column.name for column in item.columns),
+            )
             for item in orm_table.indexes
         }
+        # PostgreSQL 的派生向量层额外维护 HNSW 索引；它不是 ORM 的通用索引，
+        # 但属于迁移合同的一部分，因此在 PostgreSQL 验收中显式核对。
+        if table_name == "memory_semantic_index":
+            expected_indexes.add(("ix_memory_semantic_index_embedding_hnsw", ("embedding",)))
         assert actual_indexes == expected_indexes
 
     required_server_defaults = {
@@ -210,9 +234,7 @@ def _assert_schema_matches_orm(sync_connection) -> None:
         },
     }
     for table_name, column_names in required_server_defaults.items():
-        columns = {
-            column["name"]: column for column in inspector.get_columns(table_name)
-        }
+        columns = {column["name"]: column for column in inspector.get_columns(table_name)}
         assert all(columns[name]["default"] is not None for name in column_names)
 
 
@@ -226,15 +248,88 @@ async def _assert_postgres_schema_contract() -> None:
         await engine.dispose()
 
 
+async def _assert_real_pgvector_lifecycle() -> None:
+    """在真实 pgvector 上验证写入、检索、租户过滤、权威过滤和删除。"""
+    engine = create_async_engine(os.environ["TEST_DATABASE_URL"])
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    record_id = "m6-compose-pgvector-record"
+    provider = PgVectorSemanticProvider(session_factory)
+    try:
+        async with session_factory() as db:
+            existing = await db.get(MemoryRecordRow, record_id)
+            if existing is None:
+                db.add(
+                    MemoryRecordRow(
+                        id=record_id,
+                        user_id="offline-user",
+                        kind=MemoryValueKind.TEXT.value,
+                        category="preference",
+                        content="用户偏好低波动长期投资",
+                        status=MemoryRecordStatus.ACTIVE.value,
+                        scope="user",
+                        version=1,
+                        source="user_command",
+                        evidence_ref="compose:m6:pgvector",
+                        policy_version="memory-policy-v1",
+                        activation_source="explicit_user",
+                    )
+                )
+                await db.commit()
+        provider_id = await provider.upsert(
+            user_id="offline-user",
+            record_id=record_id,
+            memory_version=1,
+            category="preference",
+            content="用户偏好低波动长期投资",
+            metadata={"memory_record_id": record_id, "memory_version": 1},
+        )
+        own_hits = await provider.search(
+            user_id="offline-user",
+            query="低波动长期投资",
+            top_k=5,
+            min_score=0.0,
+        )
+        other_hits = await provider.search(
+            user_id="offline-user-other",
+            query="低波动长期投资",
+            top_k=5,
+            min_score=0.0,
+        )
+        assert record_id in {item.record_id for item in own_hits}
+        assert record_id not in {item.record_id for item in other_hits}
+
+        async with session_factory() as db:
+            record = await db.get(MemoryRecordRow, record_id)
+            assert record is not None
+            record.status = MemoryRecordStatus.DELETED.value
+            await db.commit()
+            retrieval = await SqlAlchemyMemoryRetrievalRepository(db).retrieve(
+                MemoryRetrievalRequest(
+                    user_id="offline-user",
+                    query="低波动长期投资",
+                ),
+                provider,
+            )
+        assert retrieval.items == ()
+        await provider.delete(user_id="offline-user", provider_record_id=provider_id)
+        async with session_factory() as db:
+            remaining = await db.scalar(
+                select(MemorySemanticIndexRow.id).where(
+                    MemorySemanticIndexRow.provider_record_id == provider_id
+                )
+            )
+        assert remaining is None
+    finally:
+        await engine.dispose()
+
+
 async def _delete_working_state_for_concurrency(session_id: str) -> None:
     """仅在隔离测试库移除初始状态，用于复现首次初始化并发。"""
     engine = create_async_engine(os.environ["TEST_DATABASE_URL"])
     try:
         async with engine.begin() as connection:
             await connection.execute(
-                text(
-                    "DELETE FROM memory_working_states WHERE session_id = :session_id"
-                ),
+                text("DELETE FROM memory_working_states WHERE session_id = :session_id"),
                 {"session_id": session_id},
             )
     finally:
@@ -247,9 +342,10 @@ async def _load_concurrency_evidence(session_id: str) -> dict[str, int]:
     try:
         async with engine.connect() as connection:
             row = (
-                await connection.execute(
-                    text(
-                        """
+                (
+                    await connection.execute(
+                        text(
+                            """
                         SELECT
                           (SELECT count(*) FROM messages WHERE session_id = :session_id)
                             AS message_count,
@@ -264,10 +360,13 @@ async def _load_concurrency_evidence(session_id: str) -> dict[str, int]:
                           (SELECT turn_count FROM sessions WHERE id = :session_id)
                             AS turn_count
                         """
-                    ),
-                    {"session_id": session_id},
+                        ),
+                        {"session_id": session_id},
+                    )
                 )
-            ).mappings().one()
+                .mappings()
+                .one()
+            )
             return {key: int(value) for key, value in row.items()}
     finally:
         await engine.dispose()
@@ -280,9 +379,10 @@ async def _wait_for_summary_evidence(session_id: str) -> dict[str, object]:
         for _ in range(50):
             async with engine.connect() as connection:
                 row = (
-                    await connection.execute(
-                        text(
-                            """
+                    (
+                        await connection.execute(
+                            text(
+                                """
                             SELECT s.summary_version,
                                    s.running_summary,
                                    t.status AS task_status,
@@ -312,10 +412,13 @@ async def _wait_for_summary_evidence(session_id: str) -> dict[str, object]:
                              AND m.summary_version = s.summary_version
                             WHERE s.id = :session_id
                             """
-                        ),
-                        {"session_id": session_id},
+                            ),
+                            {"session_id": session_id},
+                        )
                     )
-                ).mappings().one_or_none()
+                    .mappings()
+                    .one_or_none()
+                )
             if row is not None and row["task_status"] == OutboxTaskStatus.SUCCEEDED.value:
                 return dict(row)
             await asyncio.sleep(0.2)
@@ -364,9 +467,9 @@ def test_frontend_proxy_reaches_backend_and_fake_chat_chain() -> None:
 
     init_request = Request(
         f"{base_url}/api/user/init",
-        data=json.dumps(
-            {"user_id": "offline-user", "display_name": "离线验收用户"}
-        ).encode("utf-8"),
+        data=json.dumps({"user_id": "offline-user", "display_name": "离线验收用户"}).encode(
+            "utf-8"
+        ),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
@@ -412,9 +515,9 @@ def test_frontend_proxy_reaches_backend_and_fake_chat_chain() -> None:
 
     other_user_request = Request(
         f"{base_url}/api/user/init",
-        data=json.dumps(
-            {"user_id": "offline-user-other", "display_name": "跨用户负例"}
-        ).encode("utf-8"),
+        data=json.dumps({"user_id": "offline-user-other", "display_name": "跨用户负例"}).encode(
+            "utf-8"
+        ),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
@@ -429,10 +532,7 @@ def test_frontend_proxy_reaches_backend_and_fake_chat_chain() -> None:
     )
 
     trace_path = Path(os.environ["OFFLINE_TRACE_PATH"])
-    records = [
-        json.loads(line)
-        for line in trace_path.read_text(encoding="utf-8").splitlines()
-    ]
+    records = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
     roots = [item for item in records if item["record_type"] == "trace"]
     assert len(roots) >= 2
     assert all(item["status"] in {"started", "ok"} for item in roots)
@@ -476,9 +576,7 @@ def test_frontend_proxy_reaches_backend_and_fake_chat_chain() -> None:
 
     concurrent_results = asyncio.run(send_concurrent_turns())
     assert all(item["session_id"] == chat["session_id"] for item in concurrent_results)
-    concurrency_evidence = asyncio.run(
-        _load_concurrency_evidence(str(chat["session_id"]))
-    )
+    concurrency_evidence = asyncio.run(_load_concurrency_evidence(str(chat["session_id"])))
     assert concurrency_evidence["message_count"] == 6
     assert concurrency_evidence["state_count"] == 1
     assert concurrency_evidence["turn_outbox_count"] == 3
@@ -491,9 +589,7 @@ def test_frontend_proxy_reaches_backend_and_fake_chat_chain() -> None:
     assert isinstance(source_message_count, int)
     assert source_message_count >= 2
     source_end_message_id = summary_evidence["source_end_message_id"]
-    protected_tail_start_message_id = summary_evidence[
-        "protected_tail_start_message_id"
-    ]
+    protected_tail_start_message_id = summary_evidence["protected_tail_start_message_id"]
     assert isinstance(source_end_message_id, int)
     assert isinstance(protected_tail_start_message_id, int)
     assert source_end_message_id < protected_tail_start_message_id
@@ -519,14 +615,13 @@ def test_frontend_proxy_reaches_backend_and_fake_chat_chain() -> None:
     )
     assert follow_up["session_id"] == cache_seed["session_id"]
     with urlopen(f"{base_url}/api/health", timeout=10) as response:  # noqa: S310
-        cache_health = json.loads(response.read().decode("utf-8"))["components"][
-            "memory_cache"
-        ]
+        cache_health = json.loads(response.read().decode("utf-8"))["components"]["memory_cache"]
     assert cache_health["status"] == "UP"
     assert cache_health["metrics"]["hits"] >= 1
 
     # 在同一个 tmpfs PostgreSQL 上验证核心约束，并做 downgrade/re-upgrade。
     asyncio.run(_assert_postgres_schema_contract())
+    asyncio.run(_assert_real_pgvector_lifecycle())
     database_url = os.environ["TEST_DATABASE_URL"]
     downgrade_database(database_url, allow_isolated=True)
     asyncio.run(_assert_legacy_rows_after_downgrade(str(chat["session_id"])))

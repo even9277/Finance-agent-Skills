@@ -16,6 +16,7 @@ from backend.db.models import (
     MemoryCandidateRow,
     MemoryRecordRow,
 )
+from backend.infrastructure.memory.index_tasks import enqueue_index_upsert
 from src.memory.contracts import (
     MEMORY_POLICY_VERSION,
     ActivationSource,
@@ -383,26 +384,26 @@ class SqlAlchemyCandidateGovernanceRepository:
             activation_source=ActivationSource.POLICY_AUTO,
             expires_at=_utc_naive() + timedelta(days=_AUTO_MEMORY_RETENTION_DAYS),
         )
-        self._db.add(
-            MemoryRecordRow(
-                id=record.record_id,
-                user_id=record.user_id,
-                kind=record.kind.value,
-                category=record.category,
-                profile_field=None,
-                value_json=None,
-                content=record.content,
-                status=record.status.value,
-                scope=record.scope.value,
-                version=record.version,
-                source=record.source.value,
-                evidence_ref=record.evidence_ref,
-                policy_version=record.policy_version,
-                activation_source=record.activation_source.value,
-                expires_at=record.expires_at,
-            )
+        record_row = MemoryRecordRow(
+            id=record.record_id,
+            user_id=record.user_id,
+            kind=record.kind.value,
+            category=record.category,
+            profile_field=None,
+            value_json=None,
+            content=record.content,
+            status=record.status.value,
+            scope=record.scope.value,
+            version=record.version,
+            source=record.source.value,
+            evidence_ref=record.evidence_ref,
+            policy_version=record.policy_version,
+            activation_source=record.activation_source.value,
+            expires_at=record.expires_at,
         )
+        self._db.add(record_row)
         await self._db.flush()
+        await enqueue_index_upsert(self._db, record_row, trace_id=trace_id)
         self._audit(
             user_id=candidate.user_id,
             candidate_id=candidate.id,

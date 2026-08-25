@@ -12,8 +12,8 @@
   - `CLARIFICATION_QUESTIONS.md`
   - `SOLUTION_TRADEOFF.md`
 - Repository root: `D:\FinanceProject\Finance-agent-Skills`
-- Current branch: `feat/32-memory-candidate-governance`
-- GitHub tracking: Issue #22 currently tracks specification; each implementation milestone requires its own Issue/short branch/PR before GitHub delivery.
+- Current branch: `feat/35-memory-hybrid-retrieval`
+- GitHub tracking: Issue #35 tracks M6; implementation requires the short-branch/PR/CI closure before merge.
 - Created date: 2026-08-24
 
 ## 2. User-facing Purpose
@@ -595,7 +595,9 @@ Before implementation, rollback is simply discarding the unexecuted plan. During
 - [x] Milestone 5: Long-term Candidate Extraction and Governance
   - Completed: 2026-08-25 (implementation, focused acceptance, rebuilt offline Compose acceptance, PR #33 merge)
   - Evidence: typed candidate contracts and deterministic policy; user-message-only provenance/source gates; PostgreSQL candidate/evidence/audit authority; high-impact profile confirmation-only isolation; low-impact repeat/unique-session/active-day/recency/conflict governance; explicit-authority bridge; candidate outbox creation from summary success; lease fencing, malformed-payload dead-letter, bounded retry, expired-lease recovery, and idempotent task handling. Focused M5 suite reported 28 passed and 5 intentional xfails; Worker/migration additions reported 8 passed; maintained-scope Ruff and Pyright reported zero findings; migration upgrade/downgrade/re-upgrade preserved legacy rows. Rebuilt full offline Compose reported 136 passed, 1 skipped, 32 deselected, and 5 intentional xfails with exit code 0, exercising isolated PostgreSQL/Redis/FastAPI/Nginx/Vue. No paid model, production service, Tushare, Mem0, or pgvector was called. Independent review and GitHub delivery closure remain before M6.
-- [ ] Milestone 6: Mem0/pgvector Index, Hybrid Retrieval, and Stage Injection
+- [x] Milestone 6: Mem0/pgvector Index, Hybrid Retrieval, and Stage Injection
+  - Implementation status: code and offline acceptance complete on `feat/35-memory-hybrid-retrieval`; GitHub delivery pending.
+  - Evidence: `mem0ai==2.0.19` and `pgvector==0.5.0` are lock-resolved; PostgreSQL owns `memory_records` while `memory_semantic_index`, Provider references, and INDEX Outbox tasks are rebuildable derivatives. Deterministic pgvector search enforces user/version/status/expiry filtering, lexical and semantic candidates are fused and token-packed, and retrieval is injected only into Context/AnswerContextPack. The context trace records hit/token/status counts without memory正文。Seven M6 semantic/worker/context tests and 41 focused controlled-chat/memory regressions passed; maintained-scope Ruff/Pyright reported zero findings. Rebuilt offline Compose reports `136 passed, 1 skipped, 39 deselected, 5 xfailed` in 50.16 seconds with exit code `0`, covering isolated PostgreSQL/pgvector, Redis, FastAPI, Nginx, Vue, real pgvector CRUD/user isolation/authority-delete filtering, and real HTTP controlled-chat journeys. Default provider remains disabled; offline Compose explicitly uses deterministic embedding and empty external credentials. No paid model, production service, real Tushare, or Mem0 network call was used.
 - [ ] Milestone 7: Natural-language Memory Commands, API, and Frontend Controls
 - [ ] Milestone 8: Observability, Failure Hardening, and Offline Evaluation Gates
 - [ ] Milestone 9: Full Compose, Protected Live E2E, Documentation, and Delivery Closure
@@ -689,8 +691,8 @@ Before implementation, rollback is simply discarding the unexecuted plan. During
 
 - What changed: Milestone 4 added a typed, optional Redis hot-cache port and one redis-py adapter for committed context tail/summary, Working State, and compact profile. Keys hash tenant/resource identifiers; envelopes bind schema, kind, owner, resource, and authoritative versions; stale/malformed entries are discarded; successful foreground commits publish new snapshots; summary/profile writes invalidate derived entries; and short fenced leases bound cache-fill coordination. PostgreSQL and its Outbox remain the only durable authorities.
 - What was verified: Maintained-scope static gates, the 214-pass root regression, frontend gates, two Compose config checks plus the executable cache-disable override, six real-Redis integrations, the normal backend image, and the final rebuilt full Compose stack all passed. The 125-pass stack exercised real Redis 7.4.10, PostgreSQL, migrations, FastAPI, deterministic controlled workflow, Nginx, the production frontend bundle, PostgreSQL cache-outage fallback, version tamper rejection, lease fencing/single-flight, write-after-invalidation, and rollback non-publication. A separate same-session outage journey returned HTTP 200 after Redis was stopped and exposed `DEGRADED/UNAVAILABLE` without state loss. No paid/live model, real Tushare, Mem0, pgvector, or production service/write was used.
-- What remains risky: Cache counters are process-local and not a substitute for later telemetry aggregation; production load/latency targets and multi-replica soak evidence remain M8/M9 work. Long-term candidate governance, Mem0/pgvector retrieval, user memory commands/UI, and final memory-specific Trace/live-provider closure remain intentionally unimplemented.
-- What should be improved next: Execute Milestone 5 only to replace ungoverned long-term profile inference with authoritative candidate extraction, confirmation, conflict, provenance, deletion, and audit lifecycles; do not install Mem0/pgvector until M6.
+- What remains risky: Cache counters are process-local and not a substitute for later telemetry aggregation; production load/latency targets and multi-replica soak evidence remain M8/M9 work. Mem0 live-provider quality, user memory commands/UI, and final memory-specific observability gates remain intentionally deferred.
+- What should be improved next: Execute M7 only for natural-language memory commands/UI; keep Mem0 live calls, production Tushare and expanded observability behind explicit gates in M8/M9.
 
 ## 19. Deferred Work
 
@@ -706,4 +708,4 @@ Before implementation, rollback is simply discarding the unexecuted plan. During
 
 ## 20. Handoff to Small-step Implementation
 
-Milestones 0 through 5 are implemented, offline-validated, and delivered through PR #33 (`0ea2aa0`). GitHub CI passed Python quality/offline tests, frontend lint/type/build, Docker packaging/configuration, and Offline Compose E2E. The next implementation milestone is M6: Mem0/pgvector retrieval; do not start it until a new M6 issue/branch is explicitly opened.
+Milestones 0 through 6 are implemented and offline-validated. M6 is tracked by Issue #35 on `feat/35-memory-hybrid-retrieval`; delivery still requires the normal commit/push/PR/CI/review/merge closure. The next implementation milestone after merge is M7: natural-language memory commands and UI.

@@ -15,6 +15,7 @@ from backend.db.models import (
     MemoryRecordRow,
     UserInvestProfile,
 )
+from backend.infrastructure.memory.index_tasks import enqueue_index_delete, enqueue_index_upsert
 from src.memory.contracts import (
     MEMORY_POLICY_VERSION,
     ActivationSource,
@@ -173,7 +174,8 @@ class SqlAlchemyAuthoritativeMemoryRepository:
             trace_id=trace_id,
         )
         await self._db.flush()
-        return _result(row)
+        await enqueue_index_upsert(self._db, row, trace_id=trace_id)
+        return _result(row, consistency_status=DerivedConsistencyStatus.PENDING)
 
     async def update_text(
         self,
@@ -203,7 +205,8 @@ class SqlAlchemyAuthoritativeMemoryRepository:
             trace_id=trace_id,
         )
         await self._db.flush()
-        return _result(row)
+        await enqueue_index_upsert(self._db, row, trace_id=trace_id)
+        return _result(row, consistency_status=DerivedConsistencyStatus.PENDING)
 
     async def delete_record(
         self,
@@ -228,7 +231,8 @@ class SqlAlchemyAuthoritativeMemoryRepository:
             trace_id=trace_id,
         )
         await self._db.flush()
-        return _result(row)
+        await enqueue_index_delete(self._db, row, trace_id=trace_id)
+        return _result(row, consistency_status=DerivedConsistencyStatus.PENDING)
 
     async def confirm_candidate(
         self,
@@ -353,12 +357,16 @@ def _record_row(record: MemoryRecord) -> MemoryRecordRow:
     )
 
 
-def _result(row: MemoryRecordRow) -> AuthorityMutationResult:
+def _result(
+    row: MemoryRecordRow,
+    *,
+    consistency_status: DerivedConsistencyStatus = DerivedConsistencyStatus.CONSISTENT,
+) -> AuthorityMutationResult:
     """把 ORM 行映射为不依赖 Provider 的稳定应用结果。"""
     return AuthorityMutationResult(
         record_id=row.id,
         status=MemoryRecordStatus(row.status),
-        consistency_status=DerivedConsistencyStatus.CONSISTENT,
+        consistency_status=consistency_status,
         version=row.version,
     )
 

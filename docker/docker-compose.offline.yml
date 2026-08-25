@@ -15,7 +15,7 @@ services:
       retries: 15
 
   postgres-e2e:
-    image: postgres:16-alpine
+    image: pgvector/pgvector:0.8.0-pg16
     environment:
       POSTGRES_USER: e2e
       POSTGRES_PASSWORD: e2e
@@ -49,7 +49,9 @@ services:
       ENABLE_LANGFUSE: "false"
       LANGFUSE_PUBLIC_KEY: ""
       LANGFUSE_SECRET_KEY: ""
-      ENABLE_MEMORY: "false"
+      ENABLE_MEMORY: "true"
+      MEMORY_SEMANTIC_PROVIDER: deterministic
+      MEMORY_EMBEDDING_PROVIDER: deterministic
       ENABLE_REDIS_CACHE: "true"
       REDIS_URL: redis://redis-e2e:6379/0
       REDIS_CACHE_NAMESPACE: finance-offline-e2e
@@ -105,7 +107,9 @@ services:
       ENABLE_LANGFUSE: "false"
       LANGFUSE_PUBLIC_KEY: ""
       LANGFUSE_SECRET_KEY: ""
-      ENABLE_MEMORY: "false"
+      ENABLE_MEMORY: "true"
+      MEMORY_SEMANTIC_PROVIDER: deterministic
+      MEMORY_EMBEDDING_PROVIDER: deterministic
       ENABLE_REDIS_CACHE: "true"
       ENABLE_STM: "true"
       STM_SUMMARY_PROVIDER: deterministic

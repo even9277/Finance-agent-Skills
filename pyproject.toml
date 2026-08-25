@@ -27,6 +27,8 @@ dependencies = [
   "tushare>=1.4,<2",
   "langfuse>=2.57,<3",
   "redis>=8.1,<9",
+  "mem0ai>=2.0.18,<2.1",
+  "pgvector>=0.5,<1",
 ]
 
 [dependency-groups]
@@ -81,4 +83,3 @@ markers = [
   "e2e: 从真实应用入口运行的完整链路测试",
   "slow: 运行时间较长、默认不作为快速门禁的测试",
 ]
-

@@ -7,6 +7,10 @@ from backend.infrastructure.chat.repository import SqlAlchemyConversationReposit
 from backend.infrastructure.chat.testing import FakeModelProvider, FakeToolProvider
 from backend.infrastructure.chat.trace import SkillTraceSink
 from backend.infrastructure.memory.runtime import get_memory_cache
+from backend.infrastructure.memory.retrieval_repository import SqlAlchemyMemoryRetrievalRepository
+from backend.infrastructure.memory.semantic_provider import PgVectorSemanticProvider
+from backend.application.memory.retrieval import MemoryRetrievalUseCase
+from backend.db.database import AsyncSessionFactory
 from backend.main import app
 from backend.routers import chat as chat_router
 from src.conversation.workflow import ControlledConversationWorkflow
@@ -25,6 +29,10 @@ def build_offline_chat_use_case(db: AsyncSession) -> ControlledChatUseCase:
             skill_catalog=SkillRegistry().conversation_snapshot(),
         ),
         repository=SqlAlchemyConversationRepository(db, cache=get_memory_cache()),
+        retrieval=MemoryRetrievalUseCase(
+            SqlAlchemyMemoryRetrievalRepository(db),
+            PgVectorSemanticProvider(AsyncSessionFactory),
+        ),
     )
 
 

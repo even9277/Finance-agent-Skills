@@ -28,6 +28,8 @@ _ltm_worker_task = None
 _ltm_worker_stop_event = None
 _stm_worker_task = None
 _stm_worker_stop_event = None
+_semantic_index_worker_task = None
+_semantic_index_worker_stop_event = None
 
 
 def _load_project_env_files() -> None:
@@ -57,6 +59,7 @@ async def lifespan(app: FastAPI):
     关闭：停止 Worker 并清理缓存、Trace 资源。
     """
     global _ltm_worker_task, _ltm_worker_stop_event, _stm_worker_task, _stm_worker_stop_event
+    global _semantic_index_worker_task, _semantic_index_worker_stop_event
 
     # 1. 初始化数据库（创建表 + 增量字段迁移）
     await init_db()
@@ -71,7 +74,9 @@ async def lifespan(app: FastAPI):
 
         cache = await initialize_memory_cache()
         if cache is None:
-            logger.info("memory_cache_disabled stage=%s status=%s", "memory.cache.bootstrap", "SKIPPED")
+            logger.info(
+                "memory_cache_disabled stage=%s status=%s", "memory.cache.bootstrap", "SKIPPED"
+            )
     except Exception as exc:
         logger.warning(
             "memory_cache_bootstrap_failed stage=%s status=%s error_code=%s error_type=%s",
@@ -126,8 +131,7 @@ async def lifespan(app: FastAPI):
         except Exception as exc:
             print(f"[backend] ltm_governance_worker 启动失败（不影响主功能）: {type(exc).__name__}")
             logger.warning(
-                "memory_governance_worker_failed stage=%s status=%s error_code=%s "
-                "error_type=%s",
+                "memory_governance_worker_failed stage=%s status=%s error_code=%s error_type=%s",
                 "memory.candidate.govern",
                 "DEGRADED",
                 "WORKER_BOOTSTRAP_FAILED",
@@ -136,6 +140,48 @@ async def lifespan(app: FastAPI):
     else:
         print("[backend] ENABLE_MEMORY=false，跳过 ltm_governance_worker")
         logger.info("[backend] ENABLE_MEMORY=false，LTM 候选治理关闭")
+
+    # M6 语义索引只在显式启用且 Provider 非 disabled 时启动；Mem0 惰性导入。
+    if settings.enable_memory and settings.memory_semantic_provider != "disabled":
+        try:
+            from backend.infrastructure.memory.semantic_provider import (
+                initialize_semantic_provider,
+            )
+            from backend.services.semantic_index_worker import SemanticIndexWorker
+
+            semantic_provider = await initialize_semantic_provider(AsyncSessionFactory)
+            if semantic_provider is not None:
+                _semantic_index_worker_stop_event = asyncio.Event()
+                semantic_worker = SemanticIndexWorker(
+                    session_factory=AsyncSessionFactory,
+                    provider=semantic_provider,
+                )
+                _semantic_index_worker_task = asyncio.create_task(
+                    semantic_worker.run(_semantic_index_worker_stop_event),
+                    name="semantic_index_worker",
+                )
+                print("[backend] semantic_index_worker 后台任务已启动 ✓")
+                logger.info(
+                    "memory_index_worker_started stage=%s status=%s provider=%s",
+                    "memory.index",
+                    "STARTED",
+                    semantic_provider.name,
+                )
+        except Exception as exc:
+            print(f"[backend] semantic_index_worker 启动失败（前台安全降级）: {type(exc).__name__}")
+            logger.warning(
+                "memory_index_worker_failed stage=%s status=%s error_code=%s error_type=%s",
+                "memory.index",
+                "DEGRADED",
+                "WORKER_BOOTSTRAP_FAILED",
+                type(exc).__name__,
+            )
+    else:
+        logger.info(
+            "memory_index_worker_disabled stage=%s status=%s",
+            "memory.index",
+            "SKIPPED",
+        )
 
     if settings.enable_stm:
         try:
@@ -186,6 +232,16 @@ async def lifespan(app: FastAPI):
             pass
         print("[backend] stm_compaction_worker 已停止")
         logger.info("[backend] stm_compaction_worker 已停止")
+    if _semantic_index_worker_task and not _semantic_index_worker_task.done():
+        if _semantic_index_worker_stop_event:
+            _semantic_index_worker_stop_event.set()
+        _semantic_index_worker_task.cancel()
+        try:
+            await _semantic_index_worker_task
+        except asyncio.CancelledError:
+            pass
+        print("[backend] semantic_index_worker 已停止")
+        logger.info("[backend] semantic_index_worker 已停止")
     try:
         from backend.infrastructure.memory.runtime import close_memory_cache
 

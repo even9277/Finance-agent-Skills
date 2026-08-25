@@ -32,6 +32,7 @@ from .contracts import (
     ErrorCode,
     EventAttribute,
     ExecutedPlanStep,
+    MemoryContextItem,
     RouteDecision,
     RouteFamily,
     PreferenceOperation,
@@ -204,6 +205,7 @@ class ControlledConversationWorkflow:
         recent_messages: tuple[str, ...] = (),
         running_summary: str | None = None,
         working_state: WorkingState | None = None,
+        memory_context: tuple[MemoryContextItem, ...] = (),
     ) -> ConversationResult:
         """执行一轮受控对话并返回唯一终态。
 
@@ -212,6 +214,8 @@ class ControlledConversationWorkflow:
             recent_messages: 可选、已裁剪的会话尾窗。
             running_summary: 可选会话摘要；当前轮问题始终优先。
             working_state: 当前会话版本化热状态；仅作为受门控继承候选。
+            memory_context: 已经由 Application 召回并通过 PostgreSQL 后过滤的历史记忆；
+                只允许进入上下文和合成阶段。
 
         Returns:
             包含阶段事件、证据门控和终态的不可变结果。
@@ -234,9 +238,27 @@ class ControlledConversationWorkflow:
                 recent_messages=recent_messages,
                 running_summary=running_summary,
                 working_state=working_state,
+                memory_context=memory_context,
             )
             state.transition(RunPhase.PREFLIGHTED)
-            self._emit(events, context, StageName.CONTEXT, StageStatus.SUCCEEDED, started)
+            self._emit(
+                events,
+                context,
+                StageName.CONTEXT,
+                StageStatus.SUCCEEDED,
+                started,
+                attributes=(
+                    EventAttribute(key="memory_hit_count", value=len(packet.retrieved_memories)),
+                    EventAttribute(
+                        key="memory_token_count",
+                        value=sum(max(1, (len(item.content) + 3) // 4) for item in packet.retrieved_memories),
+                    ),
+                    EventAttribute(
+                        key="memory_context_status",
+                        value="USED" if packet.retrieved_memories else "EMPTY",
+                    ),
+                ),
+            )
 
             started = time.perf_counter()
             entity_result = self._services.entity.resolve(packet)
@@ -707,6 +729,7 @@ class ControlledConversationWorkflow:
                 constraints=rewrite.constraints.items,
                 reply_preference=rewrite.reply_preference.hint,
                 selected_skill=rewrite.skill_name,
+                retrieved_memories=packet.retrieved_memories,
             )
             reply = await self._services.synthesizer.synthesize(pack)
             self._emit(

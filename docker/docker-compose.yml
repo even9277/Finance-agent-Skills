@@ -18,7 +18,7 @@ services:
   # Phase 1 使用 SQLite，此服务可选启动
   # ─────────────────────────────────────────
   postgres:
-    image: pgvector/pgvector:pg16
+    image: pgvector/pgvector:0.8.0-pg16
     container_name: finance_postgres
     restart: unless-stopped
     environment:
