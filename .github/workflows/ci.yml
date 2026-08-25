@@ -82,6 +82,8 @@ jobs:
         run: uv run --locked pytest Financial-MCP-Agent -q -m "not live"
       - name: Offline eval smoke
         run: uv run --locked pytest tests/evals -q -m "eval_smoke and not live"
+      - name: Memory offline eval gate
+        run: uv run --locked pytest tests/evals/memory -q -m "eval_smoke and not live"
       - name: Root regression
         run: uv run --locked pytest -q
 
@@ -107,6 +109,8 @@ jobs:
         run: npm run type-check
       - name: Production build
         run: npm run build
+      - name: Frontend unit tests
+        run: npm run test -- --run
 
   compose-config:
     name: Docker packaging and Compose configuration

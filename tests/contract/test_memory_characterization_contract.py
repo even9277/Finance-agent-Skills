@@ -30,6 +30,7 @@ from backend.db.database import get_db  # noqa: E402
 from backend.middleware import auth as auth_middleware  # noqa: E402
 from backend.middleware.auth import AuthContext, require_auth  # noqa: E402
 from backend.routers import memory as memory_router  # noqa: E402
+from backend.application.memory.observability import MemoryStage  # noqa: E402
 from src.memory import mem0_client  # noqa: E402
 from src.memory.memory_service import MemoryService  # noqa: E402
 
@@ -302,20 +303,21 @@ def test_targeted_delete_exposes_lifecycle_and_consistency_status() -> None:
 
 
 @pytest.mark.contract
-@TARGET_GAP
 def test_memory_trace_declares_stable_foreground_and_background_stages() -> None:
-    """目标合同：记忆读取、写入、压缩和治理必须使用稳定低基数阶段名。"""
-    source_files = [PROJECT_ROOT / "backend" / "infrastructure" / "chat" / "trace.py"]
-    memory_infrastructure = PROJECT_ROOT / "backend" / "infrastructure" / "memory"
-    if memory_infrastructure.exists():
-        source_files.extend(sorted(memory_infrastructure.glob("*.py")))
-    source = "\n".join(path.read_text(encoding="utf-8") for path in source_files)
+    """正式合同：所有记忆阶段必须来自唯一的低基数枚举。"""
     required_stages = {
         "memory.preflight",
+        "memory.state.extract",
+        "memory.state.merge",
         "memory.compact",
+        "memory.candidate.extract",
         "memory.candidate.govern",
+        "memory.index",
         "memory.retrieve",
         "memory.inject",
+        "memory.mutate",
         "memory.delete",
+        "memory.cache",
+        "memory.worker",
     }
-    assert required_stages.issubset(set(source.split()))
+    assert {stage.value for stage in MemoryStage} == required_stages

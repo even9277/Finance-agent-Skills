@@ -12,6 +12,12 @@ from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from backend.application.memory.retrieval import SemanticMemoryProvider
+from backend.application.memory.observability import (
+    MemoryObservation,
+    MemoryStage,
+    MemoryStatus,
+    emit_memory_observation,
+)
 from backend.config import settings
 from backend.db.models import (
     MemoryOutboxTaskRow,
@@ -63,12 +69,35 @@ class SemanticIndexWorker:
             return False
         try:
             await self._process_claim(claim)
+            emit_memory_observation(
+                MemoryObservation(
+                    stage=MemoryStage.INDEX,
+                    status=MemoryStatus.SUCCEEDED,
+                    trace_id="",
+                    run_id=claim.task_id,
+                    reference=claim.task_id,
+                )
+            )
         except Exception as exc:
             await self._record_failure(claim, exc)
             logger.warning(
                 "memory.index stage=memory.index status=FAILED error_code=%s error_type=%s",
                 "PROVIDER_UNAVAILABLE",
                 type(exc).__name__,
+            )
+            emit_memory_observation(
+                MemoryObservation(
+                    stage=MemoryStage.INDEX,
+                    status=MemoryStatus.RETRY,
+                    trace_id="",
+                    run_id=claim.task_id,
+                    reference=claim.task_id,
+                    error_code=(
+                        "INVALID_INDEX_PAYLOAD"
+                        if isinstance(exc, ValueError) and str(exc) == "INVALID_INDEX_PAYLOAD"
+                        else "PROVIDER_UNAVAILABLE"
+                    ),
+                )
             )
         return True
 

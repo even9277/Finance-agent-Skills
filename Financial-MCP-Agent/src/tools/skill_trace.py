@@ -470,6 +470,37 @@ def log_compaction_enqueue(**kwargs: Any) -> None:
     _emit_record(record_type="event", name="chat.compaction_enqueue", stage="memory", data=kwargs)
 
 
+def log_memory_stage(
+    *,
+    trace_id: str,
+    run_id: str,
+    stage: str,
+    status: str,
+    elapsed_ms: float = 0.0,
+    error_code: str | None = None,
+    metrics: dict[str, Any] | None = None,
+    refs: dict[str, Any] | None = None,
+) -> None:
+    """记录后台或前台记忆阶段，并保持与聊天 Trace 相同的脱敏出口。"""
+    with skill_trace_context(
+        trace_id=trace_id,
+        run_id=run_id,
+        workflow_name="memory-lifecycle",
+        policy_version="memory-observability-v1",
+        trace_schema_version="memory-observability-v1",
+    ):
+        _emit_record(
+            record_type="span",
+            name=stage,
+            stage=stage,
+            status=status,
+            duration_ms=round(max(0.0, elapsed_ms), 2),
+            data={"error_code": error_code} if error_code else None,
+            metrics=metrics,
+            refs=refs,
+        )
+
+
 def log_trace_started(**kwargs: Any) -> None:
     metrics = kwargs.pop("metrics", None)
     refs = kwargs.pop("refs", None)

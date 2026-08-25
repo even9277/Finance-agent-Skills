@@ -290,6 +290,7 @@ app.include_router(portfolio.router, prefix="/api/portfolio", tags=["持仓管�
 async def health_check():
     """返回应用与可选记忆缓存的安全健康摘要。"""
     from backend.infrastructure.memory.runtime import get_memory_cache
+    from backend.application.memory.observability import memory_metrics
 
     cache = get_memory_cache()
     cache_health = (
@@ -300,5 +301,8 @@ async def health_check():
     return {
         "status": "ok",
         "version": settings.app_version,
-        "components": {"memory_cache": cache_health},
+        "components": {
+            "memory_cache": cache_health,
+            "memory_observability": {"status": "UP", "metrics": memory_metrics.snapshot()},
+        },
     }

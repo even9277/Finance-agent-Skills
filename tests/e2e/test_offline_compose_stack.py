@@ -628,9 +628,14 @@ def test_frontend_proxy_reaches_backend_and_fake_chat_chain() -> None:
     )
     assert follow_up["session_id"] == cache_seed["session_id"]
     with urlopen(f"{base_url}/api/health", timeout=10) as response:  # noqa: S310
-        cache_health = json.loads(response.read().decode("utf-8"))["components"]["memory_cache"]
+        health = json.loads(response.read().decode("utf-8"))
+        cache_health = health["components"]["memory_cache"]
+        observability_health = health["components"]["memory_observability"]
     assert cache_health["status"] == "UP"
     assert cache_health["metrics"]["hits"] >= 1
+    assert observability_health["status"] == "UP"
+    assert observability_health["metrics"]["events_total"] >= 1
+    assert observability_health["metrics"]["stage.memory.retrieve"] >= 1
 
     # M7 真实 HTTP 旅程：先通过兼容 API 写入合成文本记忆，再由聊天命令预览、确认并软删除。
     memory_add_request = Request(
