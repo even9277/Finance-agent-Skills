@@ -44,7 +44,7 @@ git diff --check: passed
 - 全仓 Pyright 仍有 86 个历史错误，集中在旧 Agent、工具和 Langfuse 适配器；本里程碑未扩大范围修复。
 - 测试存在 Python 运行时 `datetime.utcnow()` 弃用警告及 Starlette/httpx 警告；不影响本次行为结果，后续单独治理。
 - 已执行完整 Docker Compose E2E：真实隔离 PostgreSQL、Redis、FastAPI、Nginx/Vue 链路通过 `136 passed, 1 skipped, 32 deselected, 5 xfailed`，退出码为 0。
-- 尚未执行独立只读 Review、commit、push、PR、CI、Code Review 和 merge；这些是本里程碑交付闭环的下一步。
+- 交付闭环已完成：commit `e308477` 已推送，PR #33 已通过四项 CI 门禁并合并为 `0ea2aa0`；Issue #32 已关闭。GitHub 不允许 PR 作者批准自己的 PR，因此未产生作者自审批准记录；合并前已完成本地只读 diff 审查和全部自动化门禁。
 - M6 的 Mem0/pgvector 检索、索引同步和自然语言记忆命令仍未实现。
 
 ## 5. 回滚与交接
