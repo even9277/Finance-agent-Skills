@@ -384,7 +384,7 @@ For database changes, use an expand-first Alembic revision; validate upgrade, do
 - [x] Milestone 0: Safety and Baseline Check (Issue #38, branch `feat/38-memory-commands`, baseline captured)
 - [x] Milestone 1: Lock or Add Tests / Reproduction (parser/result contracts and offline fixtures added; frontend runner remains a scoped follow-up)
 - [x] Milestone 2: Implement Core Change (parser, pending authority/migration, chat branch, REST/WS/TS contract)
-- [ ] Milestone 3: Add Validation, Error Handling, and Observability
+- [x] Milestone 3: Add Validation, Error Handling, and Observability (pending lifecycle negatives, legacy delete gate, safe logs, frontend state/test harness)
 - [ ] Milestone 4: Verification and Narrow Fixes
 - [ ] Milestone 5: Documentation and Handoff
 
@@ -408,6 +408,7 @@ For database changes, use an expand-first Alembic revision; validate upgrade, do
 | Frontend currently lacks the planned unit/browser test runner | Dependency and CI scope may expand | Verify in M1; stop for approval if it cannot remain narrow |
 | Frontend `package.json` has no Vitest/Playwright and no existing test script | Adding both now would expand M1 beyond characterization scope | Keep production lint/type/build green; evaluate the smallest locked test addition in M3 |
 | The existing domain contracts already had command action/result types but lacked a low-impact response preference field | A parallel command enum would drift from M6 authority semantics | Reuse the domain action vocabulary and add only `ProfileField.RESPONSE_PREF` plus the application result fields |
+| Vitest was not installed but the frontend already had a lockfile and Vite 6 toolchain | Frontend command-state tests were otherwise impossible to run in CI | Added only Vitest, Vue Test Utils, and jsdom as dev dependencies; Playwright/browser coverage remains in M4 |
 
 ## 18. Outcomes & Retrospective
 

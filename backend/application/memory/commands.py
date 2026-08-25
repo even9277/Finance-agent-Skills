@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 import uuid
 from dataclasses import dataclass, field
@@ -23,6 +24,7 @@ from src.memory.contracts import MemoryCommandAction, MemoryRecordStatus, Memory
 PARSER_VERSION = "memory-command-v1"
 CONFIRMATION_TTL_SECONDS = 600
 MAX_PREVIEW_ITEMS = 5
+logger = logging.getLogger(__name__)
 
 
 class MemoryCommandKind(StrEnum):
@@ -158,17 +160,33 @@ class MemoryCommandUseCase:
         trace_id: str | None = None,
     ) -> MemoryCommandResult:
         """执行单条已解析命令；调用方负责最终 commit/rollback。"""
+        logger.info(
+            "memory.command stage=%s status=%s command_kind=%s",
+            "memory.command.preflight",
+            "STARTED",
+            intent.kind.value,
+        )
         if intent.kind is MemoryCommandKind.INSPECT:
-            return await self._inspect(intent)
-        if intent.kind is MemoryCommandKind.UPDATE:
-            return await self._update(intent, trace_id=trace_id)
-        if intent.kind is MemoryCommandKind.DELETE:
-            return await self._delete(intent, trace_id=trace_id)
-        if intent.kind is MemoryCommandKind.FORGET:
-            return await self._prepare_forget(intent)
-        if intent.kind is MemoryCommandKind.CONFIRM:
-            return await self._confirm(intent, trace_id=trace_id)
-        return await self._cancel(intent)
+            result = await self._inspect(intent)
+        elif intent.kind is MemoryCommandKind.UPDATE:
+            result = await self._update(intent, trace_id=trace_id)
+        elif intent.kind is MemoryCommandKind.DELETE:
+            result = await self._delete(intent, trace_id=trace_id)
+        elif intent.kind is MemoryCommandKind.FORGET:
+            result = await self._prepare_forget(intent)
+        elif intent.kind is MemoryCommandKind.CONFIRM:
+            result = await self._confirm(intent, trace_id=trace_id)
+        else:
+            result = await self._cancel(intent)
+        logger.info(
+            "memory.command stage=%s status=%s command_kind=%s affected_count=%s error_code=%s",
+            "memory.command.execute",
+            result.status.value,
+            intent.kind.value,
+            result.affected_count,
+            result.error_code or "NONE",
+        )
+        return result
 
     async def _inspect(self, intent: MemoryCommandIntent) -> MemoryCommandResult:
         """只读取当前用户的权威有效记录并返回受限摘要。"""

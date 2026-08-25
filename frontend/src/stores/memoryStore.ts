@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
-import type { MemoryProfile, MemoryItem, MemoryStats } from '@/api'
+import type { MemoryProfile, MemoryItem, MemoryStats, MemoryCommandResult } from '@/api'
 
 export const useMemoryStore = defineStore('memory', () => {
   // ── 结构化画像（来自 user_invest_profiles 权威表）──────────
@@ -36,6 +36,7 @@ export const useMemoryStore = defineStore('memory', () => {
   const itemsLoaded = ref(false)
   const currentPage = ref(1)
   const totalItems = ref(0)
+  const lastCommand = ref<MemoryCommandResult | null>(null)
   const hasMoreItems = computed(
     () => memoryItems.value.length < totalItems.value
   )
@@ -104,6 +105,10 @@ export const useMemoryStore = defineStore('memory', () => {
     totalItems.value = 0
   }
 
+  function setCommandResult(result: MemoryCommandResult | null) {
+    lastCommand.value = result
+  }
+
   function resetProfile() {
     profile.value = {
       risk_profile: undefined,
@@ -123,6 +128,7 @@ export const useMemoryStore = defineStore('memory', () => {
     totalMemories.value = 0
     stats.value = { from_conversations: 0, from_reports: 0, from_manual: 0, total_tasks: 0 }
     clearItems()
+    lastCommand.value = null
   }
 
   return {
@@ -134,6 +140,7 @@ export const useMemoryStore = defineStore('memory', () => {
     itemsLoaded,
     currentPage,
     totalItems,
+    lastCommand,
     hasMoreItems,
     // actions
     setProfile,
@@ -147,6 +154,7 @@ export const useMemoryStore = defineStore('memory', () => {
     removeWatchlist,
     setMemoryItems,
     clearItems,
+    setCommandResult,
     resetProfile,
   }
 })
