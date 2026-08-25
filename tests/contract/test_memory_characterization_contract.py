@@ -164,7 +164,6 @@ def test_chat_use_case_enqueues_compaction_after_a_committed_turn() -> None:
 
 
 @pytest.mark.contract
-@TARGET_GAP
 def test_model_inference_cannot_directly_write_high_impact_profile() -> None:
     """目标合同：模型推断的风险等级只能进入候选池，不能直写画像。"""
 
@@ -179,8 +178,8 @@ def test_model_inference_cannot_directly_write_high_impact_profile() -> None:
                 source="chat_inferred",
             )
         upsert.assert_not_awaited()
-        assert result is not None
-        assert getattr(result, "requires_confirmation", False) is True
+        assert result.requires_confirmation is True
+        assert result.applied is False
 
     asyncio.run(run_case())
 

@@ -7,9 +7,8 @@
 
 import sys
 from pathlib import Path
-from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.db.database import get_db
@@ -33,7 +32,7 @@ _AGENT_ROOT = Path(__file__).resolve().parent.parent.parent / "Financial-MCP-Age
 if str(_AGENT_ROOT) not in sys.path:
     sys.path.insert(0, str(_AGENT_ROOT))
 
-from src.utils.logging_config import setup_logger
+from src.utils.logging_config import setup_logger  # noqa: E402
 
 logger = setup_logger("memory_router", log_dir=str(_AGENT_ROOT / "logs"))
 
@@ -53,8 +52,7 @@ async def get_memory_profile(
     stats = await memory_service.get_memory_stats(user_id, db)
     total_memories = stats.get("total_tasks", 0)
 
-    logger.info(f"[memory_router] GET /profile: user={user_id}")
-    print(f"[memory_router] GET /profile: user={user_id[:8]}...")
+    logger.info("memory_profile_read stage=%s status=%s", "memory.profile.read", "SUCCEEDED")
 
     return MemoryProfileResponse(
         user_id=user_id,
@@ -72,12 +70,11 @@ async def get_memory_profile(
 @router.put("/profile/risk", summary="更新风险偏好（RiskProfileCard 调用）")
 async def update_risk(
     user_id: str = Depends(require_query_user),
-    body: MemoryUpdateRiskRequest = ...,
+    body: MemoryUpdateRiskRequest = Body(...),
     db: AsyncSession = Depends(get_db),
 ):
     await memory_service.update_risk_profile(user_id, body.risk_profile, db)
-    logger.info(f"[memory_router] PUT /profile/risk: user={user_id}, value={body.risk_profile}")
-    print(f"[memory_router] 更新风险偏好: user={user_id[:8]}..., value={body.risk_profile}")
+    logger.info("memory_profile_write stage=%s status=%s field=%s", "memory.profile.risk", "SUCCEEDED", "risk_level")
     return {"message": "已更新", "field": "risk_level", "value": body.risk_profile}
 
 
@@ -88,12 +85,11 @@ async def update_risk(
 @router.put("/profile/sectors", summary="更新关注板块（SectorTagSelector 调用）")
 async def update_sectors(
     user_id: str = Depends(require_query_user),
-    body: MemoryUpdateSectorsRequest = ...,
+    body: MemoryUpdateSectorsRequest = Body(...),
     db: AsyncSession = Depends(get_db),
 ):
     await memory_service.update_sectors(user_id, body.sectors, db)
-    logger.info(f"[memory_router] PUT /profile/sectors: user={user_id}, sectors={body.sectors}")
-    print(f"[memory_router] 更新关注板块: user={user_id[:8]}..., sectors={body.sectors}")
+    logger.info("memory_profile_write stage=%s status=%s field=%s", "memory.profile.sectors", "SUCCEEDED", "sectors")
     return {"message": "已更新", "field": "sectors", "value": body.sectors}
 
 
@@ -104,7 +100,7 @@ async def update_sectors(
 @router.put("/profile/return", summary="更新期望收益（ReturnExpectation 调用）")
 async def update_return(
     user_id: str = Depends(require_query_user),
-    body: MemoryUpdateReturnRequest = ...,
+    body: MemoryUpdateReturnRequest = Body(...),
     db: AsyncSession = Depends(get_db),
 ):
     await memory_service.update_return_expectation(
@@ -114,11 +110,7 @@ async def update_return(
         return_max=body.return_max,
         investment_horizon=body.investment_horizon,
     )
-    logger.info(
-        f"[memory_router] PUT /profile/return: user={user_id}, "
-        f"min={body.return_expectation}, max={body.return_max}"
-    )
-    print(f"[memory_router] 更新期望收益: user={user_id[:8]}..., min={body.return_expectation}%")
+    logger.info("memory_profile_write stage=%s status=%s field=%s", "memory.profile.return", "SUCCEEDED", "expected_return")
     return {
         "message": "已更新",
         "expected_return_min": body.return_expectation,
@@ -133,14 +125,14 @@ async def update_return(
 @router.put("/profile/horizon", summary="更新投资周期")
 async def update_horizon(
     user_id: str = Depends(require_query_user),
-    body: MemoryUpdateHorizonRequest = ...,
+    body: MemoryUpdateHorizonRequest = Body(...),
     db: AsyncSession = Depends(get_db),
 ):
     await memory_service.update_return_expectation(
         user_id, 0, db,
         investment_horizon=body.investment_horizon,
     )
-    logger.info(f"[memory_router] PUT /profile/horizon: user={user_id}, value={body.investment_horizon}")
+    logger.info("memory_profile_write stage=%s status=%s field=%s", "memory.profile.horizon", "SUCCEEDED", "investment_horizon")
     return {"message": "已更新", "field": "investment_horizon", "value": body.investment_horizon}
 
 
@@ -151,11 +143,11 @@ async def update_horizon(
 @router.put("/profile/pref", summary="更新回答偏好")
 async def update_pref(
     user_id: str = Depends(require_query_user),
-    body: MemoryUpdateResponsePrefRequest = ...,
+    body: MemoryUpdateResponsePrefRequest = Body(...),
     db: AsyncSession = Depends(get_db),
 ):
     await memory_service.update_response_pref(user_id, body.response_pref, db)
-    logger.info(f"[memory_router] PUT /profile/pref: user={user_id}, value={body.response_pref}")
+    logger.info("memory_profile_write stage=%s status=%s field=%s", "memory.profile.preference", "SUCCEEDED", "response_pref")
     return {"message": "已更新", "field": "response_pref", "value": body.response_pref}
 
 
@@ -171,7 +163,12 @@ async def get_memory_items(
     db: AsyncSession = Depends(get_db),
 ):
     data = await memory_service.get_memory_items(user_id, page, size, db)
-    logger.debug(f"[memory_router] GET /items: user={user_id}, total={data.get('total')}")
+    logger.debug(
+        "memory_items_read stage=%s status=%s item_count=%s",
+        "memory.items.read",
+        "SUCCEEDED",
+        data.get("total", 0),
+    )
     return MemoryItemsResponse(**data)
 
 
@@ -182,13 +179,13 @@ async def get_memory_items(
 @router.post("/items", summary="手动添加记忆条目")
 async def add_memory_item(
     user_id: str = Depends(require_query_user),
-    body: MemoryAddRequest = ...,
+    body: MemoryAddRequest = Body(...),
     db: AsyncSession = Depends(get_db),
 ):
     item = await memory_service.add_memory_item(
         user_id, body.category, body.content, body.metadata, db
     )
-    logger.info(f"[memory_router] POST /items: user={user_id}, category={body.category}")
+    logger.info("memory_item_write stage=%s status=%s operation=%s", "memory.item.write", "SUCCEEDED", "add")
     return item
 
 
@@ -200,16 +197,26 @@ async def add_memory_item(
 async def update_memory_item(
     memory_id: str,
     user_id: str = Depends(require_query_user),
-    body: MemoryUpdateRequest = ...,
+    body: MemoryUpdateRequest = Body(...),
     db: AsyncSession = Depends(get_db),
 ):
-    ok = await memory_service.update_memory_item(
+    result = await memory_service.update_memory_item(
         user_id, memory_id, body.content, body.metadata, db
     )
-    if not ok:
-        raise HTTPException(status_code=404, detail="记忆条目不存在或 Mem0 不可用")
-    logger.info(f"[memory_router] PUT /items/{memory_id}: user={user_id}")
-    return {"message": "已更新"}
+    if result is None:
+        raise HTTPException(status_code=404, detail="记忆条目不存在")
+    logger.info(
+        "memory_item_updated stage=%s status=%s",
+        "memory.item.write",
+        "SUCCEEDED",
+    )
+    return {
+        "message": "已更新",
+        "record_id": result.record_id,
+        "status": result.status.value,
+        "consistency_status": result.consistency_status.value,
+        "version": result.version,
+    }
 
 
 # ─────────────────────────────────────────────────────────────
@@ -222,11 +229,21 @@ async def delete_memory_item(
     user_id: str = Depends(require_query_user),
     db: AsyncSession = Depends(get_db),
 ):
-    ok = await memory_service.delete_memory_item(user_id, memory_id, db)
-    if not ok:
+    result = await memory_service.delete_memory_item(user_id, memory_id, db)
+    if result is None:
         raise HTTPException(status_code=404, detail="记忆条目不存在")
-    logger.info(f"[memory_router] DELETE /items/{memory_id}: user={user_id}")
-    return {"message": "已删除"}
+    logger.info(
+        "memory_item_deleted stage=%s status=%s",
+        "memory.delete",
+        "SUCCEEDED",
+    )
+    return {
+        "message": "已删除",
+        "record_id": result.record_id,
+        "status": result.status.value,
+        "consistency_status": result.consistency_status.value,
+        "version": result.version,
+    }
 
 
 # ─────────────────────────────────────────────────────────────
@@ -245,8 +262,7 @@ async def delete_all_memories(
             detail="请传入 confirm=true 以确认删除所有记忆（此操作不可撤销）",
         )
     await memory_service.delete_all_memories(user_id, db)
-    logger.warning(f"[memory_router] DELETE /all: user={user_id}")
-    print(f"[memory_router] 清空所有记忆: user={user_id[:8]}...")
+    logger.warning("memory_items_write stage=%s status=%s operation=%s", "memory.delete_all", "SUCCEEDED", "delete_all")
     return {"message": "已清空所有记忆（Mem0 + user_invest_profiles 均已重置）"}
 
 
@@ -265,5 +281,5 @@ async def get_memory_evidence(
     db: AsyncSession = Depends(get_db),
 ):
     result = await memory_service.get_memory_evidence(user_id, memory_id, db)
-    logger.debug(f"[memory_router] GET /items/{memory_id}/evidence: user={user_id}")
+    logger.debug("memory_evidence_read stage=%s status=%s", "memory.evidence.read", "SUCCEEDED")
     return MemoryEvidenceResponse(**result)

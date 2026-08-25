@@ -12,7 +12,7 @@
   - `CLARIFICATION_QUESTIONS.md`
   - `SOLUTION_TRADEOFF.md`
 - Repository root: `D:\FinanceProject\Finance-agent-Skills`
-- Current branch: `docs/22-memory-migration-spec`
+- Current branch: `feat/32-memory-candidate-governance`
 - GitHub tracking: Issue #22 currently tracks specification; each implementation milestone requires its own Issue/short branch/PR before GitHub delivery.
 - Created date: 2026-08-24
 
@@ -592,7 +592,9 @@ Before implementation, rollback is simply discarding the unexecuted plan. During
 - [x] Milestone 4: Redis Hot-State Cache and Worker Coordination
   - Completed: 2026-08-25
   - Evidence: `redis-py` 8.1.0 and the immutable Redis 7.4.10 Alpine image were verified in both dependency manifests and the normal runtime image; maintained-scope Ruff/Pyright reported zero findings, including the lifecycle and legacy memory bridge; six real-Redis integrations covered TTL/isolation/invalidation/corruption, SQL-authority outage fallback, all three inner-version tamper cases, lease expiry/token fencing, and concurrent context single-flight. Root regression reported 214 passed, 6 skipped, 5 live deselected, and 6 intentional strict xfails. The final rebuilt Redis/PostgreSQL/FastAPI/Nginx/Vue Compose stack reported 125 passed, 1 skipped, 32 deselected, and 6 intentional strict xfails. Focused transaction/summary/profile tests proved that rollback never publishes uncommitted snapshots and that post-authority invalidation failure cannot reverse a successful write. A separate outage journey stopped Redis between two turns of the same session and still returned HTTP 200 while health changed to `DEGRADED/UNAVAILABLE`.
-- [ ] Milestone 5: Long-term Candidate Extraction and Governance
+- [x] Milestone 5: Long-term Candidate Extraction and Governance
+  - Completed: 2026-08-25 (implementation, focused acceptance, and rebuilt offline Compose acceptance)
+  - Evidence: typed candidate contracts and deterministic policy; user-message-only provenance/source gates; PostgreSQL candidate/evidence/audit authority; high-impact profile confirmation-only isolation; low-impact repeat/unique-session/active-day/recency/conflict governance; explicit-authority bridge; candidate outbox creation from summary success; lease fencing, malformed-payload dead-letter, bounded retry, expired-lease recovery, and idempotent task handling. Focused M5 suite reported 28 passed and 5 intentional xfails; Worker/migration additions reported 8 passed; maintained-scope Ruff and Pyright reported zero findings; migration upgrade/downgrade/re-upgrade preserved legacy rows. Rebuilt full offline Compose reported 136 passed, 1 skipped, 32 deselected, and 5 intentional xfails with exit code 0, exercising isolated PostgreSQL/Redis/FastAPI/Nginx/Vue. No paid model, production service, Tushare, Mem0, or pgvector was called. Independent review and GitHub delivery closure remain before M6.
 - [ ] Milestone 6: Mem0/pgvector Index, Hybrid Retrieval, and Stage Injection
 - [ ] Milestone 7: Natural-language Memory Commands, API, and Frontend Controls
 - [ ] Milestone 8: Observability, Failure Hardening, and Offline Evaluation Gates
@@ -704,4 +706,4 @@ Before implementation, rollback is simply discarding the unexecuted plan. During
 
 ## 20. Handoff to Small-step Implementation
 
-Milestones 0 through 4 are complete. The first unchecked milestone is Milestone 5. Execute only long-term candidate extraction and governance against PostgreSQL authority; do not install Mem0/pgvector dependencies early, and stop before Milestone 6.
+Milestones 0 through 5 are implemented and offline-validated. M5 delivery handoff is pending independent review, commit, PR, CI, review, and merge. The next implementation milestone is M6: Mem0/pgvector retrieval; do not start it until M5 delivery closure is complete.

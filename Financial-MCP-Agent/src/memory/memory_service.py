@@ -24,6 +24,7 @@ import hashlib
 import json
 import os
 import sys
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -38,6 +39,14 @@ from src.memory.mem0_schema import MemorySource  # noqa: E402
 from src.utils.logging_config import setup_logger  # noqa: E402
 
 logger = setup_logger("memory_service")
+
+
+@dataclass(frozen=True)
+class ProfileMutationDecision:
+    """表示画像写入是否被候选治理边界接受。"""
+
+    requires_confirmation: bool
+    applied: bool
 
 # Mem0 get_all 单次拉取上限（分页在应用层切片；过小会导致前端「加载更多」缺页）
 _MEM0_GET_ALL_LIMIT = int(os.getenv("MEM0_GET_ALL_LIMIT", "500"))
@@ -358,21 +367,29 @@ class MemoryService:
         value: Any,
         source: str = "chat_inferred",
         db_session=None,
-    ) -> None:
+    ) -> "ProfileMutationDecision":
         """
-        仅写入 user_invest_profiles，不触发 Mem0 入队。
+        显式来源可继续写兼容画像；模型推断只返回待确认决定。
 
-        用于对话推断场景（P3）：先直写 DB 快速生效，Mem0 的语义同步
-        由 maybe_update_ltm_from_chat 单独处理，避免重复入队。
+        旧版本曾允许 ``chat_inferred`` 直接改写高影响画像。M5 将该入口
+        收紧为 fail-closed，候选必须由统一 REM Worker 携带用户证据创建。
         """
         if field not in MemoryService._ALLOWED_PROFILE_FIELDS:
-            logger.warning(f"[MemoryService] update_profile_field: 非法字段 '{field}'，跳过")
-            return
+            return ProfileMutationDecision(requires_confirmation=False, applied=False)
+        if source in {"chat_inferred", "report_inferred", "model_inferred"}:
+            logger.info(
+                "memory_profile_inference_blocked stage=%s status=%s field=%s",
+                "memory.candidate.govern",
+                "CONFIRMATION_REQUIRED",
+                field,
+            )
+            return ProfileMutationDecision(requires_confirmation=True, applied=False)
         await _upsert_profile_field(user_id, field, value, source, db_session)
         logger.info(
             f"[MemoryService] update_profile_field: user={user_id}, "
             f"field={field}, source={source}"
         )
+        return ProfileMutationDecision(requires_confirmation=False, applied=True)
 
     @staticmethod
     async def update_profile_and_enqueue(

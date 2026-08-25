@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from enum import StrEnum
 
 MEMORY_SCHEMA_VERSION = "memory-v1"
@@ -78,6 +78,22 @@ class CandidateStatus(StrEnum):
     CONFLICTED = "CONFLICTED"
     EXPIRED = "EXPIRED"
     SUPERSEDED = "SUPERSEDED"
+
+
+class CandidateReasonCode(StrEnum):
+    """解释候选隔离、晋升或终止的确定性原因。"""
+
+    AWAITING_MORE_EVIDENCE = "AWAITING_MORE_EVIDENCE"
+    HIGH_IMPACT_CONFIRMATION_REQUIRED = "HIGH_IMPACT_CONFIRMATION_REQUIRED"
+    ASSISTANT_ONLY_EVIDENCE = "ASSISTANT_ONLY_EVIDENCE"
+    SOURCE_NOT_AUTHORIZED = "SOURCE_NOT_AUTHORIZED"
+    CONTRADICTION_DETECTED = "CONTRADICTION_DETECTED"
+    DUPLICATE_EFFECTIVE_MEMORY = "DUPLICATE_EFFECTIVE_MEMORY"
+    PROMOTION_GATES_PASSED = "PROMOTION_GATES_PASSED"
+    USER_CONFIRMED = "USER_CONFIRMED"
+    USER_REJECTED = "USER_REJECTED"
+    RETENTION_EXPIRED = "RETENTION_EXPIRED"
+    SUPERSEDED_BY_EXPLICIT_WRITE = "SUPERSEDED_BY_EXPLICIT_WRITE"
 
 
 class MemoryRecordStatus(StrEnum):
@@ -185,6 +201,14 @@ class MemoryErrorCode(StrEnum):
     TASK_LEASE_CONFLICT = "TASK_LEASE_CONFLICT"
     PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
     INTERNAL_ERROR = "INTERNAL_ERROR"
+
+
+class DerivedConsistencyStatus(StrEnum):
+    """描述权威记录与可重建派生索引之间的一致性状态。"""
+
+    CONSISTENT = "CONSISTENT"
+    PENDING = "PENDING"
+    DEGRADED = "DEGRADED"
 
 
 class MemoryContractError(ValueError):
@@ -448,6 +472,133 @@ class MemoryCandidate:
                 )
 
 
+@dataclass(frozen=True, slots=True)
+class CandidateEvidence:
+    """引用一条用户侧证据，不复制原始对话正文。"""
+
+    session_id: str
+    message_id: int
+    source_role: str
+    query_hash: str
+    observed_on: date
+    confidence: float
+    state_event_id: int | None = None
+    state_version: int = 0
+    summary_version: int = 0
+
+    def __post_init__(self) -> None:
+        for field_name, value in (
+            ("session_id", self.session_id),
+            ("source_role", self.source_role),
+            ("query_hash", self.query_hash),
+        ):
+            _require_nonblank(value, field_name)
+        if self.message_id <= 0:
+            raise MemoryContractError("candidate evidence message_id must be positive")
+        if self.source_role != "user":
+            raise MemoryContractError("candidate evidence must reference a user message")
+        if self.state_event_id is not None and self.state_event_id <= 0:
+            raise MemoryContractError("candidate state_event_id must be positive")
+        if min(self.state_version, self.summary_version) < 0:
+            raise MemoryContractError("candidate evidence versions must be non-negative")
+        if not 0.0 <= self.confidence <= 1.0:
+            raise MemoryContractError("candidate evidence confidence must be between 0 and 1")
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateDraft:
+    """表示抽取器输出、尚未通过治理规则的强类型候选草稿。"""
+
+    kind: MemoryValueKind
+    category: str
+    normalized_key: str
+    confidence: float
+    evidence: tuple[CandidateEvidence, ...]
+    profile_field: ProfileField | None = None
+    value: ProfileValue | None = None
+    content: str | None = None
+    conflict_key: str | None = None
+
+    def __post_init__(self) -> None:
+        _require_nonblank(self.category, "category")
+        _require_nonblank(self.normalized_key, "normalized_key")
+        if not self.evidence:
+            raise MemoryContractError("candidate draft requires user evidence")
+        if not 0.0 <= self.confidence <= 1.0:
+            raise MemoryContractError("candidate draft confidence must be between 0 and 1")
+        if self.kind is MemoryValueKind.TEXT:
+            if not (self.content or "").strip():
+                raise MemoryContractError("text candidate draft requires content")
+            if self.profile_field is not None or self.value is not None:
+                raise MemoryContractError("text candidate draft cannot contain profile fields")
+        if self.kind is MemoryValueKind.STRUCTURED_PROFILE:
+            if self.profile_field is None or self.value is None:
+                raise MemoryContractError(
+                    "structured candidate draft requires profile_field and value"
+                )
+            if self.content is not None:
+                raise MemoryContractError(
+                    "structured candidate draft cannot contain text content"
+                )
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateSignals:
+    """保存 Deep 治理阶段可解释、可重放的聚合统计。"""
+
+    event_count: int
+    unique_query_count: int
+    unique_session_count: int
+    active_days: int
+    contradiction_count: int
+    average_confidence: float
+    first_seen_at: datetime
+    last_seen_at: datetime
+
+    def __post_init__(self) -> None:
+        if min(
+            self.event_count,
+            self.unique_query_count,
+            self.unique_session_count,
+            self.active_days,
+            self.contradiction_count,
+        ) < 0:
+            raise MemoryContractError("candidate signal counters must be non-negative")
+        if not 0.0 <= self.average_confidence <= 1.0:
+            raise MemoryContractError("average candidate confidence must be between 0 and 1")
+        if self.first_seen_at > self.last_seen_at:
+            raise MemoryContractError("candidate first_seen_at cannot follow last_seen_at")
+
+
+@dataclass(frozen=True, slots=True)
+class PromotionDecision:
+    """返回确定性治理决策及六维评分，禁止模型直接决定生效。"""
+
+    status: CandidateStatus
+    reason_code: CandidateReasonCode
+    eligible: bool
+    score: float
+    frequency: float
+    relevance: float
+    query_diversity: float
+    recency: float
+    consolidation: float
+    conceptual_richness: float
+
+    def __post_init__(self) -> None:
+        scores = (
+            self.score,
+            self.frequency,
+            self.relevance,
+            self.query_diversity,
+            self.recency,
+            self.consolidation,
+            self.conceptual_richness,
+        )
+        if any(not 0.0 <= value <= 1.0 for value in scores):
+            raise MemoryContractError("promotion scores must be between 0 and 1")
+
+
 class MemoryAuditAction(StrEnum):
     """权威记忆和候选生命周期允许记录的审计动作。"""
 
@@ -540,6 +691,35 @@ class SummaryCompactPayload:
 
 
 @dataclass(frozen=True, slots=True)
+class CandidateExtractPayload:
+    """冻结 REM 候选抽取所使用的摘要、状态和消息边界。"""
+
+    session_id: str
+    expected_summary_version: int
+    expected_state_version: int
+    source_start_message_id: int
+    source_end_message_id: int
+    prompt_version: str
+
+    def __post_init__(self) -> None:
+        _require_nonblank(self.session_id, "session_id")
+        _require_nonblank(self.prompt_version, "prompt_version")
+        if min(
+            self.expected_summary_version,
+            self.expected_state_version,
+            self.source_start_message_id,
+            self.source_end_message_id,
+        ) < 0:
+            raise MemoryContractError("candidate extraction counters must be non-negative")
+        if self.expected_summary_version <= 0:
+            raise MemoryContractError("candidate extraction summary version must be positive")
+        if self.source_start_message_id <= 0 or self.source_end_message_id <= 0:
+            raise MemoryContractError("candidate extraction message ids must be positive")
+        if self.source_start_message_id > self.source_end_message_id:
+            raise MemoryContractError("candidate extraction source boundary is reversed")
+
+
+@dataclass(frozen=True, slots=True)
 class NewOutboxTask:
     """表示尚未持久化、必须与业务状态同事务写入的任务意图。"""
 
@@ -548,7 +728,7 @@ class NewOutboxTask:
     aggregate_id: str
     task_kind: OutboxTaskKind
     idempotency_key: str
-    payload: TurnCommittedPayload | SummaryCompactPayload
+    payload: TurnCommittedPayload | SummaryCompactPayload | CandidateExtractPayload
     session_id: str | None = None
     trace_id: str | None = None
     schema_version: str = MEMORY_SCHEMA_VERSION
@@ -592,6 +772,23 @@ class NewOutboxTask:
                 raise MemoryContractError("summary aggregate_type must be chat_session")
             if self.aggregate_id != self.payload.session_id:
                 raise MemoryContractError("summary aggregate_id must match payload session")
+        if self.task_kind is OutboxTaskKind.CANDIDATE_EXTRACT:
+            if not isinstance(self.payload, CandidateExtractPayload):
+                raise MemoryContractError("candidate task requires its typed payload")
+            if self.session_id != self.payload.session_id:
+                raise MemoryContractError("candidate task session_id must match payload")
+            if self.aggregate_type != "chat_summary":
+                raise MemoryContractError("candidate aggregate_type must be chat_summary")
+            if self.aggregate_id != self.payload.session_id:
+                raise MemoryContractError("candidate aggregate_id must match payload session")
+            expected_key = build_candidate_outbox_key(
+                self.payload.session_id,
+                self.payload.expected_summary_version,
+            )
+            if self.idempotency_key != expected_key:
+                raise MemoryContractError(
+                    "candidate idempotency_key must match the summary version"
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -739,3 +936,11 @@ def build_summary_outbox_key(
         f"memory:summary-compact:{session_id}:"
         f"{expected_summary_version}:{source_end_message_id}"
     )
+
+
+def build_candidate_outbox_key(session_id: str, summary_version: int) -> str:
+    """构造同一摘要版本只能触发一次 REM 抽取的幂等键。"""
+    _require_nonblank(session_id, "session_id")
+    if summary_version <= 0:
+        raise MemoryContractError("candidate summary_version must be positive")
+    return f"memory:candidate-extract:{session_id}:{summary_version}"
