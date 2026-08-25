@@ -85,6 +85,7 @@ $env:RUN_PROTECTED_LIVE_E2E="true"
 uv run --with socksio -- python -m pytest tests/e2e/test_live_controlled_chat_chain.py -q -m live
 ```
 
+记忆链路的完整验收还包含离线 Compose 中的 `忘掉我的文本记忆 → 确认 → 重放拒绝` HTTP 旅程，以及 `/api/health` 的 `components.memory_observability` 指标断言。若本机只有 SOCKS 代理且不想引入 `socksio`，可临时移除 `ALL_PROXY`（保留 HTTP 代理）再运行本地 Live 验收，无需修改依赖。
 ## 7. 提交 PR
 
 提交前：

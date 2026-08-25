@@ -11,8 +11,7 @@
 
 围绕这些问题，当前仓库已经实现：
 
-- 对话模式：多轮追问、会话尾窗与既有摘要/画像读取、Tushare Skill 数据增强；仓库保留
-  STM/LTM 基础设施，但完整 LTM 检索与写回尚未接入受控主链
+- 对话模式：多轮追问、受控记忆主链（STM 滚动摘要与 Working State、LTM 画像与语义召回）、Tushare Skill 数据增强；自然语言记忆命令可在对话中直接查看、更新、删除记忆
 - 报告模式：多 Agent 协作生成基本面、技术面、估值、新闻等综合分析报告
 - 账号体系：登录、注册、切换账号、JWT 登录态恢复
 - 工程化链路：Router / Planner / Executor / Evidence 校验、结构化 Trace、可选 Langfuse 观测、Docker 部署
@@ -636,6 +635,13 @@ python src/main.py --command "帮我看看贵州茅台值不值得长期持有"
 
 这组问题基本可以把画像写入、上下文继承、基金工具路由和最终回答生成连起来看清楚。
 
+## 记忆系统（受控记忆主链）
+
+- 短期记忆：Preflight 预算筛查、Working State（`active_entity` / `constraints` / `reply_preference_hint`）、rolling summary 质量门控与 last-good 保护；Redis 仅作热缓存，PostgreSQL 始终是唯一权威源。
+- 长期记忆：候选抽取 → 确定性治理评分 → 高影响画像用户确认 → PostgreSQL 权威记录 → pgvector/Mem0 派生语义索引 → 混合召回 + 权威后过滤。
+- 自然语言命令：在对话中直接说“查看我的记忆”“以后回答简短一点”“删除记忆 <id>”“忘掉我的文本记忆”“确认”“取消”；高影响删除先返回预览并要求一次性确认，支持 TTL、版本校验并拒绝重放/跨用户/跨会话使用。
+- 可观测性：`/api/health` 返回 `components.memory_observability` 指标；记忆阶段、状态、错误码均为低基数且脱敏；后台摘要/治理/索引 worker 的 `RETRY`/`DEAD_LETTER`/`DEGRADED` 状态可在 JSONL Trace 中复现。
+- 验收矩阵：默认测试全部离线；完整离线 Docker Compose E2E 通过 `docker compose -f docker/docker-compose.offline.yml up --build --abort-on-container-exit --exit-code-from offline-e2e` 运行；受保护真实 LLM + 只读 Tushare 验收通过 `RUN_PROTECTED_LIVE_E2E=true uv run --locked pytest tests/e2e/test_live_controlled_chat_chain.py -q -m live` 显式运行（需要真实凭证，默认不执行）。
 ## 日志与排查
 
 日志主要在：
@@ -712,9 +718,7 @@ Finance-agent-Skills/
 ## 当前已实现的关键工程点
 
 - 报告模式多 Agent 协作
-- 仓库保留 STM 压缩 worker、LTM/画像基础设施和前端上下文可视化；当前受控主链只消费
-  最近消息、既有 `running_summary` 和既有画像，尚未重新接入自动压缩入队、LTM 检索/写回
-  或分阶段画像注入
+- 受控记忆主链已闭环：Preflight 预算筛查、Working State 维护、rolling summary 质量门控与 last-good 保护、Redis 热缓存、LTM 候选治理与混合召回、自然语言记忆命令与一次性确认、统一记忆可观测性（阶段/状态/指标均脱敏）
 - 用户画像读取和跨会话记忆基础设施
 - 登录、切换账号、JWT 鉴权
 - 新账号注册与登录态恢复
