@@ -2,9 +2,10 @@
 
 ## 状态
 
-- 状态：实现完成，等待提交、PR、CI 与合并闭环
+- 状态：实现、CI、代码审查与合并闭环完成
 - Issue：#35
-- 分支：`feat/35-memory-hybrid-retrieval`
+- PR：#36（已合并，merge commit `2d1d09b`）
+- 实现分支：`feat/35-memory-hybrid-retrieval`（已删除）
 - 权威源：PostgreSQL `memory_records`
 - 派生层：pgvector/Mem0 索引、`memory_provider_references`、INDEX Outbox
 
@@ -74,3 +75,9 @@ docker compose -f docker/docker-compose.offline.yml down -v --remove-orphans
 - M7 自然语言记忆命令和前端控制。
 - M8 完整指标/故障矩阵与离线评测门禁。
 - M9 受保护真实模型、真实 Tushare 和最终生产拓扑验收。
+
+## 交付闭环
+
+- Commit：`e6df305 feat(memory): add governed hybrid retrieval (#35)`
+- Pull Request：`#36`，GitHub Actions 四项门禁全部通过，完成代码审查后 squash merge 到 `main`。
+- Issue：`#35` 已关闭。
