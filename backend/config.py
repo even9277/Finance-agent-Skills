@@ -84,6 +84,13 @@ class Settings(BaseSettings):
     stm_summary_timeout_sec: int = 30
     # 必须覆盖一次模型调用及提交尾延迟，避免合法调用被过早回收并重复计费。
     stm_worker_lease_sec: int = 60
+    # LTM 候选治理仅消费 PostgreSQL Outbox；deterministic 是默认离线安全实现。
+    ltm_candidate_provider: str = "deterministic"
+    ltm_candidate_timeout_sec: int = 30
+    ltm_worker_interval_sec: int = 5
+    ltm_worker_batch_size: int = 10
+    ltm_worker_max_retries: int = 3
+    ltm_worker_lease_sec: int = 60
     # Redis 仅用于加速；连接失败不得影响应用启动或对话正确性。
     redis_url: str = "redis://localhost:6379/0"
     redis_cache_namespace: str = "finance-agent"
@@ -127,8 +134,6 @@ class Settings(BaseSettings):
     jwt_secret_key: str = "change-me-in-production-please-use-a-long-random-secret"
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 60 * 24 * 7
-    # LTM Worker 轮询间隔（秒）
-    ltm_worker_interval_sec: int = 5
     # LTM 触发最小间隔（秒，同一会话两次 enqueue_add_conversation 的最小间隔）
     min_ltm_interval: int = 300
 
@@ -165,6 +170,15 @@ class Settings(BaseSettings):
             raise ValueError("stm_summary_provider must be openai or deterministic")
         return normalized
 
+    @field_validator("ltm_candidate_provider")
+    @classmethod
+    def _validate_ltm_candidate_provider(cls, value: str) -> str:
+        """限制候选抽取 Provider 为显式在线模型或离线确定性实现。"""
+        normalized = value.strip().lower()
+        if normalized not in {"openai", "deterministic"}:
+            raise ValueError("ltm_candidate_provider must be openai or deterministic")
+        return normalized
+
     @field_validator(
         "stm_context_budget_tokens",
         "stm_keep_recent",
@@ -174,6 +188,11 @@ class Settings(BaseSettings):
         "stm_worker_max_retries",
         "stm_summary_timeout_sec",
         "stm_worker_lease_sec",
+        "ltm_candidate_timeout_sec",
+        "ltm_worker_interval_sec",
+        "ltm_worker_batch_size",
+        "ltm_worker_max_retries",
+        "ltm_worker_lease_sec",
         "redis_cache_ttl_sec",
         "redis_cache_lease_sec",
         "redis_singleflight_wait_ms",
@@ -214,13 +233,19 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_stm_worker_timing(self) -> Self:
-        """确保一次合法摘要调用不会在正常超时前丢失任务所有权。"""
+        """确保合法模型调用不会在正常超时前丢失任务所有权。"""
         safety_margin_sec = 5
         minimum_lease = self.stm_summary_timeout_sec + safety_margin_sec
         if self.stm_worker_lease_sec <= minimum_lease:
             raise ValueError(
                 "stm_worker_lease_sec must be greater than "
                 "stm_summary_timeout_sec + 5 seconds"
+            )
+        minimum_candidate_lease = self.ltm_candidate_timeout_sec + safety_margin_sec
+        if self.ltm_worker_lease_sec <= minimum_candidate_lease:
+            raise ValueError(
+                "ltm_worker_lease_sec must be greater than "
+                "ltm_candidate_timeout_sec + 5 seconds"
             )
         return self
 

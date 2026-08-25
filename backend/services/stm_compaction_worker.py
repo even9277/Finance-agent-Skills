@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import cast
@@ -21,11 +21,13 @@ from backend.application.memory.summary import (
     SummaryValidationError,
     validate_summary_draft,
 )
+from backend.application.memory.candidates import CANDIDATE_PROMPT_VERSION
 from backend.config import settings
 from backend.db.database import AsyncSessionFactory
 from backend.db.models import (
     MemoryOutboxTaskRow,
     MemorySummaryMetadataRow,
+    MemoryWorkingStateRow,
     Message,
     Session,
     SessionSummary,
@@ -34,11 +36,13 @@ from backend.services.stm_context_service import refresh_session_context_metrics
 from backend.services.token_counter import count_text_tokens
 from src.memory.contracts import (
     MEMORY_SCHEMA_VERSION,
+    CandidateExtractPayload,
     MemoryErrorCode,
     OutboxTaskKind,
     OutboxTaskStatus,
     SummaryCompactPayload,
     SummaryStatus,
+    build_candidate_outbox_key,
 )
 
 logger = logging.getLogger(__name__)
@@ -471,6 +475,49 @@ class SummaryCompactionWorker:
             metadata.input_token_estimate = payload.input_token_estimate
             metadata.output_token_count = output_tokens
             metadata.prompt_version = payload.prompt_version
+            if settings.enable_memory:
+                state_version = int(
+                    await db.scalar(
+                        select(MemoryWorkingStateRow.state_version).where(
+                            MemoryWorkingStateRow.session_id == payload.session_id
+                        )
+                    )
+                    or 0
+                )
+                candidate_payload = CandidateExtractPayload(
+                    session_id=payload.session_id,
+                    expected_summary_version=target_version,
+                    expected_state_version=state_version,
+                    source_start_message_id=payload.source_start_message_id,
+                    source_end_message_id=payload.source_end_message_id,
+                    prompt_version=CANDIDATE_PROMPT_VERSION,
+                )
+                idempotency_key = build_candidate_outbox_key(
+                    payload.session_id,
+                    target_version,
+                )
+                existing_candidate_task = await db.scalar(
+                    select(MemoryOutboxTaskRow.id).where(
+                        MemoryOutboxTaskRow.user_id == task.user_id,
+                        MemoryOutboxTaskRow.idempotency_key == idempotency_key,
+                    )
+                )
+                if existing_candidate_task is None:
+                    db.add(
+                        MemoryOutboxTaskRow(
+                            user_id=task.user_id,
+                            session_id=payload.session_id,
+                            aggregate_type="chat_summary",
+                            aggregate_id=payload.session_id,
+                            task_kind=OutboxTaskKind.CANDIDATE_EXTRACT.value,
+                            payload_json=asdict(candidate_payload),
+                            status=OutboxTaskStatus.PENDING.value,
+                            idempotency_key=idempotency_key,
+                            schema_version=MEMORY_SCHEMA_VERSION,
+                            trace_id=task.trace_id,
+                            attempt_count=0,
+                        )
+                    )
             task.status = OutboxTaskStatus.SUCCEEDED.value
             task.completed_at = _utc_naive()
             task.lease_owner = None

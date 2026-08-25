@@ -14,6 +14,7 @@ from sqlalchemy import (
     ForeignKey,
     ForeignKeyConstraint,
     Integer,
+    Index,
     JSON,
     String,
     Text,
@@ -297,6 +298,7 @@ ALEMBIC_MANAGED_TABLE_NAMES = frozenset(
         "memory_summary_metadata",
         "memory_records",
         "memory_candidates",
+        "memory_candidate_evidence",
         "memory_audit_events",
         "memory_outbox_tasks",
         "memory_provider_references",
@@ -469,6 +471,19 @@ class MemoryCandidateRow(Base):
     fingerprint: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     idempotency_key: Mapped[str] = mapped_column(String(160), nullable=False)
     conflict_group_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    normalized_key: Mapped[str] = mapped_column(String(180), nullable=False, default="")
+    decision_reason: Mapped[str | None] = mapped_column(String(64))
+    promotion_score: Mapped[float | None] = mapped_column(Float)
+    event_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    unique_query_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    unique_session_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    active_days: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    contradiction_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    first_seen_at: Mapped[datetime | None] = mapped_column(DateTime)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime)
+    prompt_version: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    source_summary_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    source_state_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     policy_version: Mapped[str] = mapped_column(String(64), nullable=False)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime, index=True)
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime)
@@ -482,6 +497,13 @@ class MemoryCandidateRow(Base):
     )
 
     __table_args__ = (
+        Index(
+            "ix_memory_candidates_user_fingerprint",
+            "user_id",
+            "kind",
+            "category",
+            "fingerprint",
+        ),
         UniqueConstraint(
             "id",
             "user_id",
@@ -491,6 +513,46 @@ class MemoryCandidateRow(Base):
             "user_id",
             "idempotency_key",
             name="uq_memory_candidate_user_idempotency",
+        ),
+    )
+
+
+class MemoryCandidateEvidenceRow(Base):
+    """保存候选到用户消息/状态事件的可审计引用，不复制正文。"""
+
+    __tablename__ = "memory_candidate_evidence"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    candidate_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    user_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    session_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    message_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("messages.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    state_event_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("memory_state_events.id", ondelete="SET NULL")
+    )
+    query_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    observed_on: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    state_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    summary_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now, nullable=False)
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["candidate_id", "user_id"],
+            ["memory_candidates.id", "memory_candidates.user_id"],
+            name="fk_memory_candidate_evidence_owner",
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint(
+            "candidate_id",
+            "message_id",
+            "state_event_id",
+            name="uq_memory_candidate_evidence_source",
         ),
     )
 

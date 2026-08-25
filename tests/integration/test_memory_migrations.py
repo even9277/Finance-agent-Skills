@@ -28,6 +28,26 @@ from backend.db.models import (  # noqa: E402
 )
 
 
+def _alembic_head_revision() -> str:
+    """读取仓库当前 Alembic head，避免迁移测试硬编码历史版本。"""
+    result = subprocess.run(
+        [sys.executable, "-m", "alembic", "heads"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    revisions = [
+        token.strip()
+        for line in result.stdout.splitlines()
+        for token in line.split()
+        if token.strip().startswith("20")
+    ]
+    if not revisions:
+        raise AssertionError(f"unable to identify Alembic revision from output: {result.stdout}")
+    return revisions[-1]
+
+
 @pytest.mark.integration
 def test_migration_downgrade_requires_explicit_isolated_confirmation() -> None:
     """确认默认调用不能误降级任何数据库。"""
@@ -149,7 +169,7 @@ def test_memory_revision_upgrade_downgrade_reupgrade_preserves_legacy_rows(
     finally:
         engine.dispose()
     assert ALEMBIC_MANAGED_TABLE_NAMES.issubset(table_names)
-    assert revision == "20260824_01"
+    assert revision == _alembic_head_revision()
     _assert_legacy_rows_readable(sync_url)
 
     downgrade_database(async_url, allow_isolated=True)

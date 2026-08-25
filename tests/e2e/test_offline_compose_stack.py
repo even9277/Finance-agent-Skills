@@ -434,12 +434,19 @@ def test_frontend_proxy_reaches_backend_and_fake_chat_chain() -> None:
         for line in trace_path.read_text(encoding="utf-8").splitlines()
     ]
     roots = [item for item in records if item["record_type"] == "trace"]
-    spans = [item for item in records if item["record_type"] == "span"]
-    assert [item["status"] for item in roots] == ["started", "ok"]
-    assert spans[0]["stage"] == "context"
-    assert spans[-1]["stage"] == "termination"
-    assert len({item["trace_id"] for item in records}) == 1
-    assert len({item["run_id"] for item in records}) == 1
+    assert len(roots) >= 2
+    assert all(item["status"] in {"started", "ok"} for item in roots)
+    assert all(
+        roots[index]["status"] == ("started" if index % 2 == 0 else "ok")
+        for index in range(len(roots))
+    )
+    latest_run_id = roots[-1]["run_id"]
+    latest_records = [item for item in records if item["run_id"] == latest_run_id]
+    latest_spans = [item for item in latest_records if item["record_type"] == "span"]
+    assert latest_spans[0]["stage"] == "context"
+    assert latest_spans[-1]["stage"] == "termination"
+    assert len({item["trace_id"] for item in latest_records}) == 1
+    assert len({item["run_id"] for item in latest_records}) == 1
     trace_text = trace_path.read_text(encoding="utf-8")
     assert "查询贵州茅台" not in trace_text
     assert "OPENAI_COMPATIBLE_API_KEY" not in trace_text

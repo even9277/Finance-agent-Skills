@@ -14,13 +14,27 @@ import sys
 from pathlib import Path
 from typing import Any, Optional
 
+from sqlalchemy import func, select, update
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from backend.application.memory.authority import AuthorityMutationResult
+from backend.db.models import MemoryRecordRow, UserInvestProfile
+from backend.infrastructure.memory.authority_repository import (
+    SqlAlchemyAuthoritativeMemoryRepository,
+)
+
 _AGENT_ROOT = Path(__file__).resolve().parent.parent.parent / "Financial-MCP-Agent"
 if str(_AGENT_ROOT) not in sys.path:
     sys.path.insert(0, str(_AGENT_ROOT))
 
 from src.utils.logging_config import setup_logger  # noqa: E402
 from src.memory.memory_service import MemoryService  # noqa: E402
-from src.memory.mem0_schema import MemorySource  # noqa: E402
+from src.memory.mem0_schema import MemorySource as LegacyMemorySource  # noqa: E402
+from src.memory.contracts import (  # noqa: E402
+    MemoryRecordStatus,
+    MemorySource,
+    ProfileField,
+)
 
 logger = setup_logger("backend.memory_service", log_dir=str(_AGENT_ROOT / "logs"))
 
@@ -55,7 +69,23 @@ async def get_user_profile(user_id: str, db=None) -> dict[str, Any]:
     - 结构化画像（user_invest_profiles）权威来源
     - 返回格式兼容 Phase 1 API 的 UserProfile schema
     """
-    profile = await MemoryService.get_structured_profile(user_id, db_session=db)
+    if db is None:
+        profile = await MemoryService.get_structured_profile(user_id, db_session=db)
+    else:
+        row = await db.scalar(
+            select(UserInvestProfile).where(UserInvestProfile.user_id == user_id)
+        )
+        profile = {
+            "risk_level": row.risk_level if row else None,
+            "sectors": row.sectors if row else [],
+            "expected_return_min": row.expected_return_min if row else None,
+            "expected_return_max": row.expected_return_max if row else None,
+            "investment_horizon": row.investment_horizon if row else None,
+            "constraints": row.constraints if row else [],
+            "response_pref": row.response_pref if row else "balanced",
+            "updated_by": row.updated_by if row else None,
+            "updated_at": row.updated_at.isoformat() if row and row.updated_at else None,
+        }
 
     logger.debug(
         "memory_profile_read stage=%s status=%s",
@@ -96,13 +126,21 @@ async def get_memory_context_for_chat(
 
 async def update_risk_profile(user_id: str, risk_profile: str, db=None) -> bool:
     """更新风险偏好（RiskProfileCard 点击调用）。"""
-    # 字段名映射：前端用 risk_profile，DB 用 risk_level
-    await MemoryService.update_profile_and_enqueue(
+    if db is None:
+        await MemoryService.update_profile_and_enqueue(
+            user_id=user_id,
+            field="risk_level",
+            value=risk_profile,
+            source=LegacyMemorySource.UI,
+            db_session=None,
+        )
+        await _invalidate_profile_cache(user_id)
+        return True
+    await _write_profile(
         user_id=user_id,
-        field="risk_level",
+        field=ProfileField.RISK_LEVEL,
         value=risk_profile,
-        source=MemorySource.UI,
-        db_session=db,
+        db=_require_db(db),
     )
     await _invalidate_profile_cache(user_id)
     logger.info(
@@ -116,12 +154,11 @@ async def update_risk_profile(user_id: str, risk_profile: str, db=None) -> bool:
 
 async def update_sectors(user_id: str, sectors: list[str], db=None) -> bool:
     """更新关注板块（SectorTagSelector 变更调用，debounce 800ms）。"""
-    await MemoryService.update_profile_and_enqueue(
+    await _write_profile(
         user_id=user_id,
-        field="sectors",
-        value=sectors,
-        source=MemorySource.UI,
-        db_session=db,
+        field=ProfileField.SECTORS,
+        value=tuple(sectors),
+        db=_require_db(db),
     )
     await _invalidate_profile_cache(user_id)
     logger.info(
@@ -141,29 +178,31 @@ async def update_return_expectation(
     investment_horizon: Optional[str] = None,
 ) -> bool:
     """更新期望收益（ReturnExpectation 变更调用，debounce 800ms）。"""
-    await MemoryService.update_profile_and_enqueue(
+    database = _require_db(db)
+    await _write_profile(
         user_id=user_id,
-        field="expected_return_min",
+        field=ProfileField.EXPECTED_RETURN_MIN,
         value=value,
-        source=MemorySource.UI,
-        db_session=db,
+        db=database,
+        commit=False,
     )
     if return_max is not None:
-        await MemoryService.update_profile_and_enqueue(
+        await _write_profile(
             user_id=user_id,
-            field="expected_return_max",
+            field=ProfileField.EXPECTED_RETURN_MAX,
             value=return_max,
-            source=MemorySource.UI,
-            db_session=db,
+            db=database,
+            commit=False,
         )
     if investment_horizon:
-        await MemoryService.update_profile_and_enqueue(
+        await _write_profile(
             user_id=user_id,
-            field="investment_horizon",
+            field=ProfileField.INVESTMENT_HORIZON,
             value=investment_horizon,
-            source=MemorySource.UI,
-            db_session=db,
+            db=database,
+            commit=False,
         )
+    await database.commit()
     await _invalidate_profile_cache(user_id)
     logger.info(
         "memory_profile_write stage=%s status=%s field=%s",
@@ -175,20 +214,30 @@ async def update_return_expectation(
 
 
 async def update_response_pref(user_id: str, pref: str, db=None) -> bool:
-    """更新回答偏好。"""
-    await MemoryService.update_profile_and_enqueue(
+    """把用户显式回答偏好写入文本权威记录，并维护旧字段投影。"""
+    database = _require_db(db)
+    await SqlAlchemyAuthoritativeMemoryRepository(database).add_text(
         user_id=user_id,
-        field="response_pref",
-        value=pref,
-        source=MemorySource.UI,
-        db_session=db,
+        category="response_preference",
+        content=f"回答偏好：{pref}",
+        source=MemorySource.USER_UI,
+        evidence_ref="ui:response_preference",
     )
+    profile = await database.scalar(
+        select(UserInvestProfile).where(UserInvestProfile.user_id == user_id)
+    )
+    if profile is None:
+        profile = UserInvestProfile(user_id=user_id, updated_by="user")
+        database.add(profile)
+    profile.response_pref = pref
+    profile.updated_by = "user"
+    await database.commit()
     await _invalidate_profile_cache(user_id)
     return True
 
 
 # ─────────────────────────────────────────────────────────────
-# 记忆条目 CRUD（Mem0 直接操作）
+# 记忆条目 CRUD（PostgreSQL 权威记录；派生向量索引在 M6 接入）
 # ─────────────────────────────────────────────────────────────
 
 async def get_memory_items(
@@ -197,10 +246,52 @@ async def get_memory_items(
     size: int = 20,
     db=None,
 ) -> dict[str, Any]:
-    """获取所有记忆条目（分页，来自 Mem0）。"""
-    result = await MemoryService.get_all_memories(
-        user_id, page=page, page_size=size, db_session=db
+    """按认证用户分页读取仍有效的 PostgreSQL 权威文本记忆。"""
+    database = _require_db(db)
+    statement = (
+        select(MemoryRecordRow)
+        .where(
+            MemoryRecordRow.user_id == user_id,
+            MemoryRecordRow.kind == "text",
+            MemoryRecordRow.status == MemoryRecordStatus.ACTIVE.value,
+        )
+        .order_by(MemoryRecordRow.created_at.desc())
+        .offset((page - 1) * size)
+        .limit(size)
     )
+    rows = list((await database.execute(statement)).scalars().all())
+    total = int(
+        await database.scalar(
+            select(func.count(MemoryRecordRow.id)).where(
+                MemoryRecordRow.user_id == user_id,
+                MemoryRecordRow.kind == "text",
+                MemoryRecordRow.status == MemoryRecordStatus.ACTIVE.value,
+            )
+        )
+        or 0
+    )
+    result = {
+        "items": [
+            {
+                "id": row.id,
+                "content": row.content or "",
+                "category": row.category,
+                "source": row.source,
+                "confidence": 1.0,
+                "evidence_ref": row.evidence_ref or "",
+                "created_at": row.created_at.isoformat() if row.created_at else "",
+                "metadata": {
+                    "status": row.status,
+                    "version": row.version,
+                    "activation_source": row.activation_source,
+                },
+            }
+            for row in rows
+        ],
+        "total": total,
+        "page": page,
+        "page_size": size,
+    }
     logger.debug(
         "memory_items_read stage=%s status=%s item_count=%s",
         "memory.items.read",
@@ -218,17 +309,32 @@ async def add_memory_item(
     db=None,
 ) -> dict[str, Any]:
     """手动添加记忆条目。"""
-    metadata["category"] = category
-    metadata.setdefault("source", MemorySource.UI.value)
-    metadata.setdefault("confidence", 1.0)
-    result = await MemoryService.add_memory(user_id, content, metadata)
+    del metadata
+    database = _require_db(db)
+    result = await SqlAlchemyAuthoritativeMemoryRepository(database).add_text(
+        user_id=user_id,
+        category=category,
+        content=content,
+        source=MemorySource.USER_UI,
+        evidence_ref="ui:memory_item",
+    )
+    await database.commit()
     logger.info(
         "memory_item_write stage=%s status=%s operation=%s",
         "memory.item.write",
         "SUCCEEDED",
         "add",
     )
-    return result
+    return {
+        "id": result.record_id,
+        "content": content,
+        "category": category,
+        "source": MemorySource.USER_UI.value,
+        "confidence": 1.0,
+        "evidence_ref": "ui:memory_item",
+        "created_at": "",
+        "metadata": {"status": result.status.value, "version": result.version},
+    }
 
 
 async def update_memory_item(
@@ -237,33 +343,82 @@ async def update_memory_item(
     content: str,
     metadata: dict,
     db=None,
-) -> bool:
+) -> AuthorityMutationResult | None:
     """编辑记忆条目。"""
-    ok = await MemoryService.update_memory(user_id, memory_id, content, metadata)
+    del metadata
+    database = _require_db(db)
+    result = await SqlAlchemyAuthoritativeMemoryRepository(database).update_text(
+        user_id=user_id,
+        record_id=memory_id,
+        content=content,
+    )
+    if result is not None:
+        await database.commit()
+    else:
+        await database.rollback()
     logger.info(
         "memory_item_write stage=%s status=%s operation=%s",
         "memory.item.write",
-        "SUCCEEDED" if ok else "FAILED",
+        "SUCCEEDED" if result else "FAILED",
         "update",
     )
-    return ok
+    return result
 
-
-async def delete_memory_item(user_id: str, memory_id: str, db=None) -> bool:
-    """删除记忆条目（软删除：标记 active=False）。"""
-    ok = await MemoryService.delete_memory(user_id, memory_id, db_session=db)
+async def delete_memory_item(
+    user_id: str,
+    memory_id: str,
+    db=None,
+) -> AuthorityMutationResult | None:
+    """软删除当前用户拥有的权威记忆并返回可检查生命周期。"""
+    database = _require_db(db)
+    result = await SqlAlchemyAuthoritativeMemoryRepository(database).delete_record(
+        user_id=user_id,
+        record_id=memory_id,
+    )
+    if result is not None:
+        await database.commit()
+    else:
+        await database.rollback()
     logger.info(
         "memory_item_write stage=%s status=%s operation=%s",
         "memory.item.write",
-        "SUCCEEDED" if ok else "FAILED",
+        "SUCCEEDED" if result else "FAILED",
         "delete",
     )
-    return ok
-
+    return result
 
 async def delete_all_memories(user_id: str, db=None) -> bool:
-    """清空所有记忆（Mem0 全清 + user_invest_profiles 重置）。"""
-    await MemoryService.delete_all(user_id, db_session=db)
+    """在已由路由确认后软删除该用户记录并重置兼容画像投影。"""
+    if db is None:
+        await MemoryService.delete_all(user_id, db_session=None)
+        await _invalidate_profile_cache(user_id)
+        return True
+    database = _require_db(db)
+    await database.execute(
+        update(MemoryRecordRow)
+        .where(
+            MemoryRecordRow.user_id == user_id,
+            MemoryRecordRow.status == MemoryRecordStatus.ACTIVE.value,
+        )
+        .values(
+            status=MemoryRecordStatus.INACTIVE.value,
+            deleted_at=func.now(),
+            version=MemoryRecordRow.version + 1,
+        )
+    )
+    profile = await database.scalar(
+        select(UserInvestProfile).where(UserInvestProfile.user_id == user_id)
+    )
+    if profile is not None:
+        profile.risk_level = None
+        profile.investment_horizon = None
+        profile.expected_return_min = None
+        profile.expected_return_max = None
+        profile.sectors = []
+        profile.constraints = []
+        profile.response_pref = "balanced"
+        profile.updated_by = "user"
+    await database.commit()
     await _invalidate_profile_cache(user_id)
     logger.warning(
         "memory_items_write stage=%s status=%s operation=%s",
@@ -275,8 +430,18 @@ async def delete_all_memories(user_id: str, db=None) -> bool:
 
 
 async def get_memory_stats(user_id: str, db=None) -> dict[str, Any]:
-    """获取记忆来源统计，用于 MemorySidebar 底部展示。"""
-    return await MemoryService.get_memory_stats(user_id, db_session=db)
+    """按 PostgreSQL 权威生命周期返回低基数统计。"""
+    database = _require_db(db)
+    total = int(
+        await database.scalar(
+            select(func.count(MemoryRecordRow.id)).where(
+                MemoryRecordRow.user_id == user_id,
+                MemoryRecordRow.status == MemoryRecordStatus.ACTIVE.value,
+            )
+        )
+        or 0
+    )
+    return {"total_tasks": total, "active_records": total}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -292,7 +457,36 @@ async def cold_start(user_id: str, preferences: Optional[dict], db=None) -> bool
     if not preferences:
         return True
 
-    await MemoryService.cold_start(user_id, tags=preferences, db_session=db)
+    if db is None:
+        await MemoryService.cold_start(user_id, tags=preferences, db_session=None)
+        await _invalidate_profile_cache(user_id)
+        return True
+
+    database = _require_db(db)
+    mapping = {
+        "risk_profile": ProfileField.RISK_LEVEL,
+        "risk_level": ProfileField.RISK_LEVEL,
+        "investment_horizon": ProfileField.INVESTMENT_HORIZON,
+        "return_expectation": ProfileField.EXPECTED_RETURN_MIN,
+        "expected_return_min": ProfileField.EXPECTED_RETURN_MIN,
+        "expected_return_max": ProfileField.EXPECTED_RETURN_MAX,
+        "sectors": ProfileField.SECTORS,
+        "constraints": ProfileField.CONSTRAINTS,
+    }
+    repository = SqlAlchemyAuthoritativeMemoryRepository(database)
+    for key, raw_value in preferences.items():
+        field = mapping.get(key)
+        if field is None or raw_value is None:
+            continue
+        value = tuple(raw_value) if isinstance(raw_value, list) else raw_value
+        await repository.write_profile(
+            user_id=user_id,
+            field=field,
+            value=value,
+            source=MemorySource.USER_UI,
+            evidence_ref="ui:cold_start",
+        )
+    await database.commit()
     await _invalidate_profile_cache(user_id)
     logger.info(
         "memory_profile_write stage=%s status=%s operation=%s field_count=%s",
@@ -355,3 +549,31 @@ async def get_memory_evidence(user_id: str, memory_id: str, db=None) -> dict[str
             "evidence": [],
             "error": "MEMORY_EVIDENCE_READ_FAILED",
         }
+
+
+async def _write_profile(
+    *,
+    user_id: str,
+    field: ProfileField,
+    value: str | float | tuple[str, ...],
+    db: AsyncSession,
+    commit: bool = True,
+) -> AuthorityMutationResult:
+    """通过唯一显式权威仓储写画像，并按调用方需要提交事务。"""
+    result = await SqlAlchemyAuthoritativeMemoryRepository(db).write_profile(
+        user_id=user_id,
+        field=field,
+        value=value,
+        source=MemorySource.USER_UI,
+        evidence_ref=f"ui:profile:{field.value}",
+    )
+    if commit:
+        await db.commit()
+    return result
+
+
+def _require_db(db: object) -> AsyncSession:
+    """拒绝新权威写路径退回本地 SQLite/Provider 隐式连接。"""
+    if not isinstance(db, AsyncSession):
+        raise RuntimeError("authoritative memory operation requires AsyncSession")
+    return db

@@ -1,9 +1,7 @@
 """
 FastAPI 应用入口 - Phase 3 更新
 
-lifespan 新增：
-1. Mem0 AsyncMemory 单例初始化（ENABLE_MEMORY=true 时）
-2. ltm_worker 后台任务启动（ENABLE_MEMORY=true 时）
+lifespan 管理 PostgreSQL 候选治理与 Rolling Summary 后台 Worker。
 """
 
 import asyncio
@@ -55,8 +53,8 @@ def _load_project_env_files() -> None:
 async def lifespan(app: FastAPI):
     """
     应用生命周期管理：
-    启动：初始化数据库 → 初始化 Mem0 → 启动 ltm_worker（ENABLE_MEMORY=true 时）
-    关闭：停止 ltm_worker → 清理资源
+    启动：初始化数据库与可选缓存，再按开关启动受控后台 Worker。
+    关闭：停止 Worker 并清理缓存、Trace 资源。
     """
     global _ltm_worker_task, _ltm_worker_stop_event, _stm_worker_task, _stm_worker_stop_event
 
@@ -103,38 +101,41 @@ async def lifespan(app: FastAPI):
             print(f"[backend] 预置登录账号初始化失败: {exc}")
             logger.error(f"[backend] 预置登录账号初始化失败: {exc}", exc_info=True)
 
-    # 2. Phase 3 LTM：初始化 Mem0 + 启动 ltm_worker
+    # 2. LTM 候选治理：M5 只启动 PostgreSQL Outbox Worker；Mem0 在 M6 单独接入。
     if settings.enable_memory:
-        # Mem0 / trace / Langfuse 相关底层模块大量直接读取 os.environ。
-        # 因此这里沿用统一的 env 注入逻辑，保证 backend/.env 与 Agent/.env 都进入进程环境。
-        _load_project_env_files()
-
-        print("[backend] ENABLE_MEMORY=true，正在初始化 Mem0...")  # env reload safe
-        logger.info("[backend] ENABLE_MEMORY=true，初始化 Mem0")
-
         try:
-            from src.memory.mem0_client import init_mem0_client
-            await init_mem0_client()
-        except Exception as exc:
-            print(f"[backend] Mem0 初始化异常（不影响启动）: {exc}")
-            logger.warning(f"[backend] Mem0 初始化异常: {exc}")
-
-        # 启动 ltm_worker 后台任务
-        try:
-            from src.memory.ltm_worker import ltm_worker_loop
-            _ltm_worker_stop_event = asyncio.Event()
-            _ltm_worker_task = asyncio.create_task(
-                ltm_worker_loop(_ltm_worker_stop_event),
-                name="ltm_worker",
+            from backend.services.ltm_governance_worker import (
+                build_ltm_governance_worker,
+                run_ltm_governance_worker,
             )
-            print("[backend] ltm_worker 后台任务已启动 ✓")
-            logger.info("[backend] ltm_worker 启动完成")
+
+            _ltm_worker_stop_event = asyncio.Event()
+            # Provider 在 create_task 前构造，配置错误必须在启动边界可见。
+            ltm_worker = build_ltm_governance_worker()
+            _ltm_worker_task = asyncio.create_task(
+                run_ltm_governance_worker(ltm_worker, _ltm_worker_stop_event),
+                name="ltm_governance_worker",
+            )
+            print("[backend] ltm_governance_worker 后台任务已启动 ✓")
+            logger.info(
+                "memory_governance_worker_started stage=%s status=%s provider=%s",
+                "memory.candidate.govern",
+                "STARTED",
+                settings.ltm_candidate_provider,
+            )
         except Exception as exc:
-            print(f"[backend] ltm_worker 启动失败（不影响主功能）: {exc}")
-            logger.warning(f"[backend] ltm_worker 启动失败: {exc}")
+            print(f"[backend] ltm_governance_worker 启动失败（不影响主功能）: {type(exc).__name__}")
+            logger.warning(
+                "memory_governance_worker_failed stage=%s status=%s error_code=%s "
+                "error_type=%s",
+                "memory.candidate.govern",
+                "DEGRADED",
+                "WORKER_BOOTSTRAP_FAILED",
+                type(exc).__name__,
+            )
     else:
-        print("[backend] ENABLE_MEMORY=false，跳过 Mem0 初始化和 ltm_worker")
-        logger.info("[backend] ENABLE_MEMORY=false，LTM 功能关闭")
+        print("[backend] ENABLE_MEMORY=false，跳过 ltm_governance_worker")
+        logger.info("[backend] ENABLE_MEMORY=false，LTM 候选治理关闭")
 
     if settings.enable_stm:
         try:
@@ -173,8 +174,8 @@ async def lifespan(app: FastAPI):
             await _ltm_worker_task
         except asyncio.CancelledError:
             pass
-        print("[backend] ltm_worker 已停止")
-        logger.info("[backend] ltm_worker 已停止")
+        print("[backend] ltm_governance_worker 已停止")
+        logger.info("[backend] ltm_governance_worker 已停止")
     if _stm_worker_task and not _stm_worker_task.done():
         if _stm_worker_stop_event:
             _stm_worker_stop_event.set()
