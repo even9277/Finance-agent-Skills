@@ -9,6 +9,13 @@ from src.conversation.workflow import ControlledConversationWorkflow
 
 from backend.application.memory.retrieval import MemoryRetrievalRequest, MemoryRetrievalUseCase
 from backend.application.memory.commands import MemoryCommandUseCase, parse_memory_command
+from backend.application.memory.observability import (
+    MemoryObservation,
+    MemoryObserver,
+    MemoryStage,
+    MemoryStatus,
+    emit_memory_observation,
+)
 from src.conversation.contracts import TerminalStatus
 from .contracts import ChatCommand, ChatOutcome
 from .ports import TransactionalConversationRepository
@@ -28,6 +35,7 @@ class ControlledChatUseCase:
         retrieval_top_k: int = 8,
         retrieval_token_budget: int = 600,
         memory_commands: MemoryCommandUseCase | None = None,
+        memory_observer: MemoryObserver | None = None,
     ) -> None:
         self._workflow = workflow
         self._repository = repository
@@ -35,6 +43,8 @@ class ControlledChatUseCase:
         self._retrieval_top_k = retrieval_top_k
         self._retrieval_token_budget = retrieval_token_budget
         self._memory_commands = memory_commands
+        # 生产工厂显式注入 Trace Sink；测试替身不自动产生旁路事件，避免改变旧 Trace 合同。
+        self._memory_observer = memory_observer
 
     async def execute(self, command: ChatCommand) -> ChatOutcome:
         """运行领域工作流并原子保存唯一终态。
@@ -50,6 +60,12 @@ class ControlledChatUseCase:
         """
         try:
             prepared = await self._repository.prepare_turn(command)
+            self._observe(
+                MemoryStage.PREFLIGHT,
+                MemoryStatus.SUCCEEDED,
+                trace_id=command.request_id or "chat-preflight",
+                run_id=prepared.session_id,
+            )
             if self._memory_commands is not None:
                 intent = parse_memory_command(
                     command.message,
@@ -59,6 +75,27 @@ class ControlledChatUseCase:
                 if intent is not None:
                     memory_result = await self._memory_commands.execute(intent)
                     await self._repository.commit()
+                    command_stage = (
+                        MemoryStage.DELETE
+                        if intent.kind.value in {"DELETE", "FORGET", "CONFIRM"}
+                        else MemoryStage.MUTATE
+                    )
+                    command_status = (
+                        MemoryStatus.SUCCEEDED
+                        if memory_result.status.value == "SUCCEEDED"
+                        else MemoryStatus.REJECTED
+                        if memory_result.status.value in {"REJECTED", "CANCELLED"}
+                        else MemoryStatus.PARTIAL
+                    )
+                    self._observe(
+                        command_stage,
+                        command_status,
+                        trace_id=command.request_id or intent.fingerprint[:16],
+                        run_id=prepared.session_id,
+                        reference=memory_result.command_ref,
+                        affected_count=memory_result.affected_count,
+                        error_code=memory_result.error_code,
+                    )
                     terminal_status = _terminal_status_for_memory(memory_result.status.value)
                     return ChatOutcome(
                         reply=memory_result.user_message,
@@ -86,6 +123,18 @@ class ControlledChatUseCase:
                             token_budget=self._retrieval_token_budget,
                         )
                     )
+                    self._observe(
+                        MemoryStage.RETRIEVE,
+                        _retrieval_memory_status(retrieval_result.status.value),
+                        trace_id=command.request_id or "chat-retrieval",
+                        run_id=prepared.session_id,
+                        affected_count=len(retrieval_result.items),
+                        error_code=(
+                            retrieval_result.error_code.value
+                            if retrieval_result.error_code is not None
+                            else None
+                        ),
+                    )
                     memory_context = tuple(
                         MemoryContextItem(
                             record_id=item.record_id,
@@ -97,6 +146,13 @@ class ControlledChatUseCase:
                         )
                         for item in retrieval_result.items
                     )
+                    self._observe(
+                        MemoryStage.INJECT,
+                        MemoryStatus.SUCCEEDED if memory_context else MemoryStatus.SKIPPED,
+                        trace_id=command.request_id or "chat-inject",
+                        run_id=prepared.session_id,
+                        affected_count=len(memory_context),
+                    )
                 except Exception as exc:
                     # 召回是增强能力；权威对话链必须在索引故障时继续运行。
                     logger.warning(
@@ -105,6 +161,13 @@ class ControlledChatUseCase:
                         "DEGRADED",
                         "PROVIDER_UNAVAILABLE",
                         type(exc).__name__,
+                    )
+                    self._observe(
+                        MemoryStage.RETRIEVE,
+                        MemoryStatus.DEGRADED,
+                        trace_id=command.request_id or "chat-retrieval",
+                        run_id=prepared.session_id,
+                        error_code="PROVIDER_UNAVAILABLE",
                     )
             workflow_kwargs = {
                 "recent_messages": prepared.recent_messages,
@@ -151,6 +214,33 @@ class ControlledChatUseCase:
             workflow_result=result,
         )
 
+    def _observe(
+        self,
+        stage: MemoryStage,
+        status: MemoryStatus,
+        *,
+        trace_id: str,
+        run_id: str,
+        reference: str | None = None,
+        affected_count: int = 0,
+        error_code: object | None = None,
+    ) -> None:
+        """发送旁路观测；任何适配器异常都不能影响聊天事务。"""
+        if self._memory_observer is None:
+            return
+        emit_memory_observation(
+            MemoryObservation(
+                stage=stage,
+                status=status,
+                trace_id=trace_id,
+                run_id=run_id,
+                reference=reference,
+                affected_count=affected_count,
+                error_code=_error_code_text(error_code),
+            ),
+            observer=self._memory_observer,
+        )
+
 
 def _terminal_status_for_memory(status: str) -> TerminalStatus:
     """把记忆命令状态映射为受控聊天终态，保证命令分支立即结束。"""
@@ -163,3 +253,20 @@ def _terminal_status_for_memory(status: str) -> TerminalStatus:
     if status in {"CONFIRMATION_REQUIRED", "PENDING"}:
         return TerminalStatus.NEEDS_CLARIFICATION
     return TerminalStatus.FAILED
+
+
+def _retrieval_memory_status(status: str) -> MemoryStatus:
+    """把召回领域状态映射为统一记忆观测状态。"""
+    if status == "SUCCEEDED":
+        return MemoryStatus.SUCCEEDED
+    if status in {"EMPTY", "PARTIAL"}:
+        return MemoryStatus.PARTIAL
+    return MemoryStatus.FAILED
+
+
+def _error_code_text(error_code: object | None) -> str | None:
+    """把领域枚举或字符串错误码收敛为安全文本。"""
+    if error_code is None:
+        return None
+    value = getattr(error_code, "value", error_code)
+    return str(value)

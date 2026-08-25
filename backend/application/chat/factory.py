@@ -13,6 +13,8 @@ from backend.infrastructure.chat.trace import SkillTraceSink
 from backend.infrastructure.memory.runtime import get_memory_cache
 from backend.infrastructure.memory.retrieval_repository import SqlAlchemyMemoryRetrievalRepository
 from backend.infrastructure.memory.semantic_provider import get_semantic_provider
+from backend.infrastructure.memory.observability import MemoryTraceSink
+from backend.application.memory.observability import memory_metrics
 from backend.application.memory.retrieval import MemoryRetrievalUseCase
 from backend.application.memory.commands import MemoryCommandUseCase
 from backend.config import settings
@@ -50,6 +52,7 @@ def build_chat_use_case(db: AsyncSession) -> ControlledChatUseCase:
         retrieval_top_k=settings.memory_retrieval_top_k,
         retrieval_token_budget=settings.memory_retrieval_token_budget,
         memory_commands=MemoryCommandUseCase(db) if settings.enable_memory else None,
+        memory_observer=MemoryTraceSink(metrics=memory_metrics),
     )
 
 

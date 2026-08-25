@@ -15,11 +15,13 @@ from backend.config import settings  # noqa: E402
 from backend.main import app  # noqa: E402
 from backend.routers import chat as chat_router  # noqa: E402
 from backend.application.chat.contracts import ChatOutcome  # noqa: E402
+from backend.application.memory.observability import memory_metrics  # noqa: E402
 from src.conversation.contracts import TerminalStatus  # noqa: E402
 
 
 @pytest.mark.contract
 def test_health_contract_is_public_and_versioned() -> None:
+    memory_metrics.reset()
     response = TestClient(app).get("/api/health")
 
     assert response.status_code == 200
@@ -32,7 +34,8 @@ def test_health_contract_is_public_and_versioned() -> None:
                 "status": "DISABLED",
                 "error_code": None,
                 "metrics": {},
-            }
+            },
+            "memory_observability": {"status": "UP", "metrics": {}},
         },
     }
 

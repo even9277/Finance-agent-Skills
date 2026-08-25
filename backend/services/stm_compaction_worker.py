@@ -22,6 +22,12 @@ from backend.application.memory.summary import (
     validate_summary_draft,
 )
 from backend.application.memory.candidates import CANDIDATE_PROMPT_VERSION
+from backend.application.memory.observability import (
+    MemoryObservation,
+    MemoryStage,
+    MemoryStatus,
+    emit_memory_observation,
+)
 from backend.config import settings
 from backend.db.database import AsyncSessionFactory
 from backend.db.models import (
@@ -164,6 +170,18 @@ class SummaryCompactionWorker:
                 compaction_input.payload.expected_summary_version + 1,
                 compaction_input.payload.source_message_count,
             )
+            emit_memory_observation(
+                MemoryObservation(
+                    stage=MemoryStage.COMPACT,
+                    status=MemoryStatus.SUCCEEDED,
+                    trace_id=compaction_input.trace_id or "",
+                    run_id=task_id,
+                    reference=task_id,
+                    elapsed_ms=(datetime.now(UTC) - started).total_seconds() * 1000,
+                    version=compaction_input.payload.expected_summary_version + 1,
+                    affected_count=compaction_input.payload.source_message_count,
+                )
+            )
         except Exception as exc:
             recorded = await self._record_failure(task_id, claim.lease_token, exc)
             logger.warning(
@@ -176,6 +194,17 @@ class SummaryCompactionWorker:
                 int((datetime.now(UTC) - started).total_seconds() * 1000),
                 _error_code(exc).value,
                 type(exc).__name__,
+            )
+            emit_memory_observation(
+                MemoryObservation(
+                    stage=MemoryStage.COMPACT,
+                    status=MemoryStatus.RETRY if recorded else MemoryStatus.DEGRADED,
+                    trace_id=claim.trace_id or "",
+                    run_id=task_id,
+                    reference=task_id,
+                    elapsed_ms=(datetime.now(UTC) - started).total_seconds() * 1000,
+                    error_code=_error_code(exc).value,
+                )
             )
         return True
 

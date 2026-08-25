@@ -21,6 +21,12 @@ from backend.application.memory.candidates import (
     CandidateSourceMessage,
     CandidateStateSignal,
 )
+from backend.application.memory.observability import (
+    MemoryObservation,
+    MemoryStage,
+    MemoryStatus,
+    emit_memory_observation,
+)
 from backend.config import settings
 from backend.db.database import AsyncSessionFactory
 from backend.db.models import (
@@ -134,6 +140,17 @@ class LongTermGovernanceWorker:
                 result.confirmation_required_count if result else 0,
                 result.conflicted_count if result else 0,
             )
+            emit_memory_observation(
+                MemoryObservation(
+                    stage=MemoryStage.CANDIDATE_GOVERN,
+                    status=MemoryStatus.SUCCEEDED if result is not None else MemoryStatus.SKIPPED,
+                    trace_id=task_input.trace_id or "",
+                    run_id=task_input.task_id,
+                    reference=task_input.task_id,
+                    elapsed_ms=(datetime.now(UTC) - started).total_seconds() * 1000,
+                    affected_count=result.created_count if result else 0,
+                )
+            )
         except Exception as exc:
             recorded = await self._record_failure(
                 claim.task_id,
@@ -150,6 +167,17 @@ class LongTermGovernanceWorker:
                 int((datetime.now(UTC) - started).total_seconds() * 1000),
                 _error_code(exc).value,
                 type(exc).__name__,
+            )
+            emit_memory_observation(
+                MemoryObservation(
+                    stage=MemoryStage.CANDIDATE_GOVERN,
+                    status=MemoryStatus.RETRY if recorded else MemoryStatus.DEGRADED,
+                    trace_id=claim.trace_id or "",
+                    run_id=claim.task_id,
+                    reference=claim.task_id,
+                    elapsed_ms=(datetime.now(UTC) - started).total_seconds() * 1000,
+                    error_code=_error_code(exc).value,
+                )
             )
         return True
 

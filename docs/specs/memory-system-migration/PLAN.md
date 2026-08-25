@@ -598,8 +598,11 @@ Before implementation, rollback is simply discarding the unexecuted plan. During
 - [x] Milestone 6: Mem0/pgvector Index, Hybrid Retrieval, and Stage Injection
   - Implementation status: delivered through PR #36 and merge commit `2d1d09b` on 2026-08-25; M6 branch was deleted after merge.
   - Evidence: `mem0ai==2.0.19` and `pgvector==0.5.0` are lock-resolved; PostgreSQL owns `memory_records` while `memory_semantic_index`, Provider references, and INDEX Outbox tasks are rebuildable derivatives. Deterministic pgvector search enforces user/version/status/expiry filtering, lexical and semantic candidates are fused and token-packed, and retrieval is injected only into Context/AnswerContextPack. The context trace records hit/token/status counts without memory正文。Seven M6 semantic/worker/context tests and 41 focused controlled-chat/memory regressions passed; maintained-scope Ruff/Pyright reported zero findings. Rebuilt offline Compose reports `136 passed, 1 skipped, 39 deselected, 5 xfailed` in 50.16 seconds with exit code `0`, covering isolated PostgreSQL/pgvector, Redis, FastAPI, Nginx, Vue, real pgvector CRUD/user isolation/authority-delete filtering, and real HTTP controlled-chat journeys. Default provider remains disabled; offline Compose explicitly uses deterministic embedding and empty external credentials. No paid model, production service, real Tushare, or Mem0 network call was used.
-- [ ] Milestone 7: Natural-language Memory Commands, API, and Frontend Controls
-- [ ] Milestone 8: Observability, Failure Hardening, and Offline Evaluation Gates
+- [x] Milestone 7: Natural-language Memory Commands, API, and Frontend Controls
+  - Completed: 2026-08-25 through PR #39, merge commit `3139480c06c54706195a136649d8ad388aaa3dfc`; Issue #38 closed and short branch deleted.
+  - Evidence: deterministic command parser, PostgreSQL pending-confirmation authority, REST/WS/frontend contract, lifecycle negatives, and rebuilt offline Compose HTTP journey (`144 passed, 1 skipped, 39 deselected, 4 xfailed`).
+- [x] Milestone 8: Observability, Failure Hardening, and Offline Evaluation Gates
+  - Completed: 2026-08-25 through Issue #40 and branch `feat/40-memory-observability-evals`; verified `249 passed, 6 skipped, 5 deselected, 3 xfailed` locally and rebuilt offline Compose E2E `148 passed, 1 skipped, 39 deselected, 3 xfailed`.
 - [ ] Milestone 9: Full Compose, Protected Live E2E, Documentation, and Delivery Closure
 
 ## 16. Decision Log
@@ -708,4 +711,4 @@ Before implementation, rollback is simply discarding the unexecuted plan. During
 
 ## 20. Handoff to Small-step Implementation
 
-Milestones 0 through 6 are implemented, offline-validated, reviewed, and delivered through PR #36; Issue #35 is closed and `main` contains merge commit `2d1d09b`. The next implementation milestone is M7: natural-language memory commands and UI, which must start from a new issue and short-lived branch.
+Milestones 0 through 7 are implemented, offline-validated, reviewed, and delivered through PRs #27/#29/#31/#33/#36/#39; Issues #26/#28/#30/#32/#35/#38 are closed and `main` contains the cumulative M7 merge commit `3139480`. Milestones 0 through 8 are implemented and locally verified (M8 through Issue #40 and branch `feat/40-memory-observability-evals`). The remaining milestone is M9: full Compose, protected live E2E, documentation, and delivery closure, which requires the protected live environment/secrets and explicit user authorization before running paid/live providers.
