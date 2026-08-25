@@ -380,7 +380,7 @@ For database changes, use an expand-first Alembic revision; validate upgrade, do
 
 ## 15. Progress
 
-- [ ] Milestone 0: Safety and Baseline Check
+- [x] Milestone 0: Safety and Baseline Check (Issue #38, branch `feat/38-memory-commands`, baseline captured)
 - [ ] Milestone 1: Lock or Add Tests / Reproduction
 - [ ] Milestone 2: Implement Core Change
 - [ ] Milestone 3: Add Validation, Error Handling, and Observability
