@@ -10,8 +10,8 @@
  */
 
 import { ref } from 'vue'
-import { memoryApi } from '@/api'
-import type { MemoryProfile, MemoryItem } from '@/api'
+import { memoryApi, chatApi } from '@/api'
+import type { MemoryProfile, MemoryItem, MemoryCommandResult } from '@/api'
 import { useMemoryStore } from '@/stores/memoryStore'
 import { useUserStore } from '@/stores/userStore'
 
@@ -54,10 +54,12 @@ export function useMemory() {
   async function updateRisk(risk: string) {
     const userId = userStore.userId
     if (!userId) return
+    const previous = { ...memoryStore.profile }
     memoryStore.updateRisk(risk)
     try {
       await memoryApi.updateRisk(userId, risk)
     } catch (e: unknown) {
+      memoryStore.setProfile(previous)
       error.value = e instanceof Error ? e.message : '更新风险偏好失败'
       console.warn('[useMemory] updateRisk 失败:', error.value)
     }
@@ -68,6 +70,7 @@ export function useMemory() {
   function updateSectors(sectors: string[]) {
     const userId = userStore.userId
     if (!userId) return
+    const previous = [...memoryStore.profile.sectors]
     memoryStore.updateSectors(sectors)
 
     if (sectorsTimer) clearTimeout(sectorsTimer)
@@ -75,6 +78,7 @@ export function useMemory() {
       try {
         await memoryApi.updateSectors(userId, sectors)
       } catch (e: unknown) {
+        memoryStore.updateSectors(previous)
         error.value = e instanceof Error ? e.message : '更新板块失败'
         console.warn('[useMemory] updateSectors 失败:', error.value)
       }
@@ -86,6 +90,7 @@ export function useMemory() {
   function updateReturn(val: number, max?: number, horizon?: string) {
     const userId = userStore.userId
     if (!userId) return
+    const previous = { ...memoryStore.profile }
     memoryStore.updateReturn(val, max)
     if (horizon) memoryStore.updateHorizon(horizon)
 
@@ -94,6 +99,7 @@ export function useMemory() {
       try {
         await memoryApi.updateReturn(userId, val, max, horizon)
       } catch (e: unknown) {
+        memoryStore.setProfile(previous)
         error.value = e instanceof Error ? e.message : '更新期望收益失败'
         console.warn('[useMemory] updateReturn 失败:', error.value)
       }
@@ -105,10 +111,12 @@ export function useMemory() {
   async function updateHorizon(horizon: string) {
     const userId = userStore.userId
     if (!userId) return
+    const previous = { ...memoryStore.profile }
     memoryStore.updateHorizon(horizon)
     try {
       await memoryApi.updateHorizon(userId, horizon)
     } catch (e: unknown) {
+      memoryStore.setProfile(previous)
       error.value = e instanceof Error ? e.message : '更新投资周期失败'
       console.warn('[useMemory] updateHorizon 失败:', error.value)
     }
@@ -120,8 +128,11 @@ export function useMemory() {
     const userId = userStore.userId
     if (!userId) return
     try {
-      await memoryApi.deleteAll(userId)
-      memoryStore.resetProfile()
+      // 宽范围删除只通过聊天命令生成 pending preview，禁止旧 confirm=true 直删。
+      const { data } = await chatApi.sendMessage(userId, '忘掉我的文本记忆')
+      if (data.memory_command) {
+        memoryStore.setCommandResult(data.memory_command)
+      }
     } catch (e: unknown) {
       error.value = e instanceof Error ? e.message : '清空记忆失败'
       console.warn('[useMemory] clearAllMemories 失败:', error.value)
@@ -168,6 +179,8 @@ export function useMemory() {
   async function deleteMemoryItem(memoryId: string) {
     const userId = userStore.userId
     if (!userId) return
+    const previousItems = [...memoryStore.memoryItems]
+    const previousTotal = memoryStore.totalItems
     try {
       await memoryApi.deleteItem(userId, memoryId)
       // 从本地列表移除
@@ -177,8 +190,27 @@ export function useMemory() {
         memoryStore.currentPage,
       )
     } catch (e: unknown) {
+      memoryStore.setMemoryItems(previousItems, previousTotal, memoryStore.currentPage)
       error.value = e instanceof Error ? e.message : '删除记忆失败'
       console.warn('[useMemory] deleteMemoryItem 失败:', error.value)
+    }
+  }
+
+  async function executeMemoryCommand(message: string, sessionId?: string): Promise<MemoryCommandResult | null> {
+    const userId = userStore.userId
+    if (!userId || !message.trim()) return null
+    try {
+      const { data } = await chatApi.sendMessage(userId, message, sessionId)
+      const result = data.memory_command ?? null
+      memoryStore.setCommandResult(result)
+      if (result?.status === 'SUCCEEDED') {
+        await loadProfile()
+        await loadMemoryItems(1)
+      }
+      return result
+    } catch (e: unknown) {
+      error.value = e instanceof Error ? e.message : '执行记忆命令失败'
+      return null
     }
   }
 
@@ -194,5 +226,6 @@ export function useMemory() {
     loadMemoryItems,
     addMemoryItem,
     deleteMemoryItem,
+    executeMemoryCommand,
   }
 }

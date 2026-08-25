@@ -88,6 +88,7 @@ function formatCreatedAt(iso: string | undefined): string {
 }
 
 const stats = computed(() => memoryStore.stats)
+const commandNotice = computed(() => memoryStore.lastCommand)
 const hasProfile = computed(() => {
   const p = memoryStore.profile
   return !!(p.risk_profile || p.sectors.length || p.return_expectation || p.investment_horizon)
@@ -150,21 +151,25 @@ const hasProfile = computed(() => {
 
       <!-- 清除按钮 -->
       <div class="pt-2 border-t border-slate-800">
+        <div v-if="commandNotice" class="mb-2 text-[10px] text-amber-400" role="status">
+          {{ commandNotice.user_message }}
+          <span v-if="commandNotice.pending_confirmation_id">请回到对话中回复“确认”或“取消”。</span>
+        </div>
         <button
           v-if="!showClearConfirm"
           class="w-full text-[10px] text-slate-600 hover:text-red-400 transition-colors py-1"
           @click="showClearConfirm = true"
         >
-          清除所有记忆与画像
+          请求清理文本记忆
         </button>
         <div v-else class="space-y-1.5">
-          <p class="text-[10px] text-red-400 text-center">⚠ 此操作不可撤销，确认清除？</p>
+          <p class="text-[10px] text-red-400 text-center">将先生成预览，不会直接删除。</p>
           <div class="flex gap-2">
             <button
               class="flex-1 text-[10px] py-1 bg-red-900/40 text-red-400 rounded hover:bg-red-900/60 transition-colors"
               :disabled="clearing"
               @click="doClearAll"
-            >{{ clearing ? '清除中...' : '确认清除' }}</button>
+            >{{ clearing ? '生成预览中...' : '生成清理预览' }}</button>
             <button
               class="flex-1 text-[10px] py-1 border border-slate-700 text-slate-500 rounded hover:text-slate-300 transition-colors"
               @click="showClearConfirm = false"

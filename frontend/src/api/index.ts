@@ -77,6 +77,35 @@ export interface ChatMessageResponse {
   // Phase 3：本次对话参考的用户画像（null 表示 ENABLE_MEMORY=false 或未设置）
   memory_profile?: MemoryProfile | null
   context_window?: ChatContextWindow | null
+  memory_command?: MemoryCommandResult | null
+}
+
+export type MemoryCommandStatus =
+  | 'PENDING'
+  | 'CONFIRMATION_REQUIRED'
+  | 'SUCCEEDED'
+  | 'PARTIAL'
+  | 'FAILED'
+  | 'REJECTED'
+  | 'CANCELLED'
+  | 'EXPIRED'
+
+export interface MemoryCommandResult {
+  status: MemoryCommandStatus
+  command_kind?: 'INSPECT' | 'UPDATE' | 'DELETE' | 'FORGET' | 'CONFIRM' | 'CANCEL' | null
+  command_ref?: string | null
+  affected_count: number
+  affected_record_ids: string[]
+  consistency_status: string
+  pending_confirmation_id?: string | null
+  error_code?: string | null
+  user_message: string
+  preview_items: Array<{
+    record_id: string
+    category: string
+    version: number
+    snippet?: string
+  }>
 }
 
 export interface ChatContextWindow {
@@ -378,6 +407,7 @@ export type WsControlFrame =
   | { type: 'compaction_done'; session_id: string; context_window: ChatContextWindow }
   | { type: 'compaction_failed'; session_id: string; context_window: ChatContextWindow; message?: string }
   | { type: 'done'; session_id: string }
+  | { type: 'memory_command'; session_id: string; memory_command: MemoryCommandResult }
   | { type: 'compress_start'; session_id: string; progress: number; eta_seconds: number }
   | { type: 'compress_done'; session_id: string; progress: number; eta_seconds: number; elapsed_seconds: number; snapshot_id?: number; compressed_message_count?: number; total_message_count?: number; percent?: number }
   | { type: 'compress_skip'; session_id: string; progress: number; eta_seconds: number }

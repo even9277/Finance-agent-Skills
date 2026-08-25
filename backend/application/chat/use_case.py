@@ -8,6 +8,8 @@ from src.conversation.contracts import ConversationRequest, MemoryContextItem
 from src.conversation.workflow import ControlledConversationWorkflow
 
 from backend.application.memory.retrieval import MemoryRetrievalRequest, MemoryRetrievalUseCase
+from backend.application.memory.commands import MemoryCommandUseCase, parse_memory_command
+from src.conversation.contracts import TerminalStatus
 from .contracts import ChatCommand, ChatOutcome
 from .ports import TransactionalConversationRepository
 
@@ -25,12 +27,14 @@ class ControlledChatUseCase:
         retrieval: MemoryRetrievalUseCase | None = None,
         retrieval_top_k: int = 8,
         retrieval_token_budget: int = 600,
+        memory_commands: MemoryCommandUseCase | None = None,
     ) -> None:
         self._workflow = workflow
         self._repository = repository
         self._retrieval = retrieval
         self._retrieval_top_k = retrieval_top_k
         self._retrieval_token_budget = retrieval_token_budget
+        self._memory_commands = memory_commands
 
     async def execute(self, command: ChatCommand) -> ChatOutcome:
         """运行领域工作流并原子保存唯一终态。
@@ -46,6 +50,24 @@ class ControlledChatUseCase:
         """
         try:
             prepared = await self._repository.prepare_turn(command)
+            if self._memory_commands is not None:
+                intent = parse_memory_command(
+                    command.message,
+                    user_id=command.user_id,
+                    session_id=prepared.session_id,
+                )
+                if intent is not None:
+                    memory_result = await self._memory_commands.execute(intent)
+                    await self._repository.commit()
+                    terminal_status = _terminal_status_for_memory(memory_result.status.value)
+                    return ChatOutcome(
+                        reply=memory_result.user_message,
+                        session_id=prepared.session_id,
+                        status=terminal_status,
+                        memory_profile=prepared.memory_profile,
+                        working_state=prepared.working_state,
+                        memory_command=memory_result,
+                    )
             request = ConversationRequest(
                 user_id=command.user_id,
                 session_id=prepared.session_id,
@@ -128,3 +150,16 @@ class ControlledChatUseCase:
             context_window=context_window,
             workflow_result=result,
         )
+
+
+def _terminal_status_for_memory(status: str) -> TerminalStatus:
+    """把记忆命令状态映射为受控聊天终态，保证命令分支立即结束。"""
+    if status == "SUCCEEDED":
+        return TerminalStatus.SUCCEEDED
+    if status in {"PARTIAL"}:
+        return TerminalStatus.PARTIAL
+    if status in {"REJECTED", "CANCELLED", "EXPIRED"}:
+        return TerminalStatus.REJECTED if status != "CANCELLED" else TerminalStatus.CANCELLED
+    if status in {"CONFIRMATION_REQUIRED", "PENDING"}:
+        return TerminalStatus.NEEDS_CLARIFICATION
+    return TerminalStatus.FAILED

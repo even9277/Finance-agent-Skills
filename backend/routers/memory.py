@@ -261,9 +261,19 @@ async def delete_all_memories(
             status_code=400,
             detail="请传入 confirm=true 以确认删除所有记忆（此操作不可撤销）",
         )
-    await memory_service.delete_all_memories(user_id, db)
-    logger.warning("memory_items_write stage=%s status=%s operation=%s", "memory.delete_all", "SUCCEEDED", "delete_all")
-    return {"message": "已清空所有记忆（Mem0 + user_invest_profiles 均已重置）"}
+    # 兼容旧客户端的布尔参数，但不再把它当作宽范围删除授权；
+    # 删除范围必须由聊天命令冻结并通过一次性 pending confirmation 消费。
+    logger.warning(
+        "memory_items_write stage=%s status=%s operation=%s error_code=%s",
+        "memory.delete_all",
+        "REJECTED",
+        "legacy_confirm_boolean",
+        "CONFIRMATION_REQUIRED",
+    )
+    raise HTTPException(
+        status_code=409,
+        detail="宽范围删除已收口为聊天命令：请发送‘忘掉我的文本记忆’，查看预览后回复‘确认’。",
+    )
 
 
 # ─────────────────────────────────────────────────────────────

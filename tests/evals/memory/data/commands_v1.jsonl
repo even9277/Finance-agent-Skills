@@ -1,0 +1,3 @@
+{"case_id":"m7-update-response-pref-001","message":"以后回答简短一点","kind":"UPDATE","profile_field":"response_pref","requires_confirmation":false}
+{"case_id":"m7-forget-text-001","message":"忘掉我的文本记忆","kind":"FORGET","category":"text","requires_confirmation":true}
+{"case_id":"m7-finance-fallthrough-001","message":"分析一下宁德时代近期的估值和风险","kind":null,"requires_confirmation":false}

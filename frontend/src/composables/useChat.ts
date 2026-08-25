@@ -3,11 +3,13 @@ import { chatApi, buildWsUrl, parseWsFrame, type ChatMessage, type ChatTemplate 
 import { useChatStore } from '@/stores/chatStore'
 import { useUserStore } from '@/stores/userStore'
 import { useMemory } from '@/composables/useMemory'
+import { useMemoryStore } from '@/stores/memoryStore'
 
 export function useChat() {
   const userStore = useUserStore()
   const chatStore = useChatStore()
   const { loadProfile } = useMemory()
+  const memoryStore = useMemoryStore()
   const templates = ref<ChatTemplate[]>([])
   let compressTimer: number | null = null
   let contextRefreshTimer: number | null = null
@@ -89,6 +91,9 @@ export function useChat() {
       }
       chatStore.setContextWindow(data.context_window || null)
       chatStore.updateSessionContext(data.session_id, data.context_window || null)
+      if (data.memory_command) {
+        memoryStore.setCommandResult(data.memory_command)
+      }
       maybeStartContextRefreshPolling()
 
       const aiMsg: ChatMessage = {
@@ -183,6 +188,8 @@ export function useChat() {
             chatStore.setContextWindow(frame.context_window)
             chatStore.updateSessionContext(frame.session_id, frame.context_window)
             maybeStartContextRefreshPolling()
+          } else if (frame.type === 'memory_command') {
+            memoryStore.setCommandResult(frame.memory_command)
           } else if (frame.type === 'compaction_queued' || frame.type === 'compaction_running' || frame.type === 'compaction_done' || frame.type === 'compaction_failed') {
             chatStore.setContextWindow(frame.context_window)
             chatStore.updateSessionContext(frame.session_id, frame.context_window)
