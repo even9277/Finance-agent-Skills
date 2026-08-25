@@ -603,7 +603,8 @@ Before implementation, rollback is simply discarding the unexecuted plan. During
   - Evidence: deterministic command parser, PostgreSQL pending-confirmation authority, REST/WS/frontend contract, lifecycle negatives, and rebuilt offline Compose HTTP journey (`144 passed, 1 skipped, 39 deselected, 4 xfailed`).
 - [x] Milestone 8: Observability, Failure Hardening, and Offline Evaluation Gates
   - Completed: 2026-08-25 through Issue #40 and branch `feat/40-memory-observability-evals`; verified `249 passed, 6 skipped, 5 deselected, 3 xfailed` locally and rebuilt offline Compose E2E `148 passed, 1 skipped, 39 deselected, 3 xfailed`.
-- [ ] Milestone 9: Full Compose, Protected Live E2E, Documentation, and Delivery Closure
+- [x] Milestone 9: Full Compose, Protected Live E2E, Documentation, and Delivery Closure
+  - Completed: 2026-08-25 through Issue #42 and branch `feat/42-memory-delivery-closure`; offline Compose E2E `148 passed, 1 skipped, 39 deselected, 3 xfailed` and protected live LLM + read-only Tushare acceptance `1 passed`; README/CONTRIBUTING updated and `MODULE_EVIDENCE_MAP.md` delivered.
 
 ## 16. Decision Log
 
