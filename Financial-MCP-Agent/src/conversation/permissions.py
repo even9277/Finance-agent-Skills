@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, cast
+
+if TYPE_CHECKING:
+    from src.skills.loader import LoadedSkillContext, PlannerSkillView
+
 from .contracts import (
     EntityType,
     RewriteKind,
@@ -90,11 +95,17 @@ class ControlledPermissionResolver:
         self._catalog = catalog
         self._skill_catalog = skill_catalog
 
-    def resolve(self, rewrite: RewriteResult) -> ToolPermissionSnapshot:
+    def resolve(
+        self,
+        rewrite: RewriteResult,
+        *,
+        skill_context: LoadedSkillContext | None = None,
+    ) -> ToolPermissionSnapshot:
         """生成 Planner 和 Executor 必须共同使用的冻结权限。
 
         Args:
             rewrite: 已完成路由主语校验的数据需求合同。
+            skill_context: 金融 SOP 在同一请求固定快照加载的 planner-stage 上下文。
 
         Returns:
             只包含治理目录内只读工具和输入 Schema 的不可变快照。
@@ -105,8 +116,29 @@ class ControlledPermissionResolver:
         if rewrite.kind is RewriteKind.FINANCIAL_SOP:
             if not rewrite.skill_name:
                 raise ContractViolationError("financial SOP rewrite has no selected skill")
+            if skill_context is None or skill_context.stage != "planner":
+                raise ContractViolationError("financial SOP permissions require planner context")
             execution_view = self._skill_catalog.execution_view(rewrite.skill_name)
-            policies = self._catalog.select(execution_view.allowed_tools)
+            if (
+                skill_context.skill_id != execution_view.name
+                or skill_context.skill_version != execution_view.version
+                or skill_context.spec_hash != execution_view.spec_hash
+                or skill_context.registry_snapshot_hash
+                != self._skill_catalog.registry_snapshot_hash
+            ):
+                raise ContractViolationError("planner context differs from routed Skill snapshot")
+            planner_view = cast("PlannerSkillView", skill_context.spec_view)
+            if set(planner_view.allowed_tools) != set(execution_view.allowed_tools):
+                raise ContractViolationError("planner and execution views disagree on Skill tools")
+            # 权限只能取 Skill 声明与当前治理目录的交集；未知工具等待独立里程碑接入。
+            governed_tools = tuple(
+                tool_name
+                for tool_name in planner_view.allowed_tools
+                if self._catalog.contains(tool_name)
+            )
+            if not governed_tools:
+                raise ContractViolationError("Skill has no tools in the governance catalog")
+            policies = self._catalog.select(governed_tools)
             source = f"skill:{execution_view.name}:{execution_view.version}"
         elif rewrite.kind is RewriteKind.TUSHARE_DATA:
             tool_names = permitted_tools_for_requirements(rewrite)
@@ -120,4 +152,12 @@ class ControlledPermissionResolver:
             permissions=policies,
             source=source,
             version=self._catalog.version,
+            skill_name=rewrite.skill_name if rewrite.kind is RewriteKind.FINANCIAL_SOP else None,
+            skill_version=(
+                skill_context.skill_version if skill_context is not None else ""
+            ),
+            skill_spec_hash=(skill_context.spec_hash if skill_context is not None else ""),
+            registry_snapshot_hash=(
+                skill_context.registry_snapshot_hash if skill_context is not None else ""
+            ),
         )

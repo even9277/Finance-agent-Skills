@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+import re
+from typing import TYPE_CHECKING, cast
+
+if TYPE_CHECKING:
+    from src.skills.contracts import InputContract
+    from src.skills.loader import RewriteSkillView, SkillLoader
+
 from .constraints import ConstraintExtractor
 from .contracts import (
     ConstraintSet,
@@ -37,8 +44,14 @@ _SOP_DATA_REQUIREMENTS = {
 class RouteAwareRewriter:
     """保持权威实体与路由不变，只补全执行问题、约束和表达偏好。"""
 
-    def __init__(self, snapshot: SkillCatalogSnapshot) -> None:
+    def __init__(
+        self,
+        snapshot: SkillCatalogSnapshot,
+        *,
+        skill_loader: SkillLoader | None = None,
+    ) -> None:
         self._snapshot = snapshot
+        self._skill_loader = skill_loader
         self._constraints = ConstraintExtractor()
         self._preferences = ReplyPreferenceExtractor()
 
@@ -150,7 +163,47 @@ class RouteAwareRewriter:
                 question="当前选择的 Skill 不在本轮能力快照中，请重新选择。",
             )
 
-        conflict, question = _validate_sop_subjects(skill_name, entities, packet.current_message)
+        if _contains_multiple_skill_tasks(packet.current_message):
+            return _invalid_sop(
+                packet.current_message,
+                entities,
+                constraints,
+                preference,
+                time_scope,
+                mismatch="multiple_skill_tasks",
+                question="这个请求包含多个独立分析任务，请拆分为两条消息后分别执行。",
+            )
+
+        if self._skill_loader is not None:
+            try:
+                loaded = self._skill_loader.load_for_rewrite(
+                    skill_name,
+                    query=packet.current_message,
+                )
+                rewrite_view = cast("RewriteSkillView", loaded.spec_view)
+            except RuntimeError:
+                return _invalid_sop(
+                    packet.current_message,
+                    entities,
+                    constraints,
+                    preference,
+                    time_scope,
+                    mismatch="skill_rewrite_load_failed",
+                    question="当前 Skill 输入合同加载失败，请稍后重试或重新选择。",
+                )
+            conflict, question = _validate_input_contract(
+                skill_name,
+                rewrite_view.input_contract,
+                entities,
+                packet.current_message,
+            )
+        else:
+            # 兼容尚未装配 Loader 的离线旧调用方；生产 factory 会固定同一 RegistrySnapshot。
+            conflict, question = _validate_sop_subjects(
+                skill_name,
+                entities,
+                packet.current_message,
+            )
         requirements = _requirements_for_sop(skill_name, entities)
         return SopRewriteResult(
             effective_query=_effective_query(packet.current_message, entities, requirements),
@@ -217,6 +270,71 @@ def _validate_sop_subjects(
         if not any(token in query for token in ("板块", "行业", "概念", "指数", "ETF")):
             return ("market_subject_missing", "请补充需要分析的股票、基金、指数或板块。")
     return ("", "")
+
+
+def _validate_input_contract(
+    skill_name: str,
+    contract: InputContract,
+    entities: tuple[Entity, ...],
+    query: str,
+) -> tuple[str, str]:
+    """根据 Loader 投影的 input contract 校验主体基数和必需槽位。"""
+    compatible = tuple(
+        entity
+        for entity in entities
+        if _entity_contract_types(entity) & set(contract.supported_entity_types)
+    )
+    if contract.entity_cardinality == "at_least_two" and len(compatible) < 2:
+        return (
+            "fund_compare_requires_two_entities",
+            "请至少告诉我两只明确的基金或 ETF 名称/代码，我再继续比较。",
+        )
+    if contract.entity_cardinality == "exactly_one" and len(compatible) != 1:
+        if skill_name == "stock-first-pass":
+            return (
+                "stock_first_pass_requires_one_stock",
+                "这个 Skill 一次只分析一只股票，请提供一个明确股票名称或代码。",
+            )
+        return (
+            "skill_requires_exactly_one_subject",
+            "这个 Skill 一次只处理一个明确主体，请补充或只保留一个分析对象。",
+        )
+    if contract.comparison_required and not any(
+        token in query.upper()
+        for token in ("比较", "对比", "哪个", "怎么选", "VS", "PK", "COMPARE")
+    ):
+        return ("comparison_intent_missing", "请确认希望比较这些基金，并说明关注的比较维度。")
+    if "screen_intent" in contract.required_slots and not any(
+        token in query for token in ("筛", "推荐", "候选", "找几只", "选几个")
+    ):
+        return ("screen_intent_missing", "请补充希望筛选的主题、指数或风险偏好。")
+    return ("", "")
+
+
+def _entity_contract_types(entity: Entity) -> set[str]:
+    """把领域实体类型映射到 Skill spec 的兼容主体标签。"""
+    if entity.entity_type is EntityType.FUND:
+        return {"fund", "etf", "lof", "qdii"}
+    if entity.entity_type is EntityType.SECTOR:
+        return {"sector", "industry", "theme"}
+    return {entity.entity_type.value}
+
+
+def _contains_multiple_skill_tasks(query: str) -> bool:
+    """识别由顺序连接词串联的两个独立 SOP 意图。"""
+    if not re.search(r"(?:先.+?(?:再|然后)|同时|另外)", query):
+        return False
+    task_types: set[str] = set()
+    for segment in re.split(r"再|然后|同时|另外|并且", query):
+        if any(token in segment.upper() for token in ("比较", "对比", "哪个", "VS", "PK")):
+            task_types.add("compare")
+        if any(token in segment for token in ("筛", "推荐", "候选", "找几只", "选几个")):
+            task_types.add("screen")
+        if any(token in segment for token in ("为什么", "异动", "拉升", "跳水")):
+            task_types.add("move")
+        if any(token in segment for token in ("热点", "龙头", "轮动")):
+            task_types.add("hotspot")
+    return len(task_types) >= 2
 
 
 def _requirements_for_sop(skill_name: str, entities: tuple[Entity, ...]) -> tuple[str, ...]:

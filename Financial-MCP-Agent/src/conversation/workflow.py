@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 import uuid
 from dataclasses import dataclass, replace
 from datetime import date
+from typing import TYPE_CHECKING, cast
+
+if TYPE_CHECKING:
+    from src.skills.contracts import DegradePolicy
+    from src.skills.loader import LoadedSkillContext, SkillLoader, SynthesisSkillView
 
 from src.memory.contracts import (
     MemorySource,
@@ -30,12 +36,16 @@ from .contracts import (
     Entity,
     EntityResolutionResult,
     ErrorCode,
+    EvidenceDimension,
     EventAttribute,
     ExecutedPlanStep,
     MemoryContextItem,
     RouteDecision,
     RouteFamily,
+    RouteSource,
+    RouteStage1Outcome,
     PreferenceOperation,
+    RewriteKind,
     RewriteResult,
     RunBudget,
     RunPhase,
@@ -54,16 +64,112 @@ from .errors import StepBudgetExceededError
 from .execution import ControlledExecutor
 from .permissions import ControlledPermissionResolver
 from .planning import ControlledPlanner
-from .ports import ModelPort, ToolPort, TraceSink
+from .ports import ModelPort, SkillRerankerPort, ToolPort, TraceSink
 from .replanning import BoundedEvidenceReplanner
 from .rewriting import RouteAwareRewriter
 from .routing import TwoStageRouter
-from .synthesis import ControlledSynthesizer
+from .synthesis import ControlledSynthesizer, build_skill_synthesis_guidance
 from .tool_governance import ToolGovernanceCatalog
 from .validation import PlanValidator
 from .verification import EvidenceVerifier
 
 logger = logging.getLogger(__name__)
+
+
+def _route_trace_attributes(
+    route: RouteDecision,
+    catalog: SkillCatalogSnapshot,
+) -> tuple[EventAttribute, ...]:
+    """构造不含查询和候选正文的低基数路由版本链。"""
+    skill_version = ""
+    if route.skill_name is not None:
+        skill_version = catalog.require(route.skill_name).version
+    confidence_band = {
+        RouteStage1Outcome.HIT_HIGH: "high",
+        RouteStage1Outcome.HIT_LOW: "mid",
+        RouteStage1Outcome.MISS: "low",
+    }[route.stage1_outcome]
+    return (
+        EventAttribute(key="route_family", value=route.family.value),
+        EventAttribute(key="confidence", value=route.confidence),
+        EventAttribute(key="confidence_band", value=confidence_band),
+        EventAttribute(key="route_source", value=route.route_source.value),
+        EventAttribute(key="selected_skill", value=route.skill_name or ""),
+        EventAttribute(key="skill_version", value=skill_version),
+        EventAttribute(
+            key="registry_snapshot_hash",
+            value=catalog.registry_snapshot_hash or catalog.snapshot_hash,
+        ),
+        EventAttribute(key="candidate_count", value=len(route.shortlist)),
+        EventAttribute(key="candidate_names", value="|".join(route.shortlist)),
+    )
+
+
+def _reference_trace_attributes(
+    prefix: str,
+    loaded: LoadedSkillContext | None,
+) -> tuple[EventAttribute, ...]:
+    """把有界 reference 列表投影为独立 path/hash 标量，避免正文和截断。"""
+    if loaded is None:
+        return (EventAttribute(key=f"{prefix}_reference_count", value=0),)
+    attributes: list[EventAttribute] = [
+        EventAttribute(key=f"{prefix}_reference_count", value=len(loaded.references))
+    ]
+    for index, reference in enumerate(loaded.references, start=1):
+        attributes.extend(
+            (
+                EventAttribute(
+                    key=f"{prefix}_reference_{index}_path",
+                    value=reference.path,
+                ),
+                EventAttribute(
+                    key=f"{prefix}_reference_{index}_hash",
+                    value=reference.content_hash,
+                ),
+            )
+        )
+    return tuple(attributes)
+
+
+def _web_search_plan_trace_attributes(plan: ToolPlan) -> tuple[EventAttribute, ...]:
+    """只记录 Web Search 是否触发和最小查询 hash，不记录查询本身。"""
+    web_steps = tuple(item for item in plan.steps if item.tool_name == "search_web_news")
+    queries = sorted(
+        {
+            str(argument.value)
+            for step in web_steps
+            for argument in step.arguments
+            if argument.name == "query"
+        }
+    )
+    query_hash = hashlib.sha256("\n".join(queries).encode("utf-8")).hexdigest() if queries else ""
+    return (
+        EventAttribute(key="web_search_triggered", value=bool(web_steps)),
+        EventAttribute(key="web_search_step_count", value=len(web_steps)),
+        EventAttribute(key="web_query_hash", value=query_hash),
+    )
+
+
+def _web_source_trace_attributes(
+    verification: VerificationResult,
+) -> tuple[EventAttribute, ...]:
+    """统计 Web 弱证据的来源和裁决数量，不暴露 URL、标题或摘要。"""
+    accepted = tuple(
+        item
+        for item in verification.accepted
+        if item.evidence_dimension is EvidenceDimension.WEB_NEWS
+    )
+    rejected = tuple(
+        item
+        for item in verification.rejected
+        if item.evidence_dimension is EvidenceDimension.WEB_NEWS
+    )
+    sources = {item.source for item in (*accepted, *rejected)}
+    return (
+        EventAttribute(key="web_source_count", value=len(sources)),
+        EventAttribute(key="web_accepted_count", value=len(accepted)),
+        EventAttribute(key="web_rejected_count", value=len(rejected)),
+    )
 
 
 def _build_working_state_update(
@@ -175,16 +281,25 @@ class ControlledConversationWorkflow:
         trace: TraceSink,
         budget: RunBudget | None = None,
         skill_catalog: SkillCatalogSnapshot | None = None,
+        skill_loader: SkillLoader | None = None,
+        skill_reranker: SkillRerankerPort | None = None,
+        skill_rerank_top_k: int | None = None,
     ) -> None:
         self._trace = trace
         self._budget = budget or RunBudget()
+        self._skill_loader = skill_loader
         catalog = skill_catalog or SkillCatalogSnapshot.empty()
+        self._skill_catalog = catalog
         tool_catalog = ToolGovernanceCatalog.default()
         self._services = _WorkflowServices(
             context=ContextBuilder(),
             entity=AuthoritativeEntityResolver(),
-            router=TwoStageRouter(catalog),
-            rewriter=RouteAwareRewriter(catalog),
+            router=TwoStageRouter(
+                catalog,
+                reranker=skill_reranker,
+                rerank_top_k=skill_rerank_top_k,
+            ),
+            rewriter=RouteAwareRewriter(catalog, skill_loader=skill_loader),
             permissions=ControlledPermissionResolver(
                 catalog=tool_catalog,
                 skill_catalog=catalog,
@@ -275,7 +390,80 @@ class ControlledConversationWorkflow:
                     EventAttribute(key="confidence", value=entity_result.confidence),
                 ),
             )
-            if entity_result.clarification:
+
+            # ENTITY_REQUIRED 可由 Skill input contract 给出更具体的槽位问题；实体歧义仍优先。
+            route_started = time.perf_counter()
+            route = self._services.router.route(
+                packet,
+                entity_result,
+                explicit_skill=request.explicit_skill,
+            )
+            invalid_explicit_skill = (
+                request.explicit_skill is not None
+                and route.route_source is RouteSource.USER_EXPLICIT
+                and route.family is RouteFamily.FALLBACK
+            )
+            if invalid_explicit_skill:
+                state.transition(RunPhase.ROUTED)
+                self._emit(
+                    events,
+                    context,
+                    StageName.ROUTE,
+                    StageStatus.SUCCEEDED,
+                    route_started,
+                    error_code=ErrorCode.INVALID_REQUEST,
+                    attributes=_route_trace_attributes(route, self._skill_catalog),
+                )
+                state.terminate(TerminalStatus.NEEDS_CLARIFICATION)
+                decision = ControllerDecision(
+                    action=ControllerAction.CLARIFY,
+                    reason="explicit skill is unavailable in the request snapshot",
+                    terminal_status=TerminalStatus.NEEDS_CLARIFICATION,
+                    retries_remaining=context.budget.max_tool_attempts,
+                    replans_remaining=context.budget.max_replans,
+                )
+                self._emit(
+                    events,
+                    context,
+                    StageName.CONTROLLER,
+                    StageStatus.SUCCEEDED,
+                    time.perf_counter(),
+                    error_code=ErrorCode.INVALID_REQUEST,
+                    attributes=(EventAttribute(key="action", value=decision.action.value),),
+                )
+                self._emit_terminal(
+                    events,
+                    context,
+                    TerminalStatus.NEEDS_CLARIFICATION,
+                    ErrorCode.INVALID_REQUEST,
+                )
+                return ConversationResult(
+                    status=TerminalStatus.NEEDS_CLARIFICATION,
+                    reply="所选分析 Skill 不存在或当前不可用，请重新选择。",
+                    context=context,
+                    events=tuple(events),
+                    entity=entity_result.entity,
+                    route=route,
+                    controller=decision,
+                    error_code=ErrorCode.INVALID_REQUEST,
+                    working_state_update=_build_working_state_update(
+                        entity_result,
+                        reset_segment=packet.reset_working_segment,
+                    ),
+                )
+            defer_entity_clarification = (
+                entity_result.error_code is ErrorCode.ENTITY_REQUIRED
+                and route.family is RouteFamily.FINANCIAL_SOP
+            )
+            ignore_entity_requirement = (
+                entity_result.error_code is ErrorCode.ENTITY_REQUIRED
+                and route.family is RouteFamily.FALLBACK
+            )
+            if (
+                entity_result.clarification
+                and not defer_entity_clarification
+                and not ignore_entity_requirement
+            ):
                 state.terminate(TerminalStatus.NEEDS_CLARIFICATION)
                 decision = ControllerDecision(
                     action=ControllerAction.CLARIFY,
@@ -312,26 +500,20 @@ class ControlledConversationWorkflow:
                     ),
                 )
 
-            started = time.perf_counter()
-            route = self._services.router.route(
-                packet,
-                entity_result,
-                explicit_skill=request.explicit_skill,
-            )
             state.transition(RunPhase.ROUTED)
             self._emit(
                 events,
                 context,
                 StageName.ROUTE,
                 StageStatus.SUCCEEDED,
-                started,
-                attributes=(
-                    EventAttribute(key="route_family", value=route.family.value),
-                    EventAttribute(key="confidence", value=route.confidence),
-                ),
+                route_started,
+                attributes=_route_trace_attributes(route, self._skill_catalog),
             )
 
             if route.requires_confirmation:
+                candidate_names = "、".join(
+                    item.skill_name for item in route.skill_confirmation.candidates
+                ) if route.skill_confirmation else "候选分析 Skill"
                 state.terminate(TerminalStatus.NEEDS_CLARIFICATION)
                 decision = ControllerDecision(
                     action=ControllerAction.CLARIFY,
@@ -356,13 +538,14 @@ class ControlledConversationWorkflow:
                 )
                 return ConversationResult(
                     status=TerminalStatus.NEEDS_CLARIFICATION,
-                    reply="我理解这可能是专业分析任务。请确认是否使用该分析 Skill 后继续。",
+                    reply=f"我识别到相邻的专业分析任务：{candidate_names}。请确认后继续。",
                     context=context,
                     events=tuple(events),
                     entity=entity_result.entity,
                     route=route,
                     controller=decision,
                     error_code=ErrorCode.ROUTE_CONFIRMATION_REQUIRED,
+                    skill_confirmation=route.skill_confirmation,
                     working_state_update=_build_working_state_update(
                         entity_result,
                         reset_segment=packet.reset_working_segment,
@@ -458,8 +641,29 @@ class ControlledConversationWorkflow:
                     route=route,
                 )
 
+            planner_context: LoadedSkillContext | None = None
+            synthesis_context: LoadedSkillContext | None = None
+            degrade_policy: DegradePolicy | None = None
+            if rewrite.kind is RewriteKind.FINANCIAL_SOP:
+                if self._skill_loader is None or rewrite.skill_name is None:
+                    raise RuntimeError("financial SOP requires a fixed SkillLoader snapshot")
+                # Planner 与 Synthesis 分别加载最小视图，但固定在同一 RegistrySnapshot。
+                planner_context = self._skill_loader.load_for_planner(
+                    rewrite.skill_name,
+                    query=rewrite.effective_query,
+                )
+                synthesis_context = self._skill_loader.load_for_synthesis(
+                    rewrite.skill_name,
+                    query=rewrite.effective_query,
+                )
+                synthesis_view = cast("SynthesisSkillView", synthesis_context.spec_view)
+                degrade_policy = synthesis_view.degrade_policy
+
             started = time.perf_counter()
-            permissions = self._services.permissions.resolve(rewrite)
+            permissions = self._services.permissions.resolve(
+                rewrite,
+                skill_context=planner_context,
+            )
             self._emit(
                 events,
                 context,
@@ -469,7 +673,15 @@ class ControlledConversationWorkflow:
                 attributes=(
                     EventAttribute(key="tool_count", value=len(permissions.allowed_tools)),
                     EventAttribute(key="permission_hash", value=permissions.snapshot_hash),
-                ),
+                    EventAttribute(key="selected_skill", value=permissions.skill_name or ""),
+                    EventAttribute(key="skill_version", value=permissions.skill_version),
+                    EventAttribute(key="skill_spec_hash", value=permissions.skill_spec_hash),
+                    EventAttribute(
+                        key="registry_snapshot_hash",
+                        value=permissions.registry_snapshot_hash,
+                    ),
+                )
+                + _reference_trace_attributes("planner", planner_context),
             )
 
             started = time.perf_counter()
@@ -477,6 +689,7 @@ class ControlledConversationWorkflow:
                 rewrite,
                 permissions,
                 trace_id=context.trace_id,
+                skill_context=planner_context,
             )
             state.transition(RunPhase.PLANNED)
             self._emit(
@@ -488,7 +701,9 @@ class ControlledConversationWorkflow:
                 attributes=(
                     EventAttribute(key="plan_id", value=plan.plan_id),
                     EventAttribute(key="step_count", value=len(plan.steps)),
-                ),
+                    EventAttribute(key="skill_spec_hash", value=plan.skill_spec_hash),
+                )
+                + _web_search_plan_trace_attributes(plan),
             )
 
             started = time.perf_counter()
@@ -594,7 +809,8 @@ class ControlledConversationWorkflow:
                         EventAttribute(key="missing_count", value=len(verification.missing_requirements)),
                         EventAttribute(key="claim_level", value=verification.claim_level.value),
                         EventAttribute(key="evidence_score", value=verification.score.total),
-                    ),
+                    )
+                    + _web_source_trace_attributes(verification),
                 )
 
                 started = time.perf_counter()
@@ -602,6 +818,7 @@ class ControlledConversationWorkflow:
                     verification,
                     budget=context.budget,
                     runtime=runtime,
+                    degrade_policy=degrade_policy,
                 )
                 self._emit_controller(events, context, decision, started)
                 if decision.action is not ControllerAction.REPLAN:
@@ -641,6 +858,7 @@ class ControlledConversationWorkflow:
                         verification,
                         budget=context.budget,
                         runtime=runtime,
+                        degrade_policy=degrade_policy,
                     )
                     self._emit_controller(
                         events,
@@ -714,11 +932,44 @@ class ControlledConversationWorkflow:
                     controller=decision,
                     tool_call_count=total_tool_calls,
                 )
+            if decision.terminal_status is TerminalStatus.NEEDS_CLARIFICATION:
+                state.terminate(TerminalStatus.NEEDS_CLARIFICATION)
+                self._emit_terminal(
+                    events,
+                    context,
+                    TerminalStatus.NEEDS_CLARIFICATION,
+                    ErrorCode.EVIDENCE_MISSING,
+                )
+                return ConversationResult(
+                    status=TerminalStatus.NEEDS_CLARIFICATION,
+                    reply="当前证据不足，请补充分析主体或时间范围后重试。",
+                    context=context,
+                    events=tuple(events),
+                    entity=rewrite.entity,
+                    route=route,
+                    plan=combined_plan,
+                    verification=verification,
+                    controller=decision,
+                    error_code=ErrorCode.EVIDENCE_MISSING,
+                    missing_dimensions=tuple(
+                        item.value for item in verification.missing_dimensions
+                    ),
+                    tool_call_count=total_tool_calls,
+                )
 
             started = time.perf_counter()
             state.transition(RunPhase.SYNTHESIZING)
             if decision.terminal_status is None:
                 raise RuntimeError("controller returned a non-terminal decision after evidence loop")
+            skill_guidance = (
+                build_skill_synthesis_guidance(
+                    synthesis_context,
+                    reply_preference=rewrite.reply_preference.hint,
+                    degrade_stage=decision.degrade_stage or "primary",
+                )
+                if synthesis_context is not None
+                else None
+            )
             pack = AnswerContextPack.create(
                 question=request.message,
                 effective_query=rewrite.effective_query,
@@ -730,6 +981,7 @@ class ControlledConversationWorkflow:
                 reply_preference=rewrite.reply_preference.hint,
                 selected_skill=rewrite.skill_name,
                 retrieved_memories=packet.retrieved_memories,
+                skill_guidance=skill_guidance,
             )
             reply = await self._services.synthesizer.synthesize(pack)
             self._emit(
@@ -740,6 +992,32 @@ class ControlledConversationWorkflow:
                 if decision.terminal_status is TerminalStatus.PARTIAL
                 else StageStatus.SUCCEEDED,
                 started,
+                attributes=(
+                    EventAttribute(key="selected_skill", value=rewrite.skill_name or ""),
+                    EventAttribute(
+                        key="skill_version",
+                        value=synthesis_context.skill_version if synthesis_context else "",
+                    ),
+                    EventAttribute(
+                        key="skill_spec_hash",
+                        value=synthesis_context.spec_hash if synthesis_context else "",
+                    ),
+                    EventAttribute(
+                        key="registry_snapshot_hash",
+                        value=(
+                            synthesis_context.registry_snapshot_hash
+                            if synthesis_context
+                            else self._skill_catalog.registry_snapshot_hash
+                            or self._skill_catalog.snapshot_hash
+                        ),
+                    ),
+                    EventAttribute(key="claim_level", value=verification.claim_level.value),
+                    EventAttribute(
+                        key="degrade_stage",
+                        value=decision.degrade_stage or "primary",
+                    ),
+                )
+                + _reference_trace_attributes("synthesis", synthesis_context),
             )
             state.terminate(decision.terminal_status)
             error_code = self._result_error_code(verification)
@@ -819,6 +1097,7 @@ class ControlledConversationWorkflow:
                 EventAttribute(key="action", value=decision.action.value),
                 EventAttribute(key="reason", value=decision.reason),
                 EventAttribute(key="replans_remaining", value=decision.replans_remaining),
+                EventAttribute(key="degrade_stage", value=decision.degrade_stage or ""),
             ),
         )
 

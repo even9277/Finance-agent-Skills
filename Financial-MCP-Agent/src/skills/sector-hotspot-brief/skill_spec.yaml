@@ -1,7 +1,57 @@
 skill_name: sector-hotspot-brief
 skill_family: financial-sop
 version: "1.0.0"
+depends_on_tools:
+  - get_sector_snapshot
+  - get_sector_constituents
+  - get_index_bars
+min_tool_schema_version: "1.0.0"
+output_schema_version: "1.0.0"
+skill_md_section_map:
+  purpose: Purpose
+  when_to_use: When to Use
+  when_not_to_use: When Not to Use
+  required_inputs: Required Inputs
+  workflow: Workflow
+  tool_use_guide: Tool Use Guide
+  evidence_rules: Evidence Rules
+  degrade_policy: Degrade Policy
+  output_contract: Output Contract
+  references: References
+requires_web_news: false
 execution_policy: deterministic
+route_metadata:
+  when_to_use:
+    - 用户要求对板块、行业、主题或指数做热点简报
+    - 用户询问板块强弱、领涨线索、成分联动和短期风险
+  when_not_to_use:
+    - 用户重点解释某个板块为何异动
+    - 用户只问静态概念或 ETF 筛选
+  positive_examples:
+    - 半导体板块今天热点简单说
+    - AI 应用板块最近有哪些领涨线索
+  negative_examples:
+    - 新能源板块今天为什么突然拉升
+    - 帮我筛几只半导体 ETF
+  supported_entity_types:
+    - sector
+    - industry
+    - theme
+    - index
+input_contract:
+  required_slots:
+    - sector_subject
+  optional_slots:
+    - index_code
+    - time_scope
+    - risk_preference
+  entity_cardinality: exactly_one
+  supported_entity_types:
+    - sector
+    - industry
+    - theme
+    - index
+  on_missing_slots: ask_clarification
 allowed_tools:
   - get_sector_snapshot
   - get_sector_constituents

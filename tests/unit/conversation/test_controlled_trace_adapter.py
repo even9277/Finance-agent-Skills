@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -32,6 +33,7 @@ from src.conversation.contracts import (  # noqa: E402
     WorkflowEvent,
 )
 from src.conversation.workflow import ControlledConversationWorkflow  # noqa: E402
+from src.skills.skill_registry import SkillRegistry  # noqa: E402
 from src.tools import skill_trace  # noqa: E402
 
 
@@ -160,5 +162,136 @@ def test_exporter_failure_does_not_change_controlled_business_result(
 
         assert outcome.status is TerminalStatus.SUCCEEDED
         assert _records(trace_path)[-1]["status"] == "ok"
+
+    asyncio.run(run_case())
+
+
+@pytest.mark.unit
+def test_skill_trace_links_route_assets_references_and_synthesis_without_raw_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """一次 Skill trace 必须只用版本、hash 和路径串起 route 到 synthesis。"""
+
+    async def run_case() -> None:
+        trace_path = tmp_path / "skill-version-chain.jsonl"
+        monkeypatch.setattr(skill_trace, "_JSONL_PATH", trace_path)
+        skill_trace.clear_trace_exporters()
+        registry = SkillRegistry()
+        catalog = registry.conversation_snapshot()
+        loader = registry.get_loader()
+        expected_planner = loader.load_for_planner(
+            "stock-first-pass",
+            query="帮我快速看一下贵州茅台基本面，值不值得继续跟踪",
+        )
+        expected_synthesis = loader.load_for_synthesis(
+            "stock-first-pass",
+            query="帮我快速看一下贵州茅台基本面，值不值得继续跟踪",
+        )
+        outcome = await ControlledChatUseCase(
+            workflow=ControlledConversationWorkflow(
+                model=FakeModelProvider(),
+                tool=FakeToolProvider(),
+                trace=SkillTraceSink(),
+                skill_catalog=catalog,
+                skill_loader=loader,
+            ),
+            repository=InMemoryConversationRepository(),
+        ).execute(
+            ChatCommand(
+                user_id="user-skill-trace",
+                session_id="session-skill-trace",
+                message="帮我快速看一下贵州茅台基本面，值不值得继续跟踪",
+                explicit_skill="stock-first-pass",
+            )
+        )
+
+        assert outcome.status is TerminalStatus.SUCCEEDED
+        spans = [item for item in _records(trace_path) if item["record_type"] == "span"]
+        by_stage = {item["stage"]: item for item in spans}
+        route = by_stage["route"]["data"]["attributes"]
+        permission = by_stage["permission"]["data"]["attributes"]
+        synthesis = by_stage["synthesis"]["data"]["attributes"]
+
+        assert route["selected_skill"] == "stock-first-pass"
+        assert route["skill_version"] == expected_planner.skill_version
+        assert route["registry_snapshot_hash"] == expected_planner.registry_snapshot_hash
+        assert route["confidence_band"] == "high"
+        assert route["candidate_names"] == "stock-first-pass"
+        assert permission["skill_spec_hash"] == expected_planner.spec_hash
+        assert permission["registry_snapshot_hash"] == expected_planner.registry_snapshot_hash
+        assert permission["planner_reference_count"] == len(expected_planner.references)
+        assert synthesis["selected_skill"] == "stock-first-pass"
+        assert synthesis["skill_spec_hash"] == expected_synthesis.spec_hash
+        assert synthesis["registry_snapshot_hash"] == expected_synthesis.registry_snapshot_hash
+        assert synthesis["claim_level"] == "ANALYTICAL"
+        for index, reference in enumerate(expected_planner.references, start=1):
+            assert permission[f"planner_reference_{index}_path"] == reference.path
+            assert permission[f"planner_reference_{index}_hash"] == reference.content_hash
+        for index, reference in enumerate(expected_synthesis.references, start=1):
+            assert synthesis[f"synthesis_reference_{index}_path"] == reference.path
+            assert synthesis[f"synthesis_reference_{index}_hash"] == reference.content_hash
+
+        trace_text = trace_path.read_text(encoding="utf-8")
+        assert "帮我快速看一下贵州茅台" not in trace_text
+        assert all(reference.content not in trace_text for reference in expected_planner.references)
+        assert all(reference.content not in trace_text for reference in expected_synthesis.references)
+
+    asyncio.run(run_case())
+
+
+@pytest.mark.unit
+def test_web_news_trace_records_query_hash_and_source_counts_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Web News 观测只能记录最小查询 hash 和来源计数，不得记录查询正文。"""
+
+    async def run_case() -> None:
+        trace_path = tmp_path / "web-search-summary.jsonl"
+        monkeypatch.setattr(skill_trace, "_JSONL_PATH", trace_path)
+        skill_trace.clear_trace_exporters()
+        registry = SkillRegistry()
+        outcome = await ControlledChatUseCase(
+            workflow=ControlledConversationWorkflow(
+                model=FakeModelProvider(),
+                tool=FakeToolProvider(),
+                trace=SkillTraceSink(),
+                skill_catalog=registry.conversation_snapshot(),
+                skill_loader=registry.get_loader(),
+            ),
+            repository=InMemoryConversationRepository(),
+        ).execute(
+            ChatCommand(
+                user_id="user-web-trace",
+                session_id="session-web-trace",
+                message="贵州茅台今天为什么跌，有什么消息",
+                explicit_skill="market-move-explain",
+            )
+        )
+
+        assert outcome.status is TerminalStatus.SUCCEEDED
+        assert outcome.workflow_result is not None
+        assert outcome.workflow_result.plan is not None
+        web_step = next(
+            item
+            for item in outcome.workflow_result.plan.steps
+            if item.tool_name == "search_web_news"
+        )
+        raw_query = str(next(item.value for item in web_step.arguments if item.name == "query"))
+        expected_hash = hashlib.sha256(raw_query.encode("utf-8")).hexdigest()
+        spans = [item for item in _records(trace_path) if item["record_type"] == "span"]
+        by_stage = {item["stage"]: item for item in spans}
+        plan = by_stage["plan"]["data"]["attributes"]
+        verify = by_stage["verify"]["data"]["attributes"]
+
+        assert plan["web_search_triggered"] is True
+        assert plan["web_query_hash"] == expected_hash
+        assert verify["web_source_count"] == 1
+        assert verify["web_accepted_count"] == 1
+        assert verify["web_rejected_count"] == 0
+        trace_text = trace_path.read_text(encoding="utf-8")
+        assert raw_query not in trace_text
+        assert "离线新闻线索" not in trace_text
 
     asyncio.run(run_case())

@@ -1,7 +1,68 @@
 skill_name: market-move-explain
 skill_family: financial-sop
-version: "1.0.0"
+version: "1.1.0"
+depends_on_tools:
+  - get_stock_basic_info
+  - get_market_bars
+  - get_index_bars
+  - get_sector_snapshot
+  - get_sector_constituents
+  - get_fund_basic_info
+  - get_etf_basic_info
+  - get_fund_market_bars
+  - search_web_news
+min_tool_schema_version: "1.0.0"
+output_schema_version: "1.0.0"
+skill_md_section_map:
+  purpose: Purpose
+  when_to_use: When to Use
+  when_not_to_use: When Not to Use
+  required_inputs: Required Inputs
+  workflow: Workflow
+  tool_use_guide: Tool Use Guide
+  evidence_rules: Evidence Rules
+  degrade_policy: Degrade Policy
+  output_contract: Output Contract
+  references: References
+requires_web_news: true
 execution_policy: deterministic
+route_metadata:
+  when_to_use:
+    - 用户解释股票、基金、ETF、指数或板块近期涨跌和异动原因
+    - 用户问为什么涨跌、今天为什么突然拉升或跳水
+  when_not_to_use:
+    - 用户要求筛选 ETF、比较基金或做单股基本面首轮研判
+    - 用户只问概念定义或投资方法论
+  positive_examples:
+    - 贵州茅台今天为什么跌，有什么消息
+    - 新能源板块今天为什么突然拉升
+  negative_examples:
+    - 黄金 ETF 是什么
+    - 帮我筛几只黄金 ETF
+  supported_entity_types:
+    - stock
+    - fund
+    - etf
+    - index
+    - sector
+    - theme
+input_contract:
+  required_slots:
+    - move_subject
+  optional_slots:
+    - entity_type
+    - time_scope
+    - sector_name
+    - index_code
+  entity_cardinality: exactly_one
+  supported_entity_types:
+    - stock
+    - fund
+    - etf
+    - index
+    - sector
+    - theme
+  on_missing_slots: ask_clarification
 allowed_tools:
   - get_stock_basic_info
   - get_market_bars
@@ -11,6 +72,7 @@ allowed_tools:
   - get_fund_basic_info
   - get_etf_basic_info
   - get_fund_market_bars
+  - search_web_news
 tool_plan_steps:
   - step: identify_stock_context
     tool: get_stock_basic_info
@@ -52,16 +114,25 @@ tool_plan_steps:
     required: false
     arguments:
       limit: 10
+  - step: scan_recent_web_news
+    tool: search_web_news
+    required: false
+    arguments:
+      max_results: 5
+      freshness_days: 7
 required_evidence:
   must_have_any:
     - stock_market
     - fund_daily
     - index_daily
     - sector_snapshot
+  optional:
+    - web_news
 output_template:
   default_section_order:
     - conclusion
     - confirmed_facts
+    - web_signals
     - possible_drivers
     - risks
     - sources
@@ -71,6 +142,7 @@ output_template:
         - risks
         - conclusion
         - confirmed_facts
+        - web_signals
         - possible_drivers
         - sources
       style_variant: risk_first

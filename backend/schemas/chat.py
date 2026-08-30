@@ -6,10 +6,34 @@ from typing import Optional
 from pydantic import BaseModel, Field, field_validator
 
 
+class SkillConfirmationCandidateResponse(BaseModel):
+    """公开确认卡可展示的单个 Skill 候选。"""
+
+    skill_name: str
+    confidence: float
+    version: str
+    reason: str
+
+
+class SkillConfirmationResponse(BaseModel):
+    """REST/WS 共用且不包含工具权限的 Skill 确认载荷。"""
+
+    candidates: list[SkillConfirmationCandidateResponse]
+    reason: str
+    registry_snapshot_hash: str
+
+
 class ChatMessageRequest(BaseModel):
     user_id: str = Field(..., min_length=1, description="用户唯一标识")
     message: str = Field(..., min_length=1, max_length=10_000, description="用户消息内容")
     session_id: Optional[str] = Field(None, description="会话ID，为空则创建新会话")
+    explicit_skill: Optional[str] = Field(
+        None,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$",
+        description="可选显式 Skill 标识；仍需服务端输入合同校验。",
+    )
 
     @field_validator("user_id", "message", mode="before")
     @classmethod
@@ -23,6 +47,14 @@ class ChatMessageRequest(BaseModel):
         """把空白 session_id 视为新会话，保持旧客户端兼容。"""
         if isinstance(value, str):
             return value.strip() or None
+        return value
+
+    @field_validator("explicit_skill", mode="before")
+    @classmethod
+    def _normalize_optional_explicit_skill(cls, value: object) -> object:
+        """把空白显式选择视为未选择，保持旧客户端兼容。"""
+        if isinstance(value, str):
+            return value.strip().lower() or None
         return value
 
 
@@ -62,6 +94,11 @@ class ChatMessageResponse(BaseModel):
         default=None,
         exclude_if=lambda value: value is None,
         description="仅在本轮识别为记忆命令时返回；普通聊天保持旧响应形状。",
+    )
+    skill_confirmation: Optional[SkillConfirmationResponse] = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description="仅在中置信 Skill 路由时返回；旧响应形状保持不变。",
     )
 
 

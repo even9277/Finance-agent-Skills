@@ -1,8 +1,9 @@
-"""实现受控工作流使用的真实 LLM、Tushare 和日志端口。"""
+"""实现受控工作流使用的真实 LLM 与统一只读工具端口。"""
 
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from dataclasses import asdict, is_dataclass
 from datetime import date, datetime
 from enum import Enum
@@ -19,7 +20,10 @@ from src.conversation.contracts import (
     ToolObservation,
 )
 from src.conversation.errors import ToolPermanentError, ToolTimeoutError, ToolTransientError
+from src.conversation.ports import ToolPort
 from src.tools.chat_tushare_tools import get_tushare_toolkit
+
+from .web_search import TavilyWebNewsProvider
 
 def _jsonable(value: Any) -> Any:
     """把不可变领域合同转换为仅用于模型输入的安全 JSON 值。"""
@@ -146,3 +150,31 @@ class TushareToolProvider:
             except ValueError:
                 continue
         return date.today()
+
+
+@dataclass(slots=True)
+class ReadOnlyToolProvider:
+    """在唯一 ToolPort 内按治理工具名分发市场数据与网页弱证据。"""
+
+    market: ToolPort
+    web_news: ToolPort
+
+    async def execute(self, call: ToolCall) -> ToolObservation:
+        """把已验收调用交给对应只读适配器。
+
+        Args:
+            call: 唯一 ControlledExecutor 生成的已授权调用。
+
+        Returns:
+            保持原调用身份和证据维度的归一化观察。
+        """
+        provider = self.web_news if call.tool_name == "search_web_news" else self.market
+        return await provider.execute(call)
+
+
+def build_read_only_tool_provider() -> ReadOnlyToolProvider:
+    """按进程配置装配生产只读工具，不在此处触发任何外部调用。"""
+    return ReadOnlyToolProvider(
+        market=TushareToolProvider(),
+        web_news=TavilyWebNewsProvider(),
+    )

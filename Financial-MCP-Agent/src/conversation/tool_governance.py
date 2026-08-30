@@ -22,6 +22,18 @@ _LIMIT = ToolInputSpec(
     minimum=1,
     maximum=100,
 )
+_MAX_RESULTS = ToolInputSpec(
+    name="max_results",
+    kind=ToolArgumentKind.INTEGER,
+    minimum=1,
+    maximum=10,
+)
+_FRESHNESS_DAYS = ToolInputSpec(
+    name="freshness_days",
+    kind=ToolArgumentKind.INTEGER,
+    minimum=1,
+    maximum=30,
+)
 
 
 def _policy(
@@ -29,15 +41,17 @@ def _policy(
     dimension: EvidenceDimension,
     entity_types: tuple[EntityType, ...],
     *fields: ToolInputSpec,
+    api_family: str = "tushare-read",
+    retryable: bool = True,
 ) -> ToolPolicy:
-    """构造同属 Tushare 只读族、允许瞬时重试的工具政策。"""
+    """构造显式 API 族和重试语义的只读工具政策。"""
     return ToolPolicy(
         tool_name=tool_name,
         evidence_dimension=dimension,
         supported_entity_types=entity_types,
         input_fields=tuple(fields),
-        api_family="tushare-read",
-        retryable=True,
+        api_family=api_family,
+        retryable=retryable,
     )
 
 
@@ -160,6 +174,15 @@ _DEFAULT_POLICIES = (
         _QUERY,
         _LIMIT,
     ),
+    _policy(
+        "search_web_news",
+        EvidenceDimension.WEB_NEWS,
+        tuple(EntityType),
+        _QUERY,
+        _MAX_RESULTS,
+        _FRESHNESS_DAYS,
+        api_family="web-search-read",
+    ),
 )
 
 
@@ -168,7 +191,7 @@ class ToolGovernanceCatalog:
     """保存版本化只读工具政策，不持有 SDK、凭证或可执行 handler。"""
 
     policies: tuple[ToolPolicy, ...]
-    version: str = "controlled-read-tools-v1"
+    version: str = "controlled-read-tools-v2"
 
     def __post_init__(self) -> None:
         names = tuple(item.tool_name for item in self.policies)
@@ -177,7 +200,7 @@ class ToolGovernanceCatalog:
 
     @classmethod
     def default(cls) -> ToolGovernanceCatalog:
-        """构建与当前 Chat Tushare 工具签名一致的只读目录。"""
+        """构建 Tushare 与 Web News 共享的版本化只读治理目录。"""
         return cls(policies=tuple(sorted(_DEFAULT_POLICIES, key=lambda item: item.tool_name)))
 
     def require(self, tool_name: str) -> ToolPolicy:
@@ -186,6 +209,10 @@ class ToolGovernanceCatalog:
             if policy.tool_name == tool_name:
                 return policy
         raise ContractViolationError(f"tool is absent from governance catalog: {tool_name}")
+
+    def contains(self, tool_name: str) -> bool:
+        """判断工具是否属于当前版本治理目录，不触发兼容或动态注册。"""
+        return any(policy.tool_name == tool_name for policy in self.policies)
 
     def select(self, tool_names: tuple[str, ...]) -> tuple[ToolPolicy, ...]:
         """按请求白名单选择政策并保持稳定排序。"""

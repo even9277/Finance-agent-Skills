@@ -55,7 +55,8 @@ class ControlledExecutor:
         if any(step_id not in by_id for layer in plan.execution_layers for step_id in layer):
             raise ContractViolationError("validated execution layers reference unknown steps")
 
-        semaphore = asyncio.Semaphore(context.budget.max_concurrency)
+        skill_limit = plan.plan.concurrency_limit or context.budget.max_concurrency
+        semaphore = asyncio.Semaphore(min(context.budget.max_concurrency, skill_limit))
         seen_actions: set[str] = set()
         observations: dict[str, ToolObservation] = {}
         tool_call_count = 0

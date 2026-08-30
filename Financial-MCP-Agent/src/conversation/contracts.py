@@ -138,6 +138,14 @@ class RouteStage1Outcome(StrEnum):
     MISS = "sop_miss"
 
 
+class RouteConfidenceBand(StrEnum):
+    """把路由分数收敛为执行、确认和回退三档。"""
+
+    HIGH = "high"
+    MID = "mid"
+    LOW = "low"
+
+
 class RewriteKind(StrEnum):
     """三路 Rewrite 的稳定判别字段。"""
 
@@ -187,6 +195,7 @@ class EvidenceDimension(StrEnum):
     INDEX_DAILY = "index_daily"
     SECTOR_SNAPSHOT = "sector_snapshot"
     SECTOR_CONSTITUENTS = "sector_constituents"
+    WEB_NEWS = "web_news"
 
 
 class StepStatus(StrEnum):
@@ -236,6 +245,7 @@ class EvidenceRejectionCode(StrEnum):
     ENTITY_MISMATCH = "ENTITY_MISMATCH"
     EMPTY_FACTS = "EMPTY_FACTS"
     INVALID_FACT = "INVALID_FACT"
+    FIELD_QUALITY = "FIELD_QUALITY"
     SOURCE_MISSING = "SOURCE_MISSING"
     STALE = "STALE"
     FUTURE_DATED = "FUTURE_DATED"
@@ -296,7 +306,7 @@ class RunBudget:
     max_steps: int = 16
     max_tool_attempts: int = 2
     max_replans: int = 1
-    max_plan_steps: int = 8
+    max_plan_steps: int = 16
     max_concurrency: int = 4
     per_tool_timeout_ms: int = 8_000
     total_tool_timeout_ms: int = 25_000
@@ -420,6 +430,7 @@ class RouteDecision:
     shortlist: tuple[str, ...] = ()
     requires_current_facts: bool = False
     fact_dimensions: tuple[str, ...] = ()
+    skill_confirmation: SkillConfirmation | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -513,6 +524,14 @@ class SkillDescriptor:
     execution_mode: str
     allowed_tools: tuple[str, ...]
     reference_paths: tuple[str, ...]
+    spec_hash: str = ""
+    document_hash: str = ""
+    reference_hash: str = ""
+    when_to_use: tuple[str, ...] = ()
+    when_not_to_use: tuple[str, ...] = ()
+    positive_examples: tuple[str, ...] = ()
+    negative_examples: tuple[str, ...] = ()
+    supported_entity_types: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -523,6 +542,11 @@ class SkillRoutingDescriptor:
     description: str
     version: str
     execution_mode: str
+    when_to_use: tuple[str, ...]
+    when_not_to_use: tuple[str, ...]
+    positive_examples: tuple[str, ...]
+    negative_examples: tuple[str, ...]
+    supported_entity_types: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -533,6 +557,8 @@ class SkillExecutionView:
     version: str
     execution_mode: str
     allowed_tools: tuple[str, ...]
+    spec_hash: str = ""
+    reference_hash: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -542,6 +568,7 @@ class SkillReferenceView:
     skill_name: str
     version: str
     reference_paths: tuple[str, ...]
+    reference_hash: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -551,6 +578,8 @@ class SkillCatalogSnapshot:
     version: str
     skills: tuple[SkillDescriptor, ...]
     snapshot_hash: str
+    registry_version: str = ""
+    registry_snapshot_hash: str = ""
 
     @classmethod
     def create(
@@ -558,12 +587,16 @@ class SkillCatalogSnapshot:
         *,
         version: str,
         skills: tuple[SkillDescriptor, ...],
+        registry_version: str = "",
+        registry_snapshot_hash: str = "",
     ) -> SkillCatalogSnapshot:
         """排序、去重并创建可审计 Skill 快照。
 
         Args:
             version: 快照构建合同版本。
             skills: Registry 已校验的 Skill 描述。
+            registry_version: 进程内原子 Registry 的发布版本。
+            registry_snapshot_hash: 请求固定的 Registry 内容哈希。
 
         Returns:
             名称排序稳定且带内容 hash 的不可变快照。
@@ -586,6 +619,14 @@ class SkillCatalogSnapshot:
                     item.execution_mode,
                     ",".join(item.allowed_tools),
                     ",".join(item.reference_paths),
+                    item.spec_hash,
+                    item.document_hash,
+                    item.reference_hash,
+                    ",".join(item.when_to_use),
+                    ",".join(item.when_not_to_use),
+                    ",".join(item.positive_examples),
+                    ",".join(item.negative_examples),
+                    ",".join(item.supported_entity_types),
                 )
             )
             for item in ordered
@@ -594,6 +635,8 @@ class SkillCatalogSnapshot:
             version=version,
             skills=ordered,
             snapshot_hash=hashlib.sha256(raw).hexdigest(),
+            registry_version=registry_version,
+            registry_snapshot_hash=registry_snapshot_hash,
         )
 
     @classmethod
@@ -616,6 +659,11 @@ class SkillCatalogSnapshot:
                 description=item.description,
                 version=item.version,
                 execution_mode=item.execution_mode,
+                when_to_use=item.when_to_use,
+                when_not_to_use=item.when_not_to_use,
+                positive_examples=item.positive_examples,
+                negative_examples=item.negative_examples,
+                supported_entity_types=item.supported_entity_types,
             )
             for item in self.skills
         )
@@ -628,6 +676,8 @@ class SkillCatalogSnapshot:
             version=item.version,
             execution_mode=item.execution_mode,
             allowed_tools=item.allowed_tools,
+            spec_hash=item.spec_hash,
+            reference_hash=item.reference_hash,
         )
 
     def reference_view(
@@ -654,6 +704,7 @@ class SkillCatalogSnapshot:
             skill_name=item.name,
             version=item.version,
             reference_paths=selected_paths,
+            reference_hash=item.reference_hash,
         )
 
 
@@ -666,6 +717,103 @@ class SkillMatch:
     outcome: RouteStage1Outcome
     shortlist: tuple[str, ...]
     reason: str
+    confidence_band: RouteConfidenceBand = RouteConfidenceBand.LOW
+    candidates: tuple[SkillRouteCandidate, ...] = ()
+    requires_confirmation: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class SkillRouteCandidate:
+    """Retriever 和可选 rerank 共享的 metadata-only 候选。"""
+
+    skill_name: str
+    version: str
+    description: str
+    score: float
+    reasons: tuple[str, ...]
+    when_to_use: tuple[str, ...] = ()
+    when_not_to_use: tuple[str, ...] = ()
+    positive_examples: tuple[str, ...] = ()
+    negative_examples: tuple[str, ...] = ()
+    supported_entity_types: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.skill_name.strip() or not self.version.strip():
+            raise ContractViolationError("rerank candidate identity must not be blank")
+        if not 0.0 <= self.score <= 1.0:
+            raise ContractViolationError("rerank candidate score must be between 0 and 1")
+
+
+@dataclass(frozen=True, slots=True)
+class SkillRerankRequest:
+    """限制在线 rerank 只能接收当前问题和 top-K 路由候选。"""
+
+    query: str
+    candidates: tuple[SkillRouteCandidate, ...]
+
+    def __post_init__(self) -> None:
+        if not self.query.strip():
+            raise ContractViolationError("rerank query must not be blank")
+        if not 1 <= len(self.candidates) <= 5:
+            raise ContractViolationError("rerank candidates must contain between 1 and 5 items")
+
+
+@dataclass(frozen=True, slots=True)
+class SkillRerankScore:
+    """在线 rerank 返回的单个候选归一化分数。"""
+
+    skill_name: str
+    score: float
+    reason: str
+
+    def __post_init__(self) -> None:
+        if not self.skill_name.strip() or not self.reason.strip():
+            raise ContractViolationError("rerank score identity and reason must not be blank")
+        if not 0.0 <= self.score <= 1.0:
+            raise ContractViolationError("rerank score must be between 0 and 1")
+
+
+@dataclass(frozen=True, slots=True)
+class SkillRerankResult:
+    """可插拔 rerank Provider 的有限结构化输出。"""
+
+    scores: tuple[SkillRerankScore, ...]
+
+    def __post_init__(self) -> None:
+        names = tuple(item.skill_name for item in self.scores)
+        if not names or len(names) != len(set(names)):
+            raise ContractViolationError("rerank result must contain unique candidates")
+
+
+@dataclass(frozen=True, slots=True)
+class SkillConfirmationCandidate:
+    """前端或旧文本客户端可展示的最小 Skill 确认候选。"""
+
+    skill_name: str
+    confidence: float
+    version: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        if not self.skill_name.strip() or not self.version.strip() or not self.reason.strip():
+            raise ContractViolationError("skill confirmation candidate must be complete")
+        if not 0.0 <= self.confidence <= 1.0:
+            raise ContractViolationError("skill confirmation confidence must be between 0 and 1")
+
+
+@dataclass(frozen=True, slots=True)
+class SkillConfirmation:
+    """中置信路由返回的、无需持久化 token 的确认载荷。"""
+
+    candidates: tuple[SkillConfirmationCandidate, ...]
+    reason: str
+    registry_snapshot_hash: str
+
+    def __post_init__(self) -> None:
+        if not self.candidates:
+            raise ContractViolationError("skill confirmation candidates must not be empty")
+        if not self.reason.strip():
+            raise ContractViolationError("skill confirmation reason must not be blank")
 
 
 ToolArgumentValue = str | int | float | bool
@@ -711,6 +859,10 @@ class ToolPermissionSnapshot:
     source: str
     version: str
     snapshot_hash: str
+    skill_name: str | None = None
+    skill_version: str = ""
+    skill_spec_hash: str = ""
+    registry_snapshot_hash: str = ""
 
     @property
     def allowed_tools(self) -> tuple[str, ...]:
@@ -731,6 +883,10 @@ class ToolPermissionSnapshot:
         permissions: tuple[ToolPolicy, ...],
         source: str,
         version: str,
+        skill_name: str | None = None,
+        skill_version: str = "",
+        skill_spec_hash: str = "",
+        registry_snapshot_hash: str = "",
     ) -> ToolPermissionSnapshot:
         """创建排序、去重且包含参数 Schema 的权限快照。
 
@@ -738,6 +894,10 @@ class ToolPermissionSnapshot:
             permissions: 从治理目录选择出的只读工具政策。
             source: 权限规则来源，必须是稳定低基数字符串。
             version: 工具治理合同版本。
+            skill_name: 可选的金融 SOP 稳定标识；普通数据路由为空。
+            skill_version: 请求固定的 Skill 语义版本。
+            skill_spec_hash: Planner 消费的机器规范内容哈希。
+            registry_snapshot_hash: 本请求固定的 Registry 内容哈希。
 
         Returns:
             可在计划、校验、执行和 Trace 中复核的不可变快照。
@@ -770,12 +930,26 @@ class ToolPermissionSnapshot:
             )
             for item in ordered
         )
-        payload = "|".join((source, version, raw)).encode()
+        payload = "|".join(
+            (
+                source,
+                version,
+                skill_name or "",
+                skill_version,
+                skill_spec_hash,
+                registry_snapshot_hash,
+                raw,
+            )
+        ).encode()
         return cls(
             permissions=ordered,
             source=source,
             version=version,
             snapshot_hash=hashlib.sha256(payload).hexdigest(),
+            skill_name=skill_name,
+            skill_version=skill_version,
+            skill_spec_hash=skill_spec_hash,
+            registry_snapshot_hash=registry_snapshot_hash,
         )
 
 
@@ -786,6 +960,29 @@ class EvidenceRequirement:
     dimension: EvidenceDimension
     required: bool
     entity_symbol: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SkillEvidenceContract:
+    """把 Skill spec 的证据组归一化为领域可执行合同。"""
+
+    must_have_all: tuple[EvidenceDimension, ...] = ()
+    must_have_any: tuple[EvidenceDimension, ...] = ()
+    per_symbol_must_have_any: tuple[EvidenceDimension, ...] = ()
+    optional: tuple[EvidenceDimension, ...] = ()
+    min_distinct_symbols: int | None = None
+
+    def __post_init__(self) -> None:
+        for dimensions in (
+            self.must_have_all,
+            self.must_have_any,
+            self.per_symbol_must_have_any,
+            self.optional,
+        ):
+            if len(dimensions) != len(set(dimensions)):
+                raise ContractViolationError("Skill evidence dimensions must be unique")
+        if self.min_distinct_symbols is not None and self.min_distinct_symbols < 1:
+            raise ContractViolationError("min_distinct_symbols must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -800,6 +997,7 @@ class ToolPlanStep:
     arguments: tuple[ToolArgument, ...] = ()
     idempotency_key: str = ""
     depends_on: tuple[str, ...] = ()
+    template_step: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -814,6 +1012,14 @@ class ToolPlan:
     route_family: RouteFamily = RouteFamily.TUSHARE_DATA
     objective: str = ""
     entities: tuple[Entity, ...] = ()
+    skill_name: str | None = None
+    skill_version: str = ""
+    skill_spec_hash: str = ""
+    registry_snapshot_hash: str = ""
+    evidence_contract: SkillEvidenceContract | None = None
+    concurrency_limit: int | None = None
+    candidate_expansion_top_n: int | None = None
+    candidate_expansion_tools: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -942,6 +1148,8 @@ class VerificationResult:
     recoverable: bool
     score: EvidenceScoreBreakdown
     hard_gate_failures: tuple[EvidenceRejectionCode, ...] = ()
+    missing_evidence_groups: tuple[str, ...] = ()
+    distinct_symbol_shortfall: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -961,6 +1169,7 @@ class ControllerDecision:
     terminal_status: TerminalStatus | None
     retries_remaining: int
     replans_remaining: int
+    degrade_stage: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -997,6 +1206,31 @@ class RejectedEvidenceSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class SkillReferenceGuidance:
+    """Synthesis 可见的静态参考片段；不得作为当前市场事实。"""
+
+    title: str
+    path: str
+    content: str
+    content_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class SkillSynthesisGuidance:
+    """从 synthesis view 投影出的输出、降级和静态参考指引。"""
+
+    skill_name: str
+    skill_version: str
+    spec_hash: str
+    reference_hash: str
+    registry_snapshot_hash: str
+    section_order: tuple[str, ...]
+    style_variant: str
+    degrade_stage: str
+    references: tuple[SkillReferenceGuidance, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class AnswerContextPack:
     """Synthesis 唯一允许消费的、只含 accepted evidence 的上下文。"""
 
@@ -1014,6 +1248,7 @@ class AnswerContextPack:
     reply_preference: str
     selected_skill: str | None
     retrieved_memories: tuple[MemoryContextItem, ...] = ()
+    skill_guidance: SkillSynthesisGuidance | None = None
 
     @property
     def entity(self) -> Entity | None:
@@ -1034,6 +1269,7 @@ class AnswerContextPack:
         reply_preference: str,
         selected_skill: str | None,
         retrieved_memories: tuple[MemoryContextItem, ...] = (),
+        skill_guidance: SkillSynthesisGuidance | None = None,
     ) -> AnswerContextPack:
         """从 Verifier 结果构造不含 rejected facts 的回答包。
 
@@ -1047,6 +1283,8 @@ class AnswerContextPack:
             constraints: 本轮已确认的业务约束摘要。
             reply_preference: 本轮回答风格提示。
             selected_skill: 可选的已确认 Skill 名称。
+            retrieved_memories: 仅影响表达偏好和历史语境的受控记忆片段。
+            skill_guidance: 可选的 synthesis-stage 输出/降级/reference 指引；不含工具权限。
 
         Returns:
             仅含 accepted facts 和无事实拒绝摘要的不可变上下文。
@@ -1075,6 +1313,7 @@ class AnswerContextPack:
             reply_preference=reply_preference,
             selected_skill=selected_skill,
             retrieved_memories=retrieved_memories,
+            skill_guidance=skill_guidance,
         )
 
 
@@ -1125,6 +1364,7 @@ class ConversationResult:
     verification: VerificationResult | None = None
     controller: ControllerDecision | None = None
     error_code: ErrorCode | None = None
+    skill_confirmation: SkillConfirmation | None = None
     missing_dimensions: tuple[str, ...] = ()
     tool_call_count: int = 0
     working_state_update: WorkingStateUpdate | None = None

@@ -34,6 +34,8 @@ from src.conversation.contracts import (  # noqa: E402
 )
 from src.conversation.workflow import ControlledConversationWorkflow  # noqa: E402
 from src.skills.skill_registry import SkillRegistry  # noqa: E402
+from src.skills.loader import SkillLoader  # noqa: E402
+from src.conversation.contracts import SkillCatalogSnapshot  # noqa: E402
 
 CASES_PATH = ROOT / "tests" / "fixtures" / "conversation" / "vertical_slice_cases.json"
 
@@ -43,6 +45,13 @@ def _load_cases() -> list[dict[str, Any]]:
     payload = json.loads(CASES_PATH.read_text(encoding="utf-8"))
     assert payload["fixture_version"] == "controlled-chat-vertical-slice-v1"
     return list(payload["cases"])
+
+
+def _skill_runtime() -> tuple[SkillCatalogSnapshot, SkillLoader]:
+    """从同一 RegistrySnapshot 生成对话目录和阶段 Loader。"""
+    registry = SkillRegistry()
+    runtime = registry.runtime_snapshot()
+    return registry.conversation_snapshot(runtime), registry.get_loader(runtime)
 
 
 @pytest.mark.e2e
@@ -215,11 +224,13 @@ def test_low_confidence_skill_route_clarifies_before_tools() -> None:
         model = FakeModelProvider()
         tool = FakeToolProvider()
         trace = InMemoryTraceSink()
+        skill_catalog, skill_loader = _skill_runtime()
         workflow = ControlledConversationWorkflow(
             model=model,
             tool=tool,
             trace=trace,
-            skill_catalog=SkillRegistry().conversation_snapshot(),
+            skill_catalog=skill_catalog,
+            skill_loader=skill_loader,
         )
         result = await ControlledChatUseCase(
             workflow=workflow,
@@ -257,11 +268,13 @@ def test_m4_sop_runs_validated_tools_before_baseline_evidence_stages() -> None:
         model = FakeModelProvider()
         tool = FakeToolProvider()
         trace = InMemoryTraceSink()
+        skill_catalog, skill_loader = _skill_runtime()
         workflow = ControlledConversationWorkflow(
             model=model,
             tool=tool,
             trace=trace,
-            skill_catalog=SkillRegistry().conversation_snapshot(),
+            skill_catalog=skill_catalog,
+            skill_loader=skill_loader,
         )
         result = await ControlledChatUseCase(
             workflow=workflow,
@@ -277,12 +290,15 @@ def test_m4_sop_runs_validated_tools_before_baseline_evidence_stages() -> None:
 
         assert result.status is TerminalStatus.SUCCEEDED
         assert result.route is not None and result.route.skill_name == "stock-first-pass"
-        assert result.tool_call_count == 3
+        assert result.tool_call_count == 6
         assert len(model.calls) == 1
         assert {call.tool_name for call in tool.calls} == {
             "get_stock_basic_info",
             "get_market_bars",
             "get_fina_indicator",
+            "get_income",
+            "get_balance_sheet",
+            "get_cashflow",
         }
         assert [event.stage.value for event in trace.events] == [
             "context",
@@ -379,11 +395,13 @@ def test_invalid_explicit_sop_subject_clarifies_before_planning() -> None:
 
     async def run_case() -> None:
         tool = FakeToolProvider()
+        skill_catalog, skill_loader = _skill_runtime()
         workflow = ControlledConversationWorkflow(
             model=FakeModelProvider(),
             tool=tool,
             trace=InMemoryTraceSink(),
-            skill_catalog=SkillRegistry().conversation_snapshot(),
+            skill_catalog=skill_catalog,
+            skill_loader=skill_loader,
         )
         result = await ControlledChatUseCase(
             workflow=workflow,
@@ -402,5 +420,42 @@ def test_invalid_explicit_sop_subject_clarifies_before_planning() -> None:
         assert result.error_code is ErrorCode.REWRITE_CLARIFICATION_REQUIRED
         assert tool.calls == []
         assert result.route is not None and result.route.skill_name == "fund-compare"
+
+    asyncio.run(run_case())
+
+
+@pytest.mark.e2e
+def test_unknown_explicit_skill_clarifies_without_tool_or_model_calls() -> None:
+    """不存在的显式 Skill 必须安全澄清，不能回退普通模型掩盖错误。"""
+
+    async def run_case() -> None:
+        tool = FakeToolProvider()
+        model = FakeModelProvider()
+        skill_catalog, skill_loader = _skill_runtime()
+        workflow = ControlledConversationWorkflow(
+            model=model,
+            tool=tool,
+            trace=InMemoryTraceSink(),
+            skill_catalog=skill_catalog,
+            skill_loader=skill_loader,
+        )
+        outcome = await ControlledChatUseCase(
+            workflow=workflow,
+            repository=InMemoryConversationRepository(),
+        ).execute(
+            ChatCommand(
+                user_id="user-m7",
+                session_id="session-explicit-unknown",
+                message="按这个分析",
+                explicit_skill="unknown-finance-skill",
+            )
+        )
+
+        assert outcome.status is TerminalStatus.NEEDS_CLARIFICATION
+        assert outcome.error_code is ErrorCode.INVALID_REQUEST
+        assert outcome.tool_call_count == 0
+        assert tool.calls == []
+        assert model.calls == []
+        assert "不存在" in outcome.reply or "不可用" in outcome.reply
 
     asyncio.run(run_case())

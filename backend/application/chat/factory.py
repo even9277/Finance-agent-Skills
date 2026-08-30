@@ -6,10 +6,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.infrastructure.chat.providers import (
     OpenAICompatibleModelProvider,
-    TushareToolProvider,
+    build_read_only_tool_provider,
 )
 from backend.infrastructure.chat.repository import SqlAlchemyConversationRepository
 from backend.infrastructure.chat.trace import SkillTraceSink
+from backend.infrastructure.chat.skill_rerank import build_skill_reranker
 from backend.infrastructure.memory.runtime import get_memory_cache
 from backend.infrastructure.memory.retrieval_repository import SqlAlchemyMemoryRetrievalRepository
 from backend.infrastructure.memory.semantic_provider import get_semantic_provider
@@ -19,7 +20,7 @@ from backend.application.memory.retrieval import MemoryRetrievalUseCase
 from backend.application.memory.commands import MemoryCommandUseCase
 from backend.config import settings
 from src.conversation.workflow import ControlledConversationWorkflow
-from src.skills.skill_registry import SkillRegistry
+from src.skills.skill_registry import get_skill_registry
 
 from .session_use_case import ChatSessionUseCase
 from .use_case import ControlledChatUseCase
@@ -28,11 +29,17 @@ from .use_case import ControlledChatUseCase
 def build_chat_use_case(db: AsyncSession) -> ControlledChatUseCase:
     """为一个请求数据库 Session 装配唯一受控聊天用例。"""
     repository = SqlAlchemyConversationRepository(db, cache=get_memory_cache())
+    # 进程级 Registry 保留最近一次合法快照；每个请求仍固定读取同一不可变 snapshot。
+    registry = get_skill_registry()
+    registry_snapshot = registry.runtime_snapshot()
     workflow = ControlledConversationWorkflow(
         model=OpenAICompatibleModelProvider(),
-        tool=TushareToolProvider(),
+        tool=build_read_only_tool_provider(),
         trace=SkillTraceSink(),
-        skill_catalog=SkillRegistry().conversation_snapshot(),
+        skill_catalog=registry.conversation_snapshot(registry_snapshot),
+        skill_loader=registry.get_loader(registry_snapshot),
+        skill_reranker=build_skill_reranker(),
+        skill_rerank_top_k=settings.skill_rerank_top_k,
     )
     retrieval = None
     if settings.enable_memory:

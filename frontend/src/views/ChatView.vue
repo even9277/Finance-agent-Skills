@@ -4,6 +4,7 @@ import AppLayout from '@/components/layout/AppLayout.vue'
 import ChatHistorySidebar from '@/components/chat/ChatHistorySidebar.vue'
 import ChatWindow from '@/components/chat/ChatWindow.vue'
 import ChatInput from '@/components/chat/ChatInput.vue'
+import SkillConfirmationCard from '@/components/chat/SkillConfirmationCard.vue'
 import TemplatePrompts from '@/components/chat/TemplatePrompts.vue'
 import MemorySidebar from '@/components/memory/MemorySidebar.vue'
 import { useChat } from '@/composables/useChat'
@@ -16,6 +17,7 @@ const userStore = useUserStore()
 const {
   templates,
   loadSessions, loadMessages, sendMessage, sendMessageStream,
+  confirmSkill, cancelSkillConfirmation,
   newSession, deleteSession, renameSession, loadTemplates,
 } = useChat()
 
@@ -180,6 +182,14 @@ async function handleViewSummaryHistory() {
       </div>
 
       <!-- 底部输入框 -->
+      <SkillConfirmationCard
+        v-if="chatStore.pendingSkillConfirmation"
+        :confirmation="chatStore.pendingSkillConfirmation.confirmation"
+        :disabled="chatStore.isSending || chatStore.isStreaming"
+        @confirm="confirmSkill"
+        @cancel="cancelSkillConfirmation"
+      />
+
       <ChatInput
         :disabled="chatStore.isSending || chatStore.isStreaming"
         :context-window="chatStore.currentContextWindow"

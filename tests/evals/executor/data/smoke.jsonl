@@ -1,3 +1,3 @@
-{"case_id":"executor_m4_001","behavior":"success","max_tool_attempts":2,"gold":{"tool_call_count":3,"statuses":["SUCCEEDED","SUCCEEDED","SUCCEEDED"]}}
-{"case_id":"executor_m4_002","behavior":"transient_once","max_tool_attempts":2,"gold":{"tool_call_count":4,"statuses":["SUCCEEDED","SUCCEEDED","SUCCEEDED"]}}
-{"case_id":"executor_m4_003","behavior":"permanent_market","max_tool_attempts":2,"gold":{"tool_call_count":3,"statuses":["SUCCEEDED","FAILED","SUCCEEDED"]}}
+{"case_id":"executor_m5_001","behavior":"success","max_tool_attempts":2,"gold":{"tool_call_count":6,"statuses":["SUCCEEDED","SUCCEEDED","SUCCEEDED","SUCCEEDED","SUCCEEDED","SUCCEEDED"]}}
+{"case_id":"executor_m5_002","behavior":"transient_once","max_tool_attempts":2,"gold":{"tool_call_count":7,"statuses":["SUCCEEDED","SUCCEEDED","SUCCEEDED","SUCCEEDED","SUCCEEDED","SUCCEEDED"]}}
+{"case_id":"executor_m5_003","behavior":"permanent_market","max_tool_attempts":2,"gold":{"tool_call_count":6,"statuses":["SUCCEEDED","FAILED","SUCCEEDED","SUCCEEDED","SUCCEEDED","SUCCEEDED"]}}

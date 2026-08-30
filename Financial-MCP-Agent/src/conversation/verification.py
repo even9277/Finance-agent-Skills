@@ -38,6 +38,7 @@ _FRESHNESS_DAYS: dict[EvidenceDimension, int] = {
     EvidenceDimension.BASIC_PROFILE: 3_650,
     EvidenceDimension.FUND_BASIC: 3_650,
     EvidenceDimension.ETF_BASIC: 3_650,
+    EvidenceDimension.WEB_NEWS: 31,
 }
 
 _HARD_GATE_CODES = frozenset(
@@ -48,6 +49,38 @@ _HARD_GATE_CODES = frozenset(
         EvidenceRejectionCode.CONFLICT,
     }
 )
+
+_QUALITY_FIELDS: dict[EvidenceDimension, frozenset[str]] = {
+    EvidenceDimension.BASIC_PROFILE: frozenset({"name", "ts_code", "symbol"}),
+    EvidenceDimension.MARKET_SNAPSHOT: frozenset({"close", "trade_date", "pct_change"}),
+    EvidenceDimension.FINANCIAL_INDICATOR: frozenset(
+        {"roe", "roa", "revenue", "net_profit", "grossprofit_margin", "debt_to_assets"}
+    ),
+    EvidenceDimension.INCOME_STATEMENT: frozenset(
+        {"revenue", "total_revenue", "n_income", "net_profit"}
+    ),
+    EvidenceDimension.BALANCE_SHEET: frozenset(
+        {"total_assets", "total_liab", "money_cap", "total_hldr_eqy_exc_min_int"}
+    ),
+    EvidenceDimension.CASHFLOW_STATEMENT: frozenset(
+        {"n_cashflow_act", "n_cashflow_inv_act", "n_cash_flows_fnc_act", "free_cashflow"}
+    ),
+    EvidenceDimension.FUND_BASIC: frozenset({"fund_name", "name", "ts_code"}),
+    EvidenceDimension.ETF_BASIC: frozenset({"fund_name", "name", "ts_code"}),
+    EvidenceDimension.FUND_NAV: frozenset({"unit_nav", "accum_nav", "nav_date"}),
+    EvidenceDimension.FUND_MARKET: frozenset({"close", "trade_date", "pct_change"}),
+    EvidenceDimension.FUND_SHARE: frozenset({"fd_share", "share", "trade_date"}),
+    EvidenceDimension.INDEX_DAILY: frozenset({"close", "trade_date", "pct_change"}),
+    EvidenceDimension.SECTOR_SNAPSHOT: frozenset(
+        {"pct_change", "close", "trade_date", "up_count", "down_count"}
+    ),
+    EvidenceDimension.SECTOR_CONSTITUENTS: frozenset(
+        {"constituent", "symbol", "ts_code", "name"}
+    ),
+    EvidenceDimension.WEB_NEWS: frozenset(
+        {"title", "url", "domain", "summary", "published_at", "retrieved_at"}
+    ),
+}
 
 
 class EvidenceVerifier:
@@ -88,7 +121,13 @@ class EvidenceVerifier:
         accepted, conflicts = self._reject_conflicts(tuple(accepted_candidates))
         rejected.extend(conflicts)
         missing = self._missing_requirements(plan.requirements, accepted)
-        missing_dimensions = tuple(dict.fromkeys(item.dimension for item in missing))
+        missing_groups, group_dimensions, distinct_shortfall = self._missing_skill_groups(
+            plan,
+            accepted,
+        )
+        missing_dimensions = tuple(
+            dict.fromkeys((*tuple(item.dimension for item in missing), *group_dimensions))
+        )
         hard_failures = tuple(
             dict.fromkeys(
                 code
@@ -97,7 +136,18 @@ class EvidenceVerifier:
                 and code in _HARD_GATE_CODES
             )
         )
-        if accepted and not missing and not hard_failures:
+        has_strong_evidence = any(
+            item.evidence_dimension is not EvidenceDimension.WEB_NEWS
+            for item in accepted
+        )
+        if (
+            accepted
+            and has_strong_evidence
+            and not missing
+            and not missing_groups
+            and distinct_shortfall == 0
+            and not hard_failures
+        ):
             claim_level = ClaimLevel.ANALYTICAL
         elif accepted:
             claim_level = ClaimLevel.DESCRIPTIVE
@@ -109,13 +159,15 @@ class EvidenceVerifier:
             missing_dimensions=missing_dimensions,
             missing_requirements=missing,
             claim_level=claim_level,
-            recoverable=bool(missing),
+            recoverable=bool(missing or missing_groups or distinct_shortfall),
             score=self._score(
                 requirements=plan.requirements,
                 accepted=accepted,
                 rejected=tuple(rejected),
             ),
             hard_gate_failures=hard_failures,
+            missing_evidence_groups=missing_groups,
+            distinct_symbol_shortfall=distinct_shortfall,
         )
 
     def _normalize(
@@ -131,6 +183,7 @@ class EvidenceVerifier:
             step=step,
             observation=observation,
             freshness_days=freshness_days,
+            enforce_field_quality=plan.evidence_contract is not None,
         )
         role = (
             EvidenceRole.REQUIRED
@@ -174,6 +227,7 @@ class EvidenceVerifier:
         step: ToolPlanStep | None,
         observation: ToolObservation,
         freshness_days: int,
+        enforce_field_quality: bool,
     ) -> EvidenceRejectionCode | None:
         if observation.status is not StepStatus.SUCCEEDED:
             return EvidenceRejectionCode.STEP_FAILED
@@ -196,7 +250,62 @@ class EvidenceVerifier:
             return EvidenceRejectionCode.FUTURE_DATED
         if freshness_days > _FRESHNESS_DAYS[observation.evidence_dimension]:
             return EvidenceRejectionCode.STALE
+        if enforce_field_quality:
+            expected = _QUALITY_FIELDS[observation.evidence_dimension]
+            actual = {
+                item.key.strip().lower().rsplit(".", maxsplit=1)[-1]
+                for item in observation.facts
+            }
+            if not actual.intersection(expected):
+                return EvidenceRejectionCode.FIELD_QUALITY
         return None
+
+    @staticmethod
+    def _missing_skill_groups(
+        plan: ToolPlan,
+        accepted: tuple[EvidenceEnvelope, ...],
+    ) -> tuple[tuple[str, ...], tuple[EvidenceDimension, ...], int]:
+        """验收 Skill 的 any/per-symbol/min-distinct 证据组。
+
+        Args:
+            plan: 带可选 Skill 证据合同的当前合并计划。
+            accepted: 已通过单条证据硬门控和冲突检查的证据。
+
+        Returns:
+            稳定缺口标识、缺失维度并集和最小主体数差额。
+        """
+        contract = plan.evidence_contract
+        if contract is None:
+            return (), (), 0
+        groups: list[str] = []
+        dimensions: list[EvidenceDimension] = []
+        accepted_dimensions = {item.evidence_dimension for item in accepted}
+        for dimension in contract.must_have_all:
+            if dimension not in accepted_dimensions:
+                groups.append(f"must_have_all:{dimension.value}")
+                dimensions.append(dimension)
+        if contract.must_have_any and not accepted_dimensions.intersection(contract.must_have_any):
+            groups.append("must_have_any")
+            dimensions.extend(contract.must_have_any)
+        if contract.per_symbol_must_have_any:
+            for entity in plan.entities:
+                if not entity.symbol:
+                    continue
+                if not any(
+                    item.entity_symbol == entity.symbol
+                    and item.evidence_dimension in contract.per_symbol_must_have_any
+                    for item in accepted
+                ):
+                    groups.append(f"per_symbol:{entity.symbol}")
+                    dimensions.extend(contract.per_symbol_must_have_any)
+        accepted_symbols = {item.entity_symbol for item in accepted if item.entity_symbol}
+        distinct_shortfall = max(
+            0,
+            (contract.min_distinct_symbols or 0) - len(accepted_symbols),
+        )
+        if distinct_shortfall:
+            groups.append("min_distinct_symbols")
+        return tuple(groups), tuple(dict.fromkeys(dimensions)), distinct_shortfall
 
     @staticmethod
     def _quality_score(observation: ToolObservation) -> int:

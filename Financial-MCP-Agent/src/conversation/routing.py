@@ -10,8 +10,12 @@ from .contracts import (
     RouteSource,
     RouteStage1Outcome,
     SkillCatalogSnapshot,
+    SkillConfirmation,
+    SkillConfirmationCandidate,
+    SkillRouteCandidate,
 )
 from .errors import ContractViolationError
+from .ports import SkillRerankerPort
 from .skill_discovery import SkillDiscovery
 
 _CURRENT_FACT_HINTS = (
@@ -38,9 +42,19 @@ _STATIC_CONCEPT_HINTS = ("区别", "是什么", "概念", "原理", "方法", "�
 class TwoStageRouter:
     """先选择高价值 SOP，再判断是否需要当前可核对金融事实。"""
 
-    def __init__(self, snapshot: SkillCatalogSnapshot) -> None:
+    def __init__(
+        self,
+        snapshot: SkillCatalogSnapshot,
+        *,
+        reranker: SkillRerankerPort | None = None,
+        rerank_top_k: int | None = None,
+    ) -> None:
         self._snapshot = snapshot
-        self._discovery = SkillDiscovery(snapshot)
+        self._discovery = SkillDiscovery(
+            snapshot,
+            reranker=reranker,
+            top_k=rerank_top_k,
+        )
 
     def route(
         self,
@@ -86,11 +100,20 @@ class TwoStageRouter:
         if not entities and entity_result.entity is not None:
             entities = (entity_result.entity,)
         stage1 = self._discovery.discover(packet.current_message, entities=entities)
-        if stage1.outcome is not RouteStage1Outcome.MISS and stage1.skill_name:
-            low_confidence = stage1.outcome is RouteStage1Outcome.HIT_LOW
+        if stage1.outcome is not RouteStage1Outcome.MISS:
+            low_confidence = stage1.requires_confirmation
+            confirmation = (
+                self._build_confirmation(stage1.candidates, stage1.reason)
+                if low_confidence
+                else None
+            )
             return RouteDecision(
                 family=RouteFamily.FINANCIAL_SOP,
-                analysis_mode=stage1.skill_name.replace("-", "_"),
+                analysis_mode=(
+                    stage1.skill_name.replace("-", "_")
+                    if stage1.skill_name
+                    else "skill_confirmation"
+                ),
                 confidence=stage1.confidence,
                 reason=stage1.reason,
                 skill_name=stage1.skill_name,
@@ -99,9 +122,32 @@ class TwoStageRouter:
                 stage1_outcome=stage1.outcome,
                 shortlist=stage1.shortlist,
                 requires_current_facts=True,
+                skill_confirmation=confirmation,
             )
 
         return self._route_stage2(packet, entity_result, stage1.shortlist)
+
+    def _build_confirmation(
+        self,
+        candidates: tuple[SkillRouteCandidate, ...],
+        reason: str,
+    ) -> SkillConfirmation:
+        """把 metadata 候选投影为不含工具和正文的确认载荷。"""
+        return SkillConfirmation(
+            candidates=tuple(
+                SkillConfirmationCandidate(
+                    skill_name=item.skill_name,
+                    confidence=item.score,
+                    version=item.version,
+                    reason="; ".join(item.reasons),
+                )
+                for item in candidates
+            ),
+            reason=reason,
+            registry_snapshot_hash=(
+                self._snapshot.registry_snapshot_hash or self._snapshot.snapshot_hash
+            ),
+        )
 
     @staticmethod
     def _route_stage2(

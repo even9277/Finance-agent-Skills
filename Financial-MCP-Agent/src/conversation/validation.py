@@ -47,6 +47,25 @@ class PlanValidator:
                     "plan exceeds the request step budget",
                 )
             )
+        if plan.concurrency_limit is not None and plan.concurrency_limit < 1:
+            issues.append(
+                self._issue(
+                    ValidationIssueCode.STEP_LIMIT_EXCEEDED,
+                    "Skill concurrency limit must be positive",
+                )
+            )
+        if plan.skill_name is not None and (
+            plan.skill_name != permissions.skill_name
+            or plan.skill_version != permissions.skill_version
+            or plan.skill_spec_hash != permissions.skill_spec_hash
+            or plan.registry_snapshot_hash != permissions.registry_snapshot_hash
+        ):
+            issues.append(
+                self._issue(
+                    ValidationIssueCode.TOOL_NOT_ALLOWED,
+                    "Skill plan identity differs from the frozen permission snapshot",
+                )
+            )
 
         step_ids = tuple(step.step_id for step in plan.steps)
         known_steps = set(step_ids)
@@ -133,6 +152,8 @@ class PlanValidator:
                     )
                 )
 
+        issues.extend(self._validate_skill_evidence_contract(plan))
+
         if issues:
             return PlanValidationResult(
                 is_valid=False,
@@ -148,6 +169,62 @@ class PlanValidator:
                 execution_layers=self._execution_layers(plan),
             ),
         )
+
+    def _validate_skill_evidence_contract(self, plan: ToolPlan) -> list[ValidationIssue]:
+        """验证 Skill 证据组在执行前已被计划节点覆盖。
+
+        Args:
+            plan: 带可选 `SkillEvidenceContract` 的未执行计划。
+
+        Returns:
+            必需证据组、主体覆盖或最小主体数不足的结构化问题。
+        """
+        contract = plan.evidence_contract
+        if contract is None:
+            return []
+        issues: list[ValidationIssue] = []
+        dimensions = {step.evidence_dimension for step in plan.steps}
+        for dimension in contract.must_have_all:
+            if dimension not in dimensions:
+                issues.append(
+                    self._issue(
+                        ValidationIssueCode.MISSING_REQUIRED_EVIDENCE,
+                        "Skill must-have-all evidence is absent from the plan",
+                    )
+                )
+        if contract.must_have_any and not dimensions.intersection(contract.must_have_any):
+            issues.append(
+                self._issue(
+                    ValidationIssueCode.MISSING_REQUIRED_EVIDENCE,
+                    "Skill must-have-any evidence group is absent from the plan",
+                )
+            )
+        if contract.per_symbol_must_have_any:
+            symbols = tuple(dict.fromkeys(item.symbol for item in plan.entities if item.symbol))
+            for symbol in symbols:
+                if not any(
+                    step.symbol == symbol
+                    and step.evidence_dimension in contract.per_symbol_must_have_any
+                    for step in plan.steps
+                ):
+                    issues.append(
+                        self._issue(
+                            ValidationIssueCode.MISSING_REQUIRED_EVIDENCE,
+                            "Skill per-symbol evidence group is absent from the plan",
+                        )
+                    )
+        if (
+            contract.min_distinct_symbols is not None
+            and len({item.symbol for item in plan.entities if item.symbol})
+            < contract.min_distinct_symbols
+        ):
+            issues.append(
+                self._issue(
+                    ValidationIssueCode.MISSING_REQUIRED_EVIDENCE,
+                    "Skill plan has fewer authoritative subjects than required",
+                )
+            )
+        return issues
 
     def _validate_arguments(
         self,
