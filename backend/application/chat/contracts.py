@@ -12,6 +12,7 @@ from src.conversation.contracts import (
     Entity,
     ErrorCode,
     RouteDecision,
+    SkillConfirmation,
     TerminalStatus,
     VerificationResult,
 )
@@ -71,6 +72,7 @@ class ChatOutcome:
     context_window: ChatContextWindowData | None = None
     workflow_result: ConversationResult | None = None
     memory_command: MemoryCommandResult | None = None
+    skill_confirmation: SkillConfirmation | None = None
 
     @property
     def context(self) -> ConversationRunContext:

@@ -1,7 +1,7 @@
 # 受控对话主链：面试口径与当前实现映射
 
-> 状态：M8 最终事实核对
-> 日期：2026-08-24
+> 状态：Skills SOP Milestone 9 最终事实核对
+> 日期：2026-08-30
 > 当前实现真相源：`Finance-agent-Skills`
 > 历史证据源：`Finance/金融Agent项目描述文档/成果点-对话模式与工具治理-完整阐述.md`、`Finance/金融Agent项目描述文档/对话模式与可观测与skills.md`
 
@@ -86,11 +86,11 @@ Vue Chat UI
 ### 4.4 两阶段路由与 Skill 激活
 
 - **面试口径**：Stage1 做 SOP shortlist + rerank + confidence gate；Stage2 按是否必须依赖当前事实区分 `tushare-data/fallback`；显式 Skill 是高优先级真源。
-- **当前状态**：`IMPLEMENTED_WITH_LIMITATIONS`。
-- **当前设计**：`TwoStageRouter` 已固定两阶段职责；`SkillDiscovery` 对 5 个 Skill 做确定性规则匹配，高置信自动进入、低置信返回文字澄清；Stage2 区分静态概念和当前金融事实。Application 合同支持 `explicit_skill`。
-- **证据**：`Financial-MCP-Agent/src/conversation/routing.py`、`skill_discovery.py`、`tests/evals/route/`、`tests/evals/skill_activation/`。
-- **缺口**：当前没有 LLM rerank、top1/top2 margin 校准或真实 150×3 数据集；公开 REST/WS Schema 没有 `explicit_skill` 字段，前端也没有 `skill_confirm` 确认卡，所以显式选择目前仅是内部合同能力。
-- **安全口径**：应表述为“确定性规则基线 + Typed 两阶段路由 + 文字澄清”；LLM rerank 和确认卡是待增强能力。
+- **当前状态**：默认确定性链路与公开确认闭环为 `VERIFIED_IMPLEMENTED`；在线 rerank 效果为 `IMPLEMENTED_WITH_LIMITATIONS`。
+- **当前设计**：`TwoStageRouter` 固定两阶段职责；`SkillDiscovery` 对 5 个 Skill 使用资产 metadata、稳定规则、集中阈值与 top1/top2 margin，高置信自动进入、中置信返回 typed 候选确认、未命中再区分 `tushare-data/fallback`。可选 OpenAI-compatible reranker 只能重排 top-K typed candidates，默认关闭且失败回退确定性结果。REST/WS Schema、前端确认卡和同 session `explicit_skill` 重提已经闭环。
+- **证据**：`Financial-MCP-Agent/src/conversation/routing.py`、`skill_discovery.py`、`backend/infrastructure/chat/skill_rerank.py`、`tests/unit/conversation/test_skill_routing_m4.py`、`tests/contract/test_skill_confirmation_public_contract.py`、frontend Vitest。
+- **缺口**：没有默认在线 LLM rerank、生产流量校准或历史 150×3 数据集；当前 15×3 基线不能替代历史口径。
+- **安全口径**：可以讲“确定性可复现基线 + 可插拔 typed rerank + high/mid/miss gate + 公共确认闭环”；不能说默认请求都会调用 rerank 模型。
 
 ### 4.5 Route-specific Rewrite、约束与回答偏好
 
@@ -113,19 +113,19 @@ Vue Chat UI
 ### 4.7 Skill Registry、Loader 与五个金融 SOP
 
 - **面试口径**：5 个 SOP 用 `SKILL.md + skill_spec.yaml + references + tests` 表达；Registry 启动校验；路由、规划和总结按阶段渐进加载。
-- **当前状态**：`IMPLEMENTED_WITH_LIMITATIONS`。
-- **当前设计**：`SkillRegistry().conversation_snapshot()` 为每轮 Workflow 提供冻结 `SkillCatalogSnapshot`；合同把 routing view、execution view 和 reference view 分开；五个 Skill 可被发现并约束权限/数据需求。
-- **证据**：`Financial-MCP-Agent/src/skills/skill_registry.py`、`Financial-MCP-Agent/src/skills/financial-sop/`、`Financial-MCP-Agent/src/conversation/contracts.py`、`tests/contract/test_skill_catalog_contract.py`。
-- **缺口**：没有完整 lifecycle 状态机、shadow/canary、last-known-good 热切换、reference BM25/embedding 或 ScriptToolSpec；不能把这些设计说成已上线。
-- **安全口径**：可以说“已有冻结快照和分阶段视图，5 个 SOP 已进入同一主链”；生命周期和热更新是后续治理设计。
+- **当前状态**：Schema Gate、进程级 Registry/LKG、请求快照、ReferenceIndex 和三阶段 Loader 为 `VERIFIED_IMPLEMENTED`；发布平台为 `DEFERRED_NOT_IMPLEMENTED`。
+- **当前设计**：五个目录均包含 `SKILL.md + skill_spec.yaml + references + tests`。Registry 扫描 workspace/vendor 后执行 typed Gate，候选完整通过才原子发布；失败保持 active/LKG。生产 factory 复用进程级 Registry，每轮再固定不可变 `RegistrySnapshot`；routing/rewrite/planner/synthesis 只得到各自最小视图和有界 reference path/content/hash。
+- **证据**：`Financial-MCP-Agent/src/skills/{schema_gate,lifecycle,snapshot,reference_index,loader,skill_registry}.py`、五个 Skill 目录、`tests/unit/skills/`、`tests/contract/test_skill_assets_v2_contract.py`。
+- **缺口**：没有 shadow/canary 管理平台、embedding/BM25 混排或 ScriptToolSpec 沙箱；LKG 是进程内，不是跨实例持久化控制面。
+- **安全口径**：可以完整讲 Gate→Snapshot/LKG→请求快照→分阶段 Loader；不能扩展为已上线的多实例发布平台。
 
 ### 4.8 工具发现、动态白名单与权限快照
 
 - **面试口径**：Capability Index、Executable Registry、当前轮 shortlist、Skill `allowed_tools` 和健康状态求交，形成版本化权限快照。
 - **当前状态**：`IMPLEMENTED_WITH_LIMITATIONS`。
-- **当前设计**：`ToolGovernanceCatalog` 维护 15 个只读工具 Typed Schema；`ControlledPermissionResolver` 根据 rewrite 需求和 Skill 执行视图求交，并生成带 hash 的请求级 `ToolPermissionSnapshot`；Planner 和 Validator 共用该快照。
+- **当前设计**：`ToolGovernanceCatalog` 维护只读工具 Typed Schema（含 `search_web_news`）；`ControlledPermissionResolver` 根据 rewrite 需求和 Skill 执行视图求交，并生成带 hash 的请求级 `ToolPermissionSnapshot`；Planner 和 Validator 共用该快照。
 - **证据**：`Financial-MCP-Agent/src/conversation/tool_governance.py`、`permissions.py`、`tests/unit/conversation/test_tool_governance.py`。
-- **缺口**：没有扫描 vendor 文档生成完整 capability index；没有按实时健康、权限等级、freshness 动态过滤；`search_web_news` 不在当前治理目录和生产 Provider 中。
+- **缺口**：没有把全部 vendor 文档自动提升为可执行 capability，也没有按实时健康、租户权限和 freshness 动态过滤；Web News 默认关闭且受独立配额约束。
 - **安全口径**：可以说“已实现静态治理目录 + 请求级冻结白名单”；不能说“全量 Tushare capability 自动索引和健康感知 discovery 已上线”。
 
 ### 4.9 Planner 与 Plan Validator
@@ -152,8 +152,8 @@ Vue Chat UI
 - **当前状态**：`VERIFIED_IMPLEMENTED`。
 - **当前设计**：Provider 先把结果转换为 `ToolObservation`；`EvidenceVerifier` 再归一化为 `EvidenceEnvelope`，执行主体、时效、证据维度、角色、质量和冲突检查，并输出 `ANALYTICAL/DESCRIPTIVE/REFUSE` 结论级别。HTTP 200 的空 payload、错主体和陈旧证据不能被静默接受。
 - **证据**：`Financial-MCP-Agent/src/conversation/verification.py`、`contracts.py`、`tests/unit/conversation/test_evidence_control_synthesis.py`、`tests/evals/verifier/`。
-- **限制**：当前生产目录没有网页新闻证据，因此“弱新闻与行情强证据冲突治理”只属于设计口径；Skill-specific degrade policy 目前主要收敛为统一 claim level。
-- **安全口径**：可以完整讲 Evidence/Verifier 主链，但要把网页新闻分层说明为未接入能力。
+- **限制**：Web News 已作为 optional weak evidence 接入，但默认关闭；它不能单独形成分析结论，也没有多源事实图或模型 Judge。Skill-specific degrade policy 已进入 Controller/Synthesis，但可用备用数据源仍有限。
+- **安全口径**：可以完整讲强行情证据、弱新闻、claim level 和 Skill degrade；不能把网页摘要说成确定因果。
 
 ### 4.12 Controller 与有界 Replanner
 
@@ -176,11 +176,11 @@ Vue Chat UI
 ### 4.14 前端、REST 与 WebSocket 事件
 
 - **面试口径**：前端展示流式 token、route summary、plan preview、step status、verification 和 skill confirm 卡片。
-- **当前状态**：REST/WS 单主链为 `VERIFIED_IMPLEMENTED`；丰富控制事件为 `DEFERRED_NOT_IMPLEMENTED`。
-- **当前设计**：前端已支持会话、消息、摘要、上下文窗口、画像和 WebSocket；WS 发送 `session_id → 一段最终回答文本 → context_update → done`，异常返回稳定码和安全文案。
-- **证据**：`backend/routers/chat.py`、`frontend/src/composables/useChat.ts`、`frontend/src/stores/chatStore.ts`、`tests/contract/test_controlled_chat_contract.py`。
-- **缺口**：不是 Provider 逐 token streaming；没有 `plan_preview/step_status/verification_summary/skill_confirm` 产品卡片；内部 `WorkflowEvent` 目前送往 Trace，不作为公开 WS 事件协议。
-- **安全口径**：应说“REST/WS 已共用业务用例，WS 是兼容终态文本帧”；不要演示不存在的控制卡片。
+- **当前状态**：REST/WS 单主链与 `skill_confirm` 为 `VERIFIED_IMPLEMENTED`；plan/step/verification 卡片为 `DEFERRED_NOT_IMPLEMENTED`。
+- **当前设计**：请求支持 optional `explicit_skill`；中置信 WS 返回 typed `skill_confirm`，前端展示候选/原因/版本并支持确认或取消。确认在同一 session 重提请求且不重复用户消息；取消 0 request。普通回答仍发送兼容终态文本、`context_update` 和 `done`。
+- **证据**：`backend/routers/chat.py`、`backend/schemas/chat.py`、`frontend/src/composables/useChat.ts`、`frontend/src/stores/chatStore.ts`、确认组件、`tests/contract/test_skill_confirmation_public_contract.py` 和 frontend Vitest。
+- **缺口**：不是 Provider 逐 token streaming；没有 `plan_preview/step_status/verification_summary` 产品卡片；大多数内部 `WorkflowEvent` 仍只进入 Trace。
+- **安全口径**：可以演示 Skill 确认卡；不要把它扩展成不存在的完整执行控制台。
 
 ### 4.15 持久化、鉴权、Redis 与高可用
 
@@ -194,26 +194,26 @@ Vue Chat UI
 ### 4.16 Trace、Langfuse 与可观测
 
 - **面试口径**：一轮一 Trace、阶段一 Span、工具一子 Span；JSONL 是本地账本，Langfuse 做跨请求聚合和 score；bad case 回流评测。
-- **当前状态**：本地 Trace 为 `VERIFIED_IMPLEMENTED`；真实 Langfuse 与完整评测回流为 `IMPLEMENTED_WITH_LIMITATIONS`。
-- **当前设计**：`WorkflowEvent` 按实际执行分支被 `SkillTraceSink` 映射为一个 root 和有序阶段 Span；固定成功案例为 12 个阶段，澄清路径提前终止，重规划路径会增加重复阶段。稳定字段包括 trace/run/session/sequence/stage/status/elapsed/error；JSONL 和可选 exporter 共用递归脱敏；exporter 故障不阻断主链。
-- **证据**：`backend/infrastructure/chat/trace.py`、`Financial-MCP-Agent/src/tools/skill_trace.py`、`tests/unit/conversation/test_controlled_trace_adapter.py`、`tests/unit/test_trace_redaction.py`、M7 `TRACE_ARTIFACT_INDEX.json`。
-- **缺口**：M7 没向真实 Langfuse 项目发送数据；当前受控 root 下没有完整 generation/tool-call 语义 span、token/cost/score/dataset 回写；没有会话 Markdown 复盘或 PostgreSQL trace sink 的当前主链验收。
-- **安全口径**：可以说“本地可回放和脱敏 exporter 边界已验证”；Langfuse 应说“可选出口，尚未完成真实在线闭环”。
+- **当前状态**：本地 Trace 与 Skills 版本链为 `VERIFIED_IMPLEMENTED`；真实 Langfuse 在线回流仍为 `IMPLEMENTED_WITH_LIMITATIONS`。
+- **当前设计**：`WorkflowEvent` 按实际执行分支被 `SkillTraceSink` 映射为一个 root 和有序阶段 Span；固定成功案例为 12 个阶段，澄清路径提前终止，重规划路径会增加重复阶段。除 trace/run/session/sequence/stage/status/elapsed/error 外，route→synthesis 现在记录 `selected_skill/skill_version/skill_spec_hash/registry_snapshot_hash/confidence_band/candidate_names`；Planner/Synthesis reference 只记录有界 path/hash；Web Search 只记录 trigger、query SHA-256 和 accepted/rejected/source counts。JSONL 与可选 exporter 共用递归脱敏，exporter 故障不阻断主链。
+- **证据**：`backend/infrastructure/chat/trace.py`、`Financial-MCP-Agent/src/conversation/workflow.py`、`Financial-MCP-Agent/src/tools/skill_trace.py`、`tests/unit/conversation/test_controlled_trace_adapter.py`、`tests/unit/test_trace_redaction.py`。
+- **缺口**：当前没有向真实 Langfuse 项目发送本次 Skills 数据；受控 root 下仍缺完整 generation/tool-call 亲子语义、token/cost/在线 score/dataset 回写；没有会话 Markdown 复盘或 PostgreSQL trace sink 的当前主链验收。
+- **安全口径**：可以说“本地 trace 已能回放到具体 Registry、Skill、spec、reference 和 evidence/claim 版本，且 raw query/reference/web content 不入账本”；Langfuse 仍只能说“可选出口，尚未完成真实在线闭环”。
 
 ### 4.17 离线评测、Compose、Live 与历史指标
 
 - **面试口径**：按 Entity/Route/Rewrite/Planner/Executor/Verifier/Synthesis/Skill/Web Search 分模块评测，并给出 93.8%、88.4%、95%+ 等结果。
-- **当前状态**：测试基础设施为 `VERIFIED_IMPLEMENTED`；历史数字为 `HISTORICAL_CLAIM_REQUIRES_RETEST`。
-- **当前证据**：默认全量最近结果为 `126 passed, 2 skipped, 5 deselected`；Compose 为 `73 passed, 1 skipped`；真实 LLM + 只读 Tushare + HTTP + 临时 SQLite Live 为 `1 passed`；固定 mainline eval 的终态准确率和阶段覆盖率均为 `1.0`。
-- **覆盖范围**：默认测试不访问付费模型或生产服务；Compose 只 Fake 外部 Model/Tool Ports，真实经过 Nginx、FastAPI、Application、Workflow、Repository、PostgreSQL 和生产 Trace Adapter；Live 必须显式开启且无生产写。单元测试会按被测边界使用 Repository/Trace Fake。
-- **缺口**：当前 `tests/evals/*/data/smoke.jsonl` 是小型 smoke，不是面试材料中的 150×3、90×3、75×3 黄金集；没有证明 70.2%→88.4%、81.8%→93.8%、工具成功率 >98% 或单轮 <10s。
-- **安全口径**：面试时优先给出当前可复现测试矩阵；历史指标只能说明“过去的联调口径，正在按新主链重建黄金集”。
+- **当前状态**：离线评测基础设施和 `skills_sop` 可复现 runner 为 `VERIFIED_IMPLEMENTED`；历史 150×3/90×3/75×3 数字仍为 `HISTORICAL_CLAIM_REQUIRES_RETEST`。
+- **当前证据**：`tests/evals/skills_sop/data/smoke.jsonl` 固定 15 条高信息量案例，覆盖五类 Skill、fallback、显式选择、缺槽位、多任务和中置信确认；真实 Workflow + FakeModel/FakeTool 执行 3 次共 45 个预测。M9 窄修后基线为 activation accuracy `0.933333`、precision `0.909091`、recall `1.0`、plan compliance `1.0`、evidence coverage `1.0`、clarification accuracy `1.0`、claim-level accuracy `1.0`、overclaim `0.0`、deterministic stability `1.0`。artifact 同时记录 dataset/runner/Registry/tool schema/provider/repeat/hash 和单 Skill 分项。
+- **覆盖范围**：默认 runner 不访问付费模型、外网、数据库或生产服务；每条记录不保存用户原文、模型回答、证据事实或动态 trace/session ID。同数据、同 Registry 的第二次运行产生相同 records hash 和 reproducibility hash。
+- **缺口**：15×3 是当前真实新基线，不是历史 75×3 黄金集。唯一 activation mismatch 是多任务先 provisional route、随后 Rewrite 在 0 tool 时正确阻断，而 gold 要求 `skill_id=null`；未为追求 100% 改指标定义。当前报告也没有证明历史工具成功率或延迟数字。
+- **安全口径**：可以报当前文件生成的 15×3 指标及 hash；历史数字只能作为缺少原始数据/artifact 的历史声明，不能与新基线混写。
 
 ### 4.18 工程流程与 GitHub 闭环
 
 - **面试口径**：AGENTS、Spec Coding、Issue、短分支、测试先行、CI、Review、Squash Merge 和单提交回滚形成闭环。
 - **当前状态**：`VERIFIED_IMPLEMENTED`。
-- **当前证据**：M0-M7 均有独立 Issue/PR/里程碑报告并已 Squash Merge；CI 包含 Python 静态检查、分层测试、前端 lint/type/build、Compose config 和真实离线 Compose E2E；Live workflow 仅手工触发并绑定受保护 Environment。
+- **当前证据**：受控主链历史里程碑保留独立报告；本次 Skills M0-M9 在 `feature/skills-sop-migration` 按冻结计划执行并保留逐里程碑报告，尚未 commit/push/PR。CI 包含 Python 静态检查、分层测试、前端 lint/type/build、Compose config 和真实离线 Compose E2E；Live workflow 仅手工触发并绑定受保护 Environment。
 - **证据**：`AGENTS.md`、`CONTRIBUTING.md`、`.github/workflows/ci.yml`、`.github/workflows/live-e2e.yml`、`docs/specs/controlled-conversation-mainline/milestones/`。
 - **限制**：仓库管理员仍需在 GitHub 配置 Live Environment secrets/审批和可选分支保护；当前没有 CD/生产部署流水线，因为用户没有要求部署，项目也没有生产写授权。
 - **安全口径**：可以说“研发与 CI 闭环已跑通”；不要把 CI 说成已部署生产的 CD。
@@ -222,33 +222,33 @@ Vue Chat UI
 
 | 面试材料说法 | 当前主仓库事实 | 处理结论 |
 | --- | --- | --- |
-| Router 使用 metadata shortlist + LLM rerank | 当前是冻结 metadata + 确定性规则 | 保留两阶段设计，明确 rerank 未实现 |
-| 中置信返回前端 `skill_confirm` 卡片 | 当前返回文字澄清，公开协议无显式 Skill 字段 | 卡片与确认恢复延期 |
+| Router 使用 metadata shortlist + LLM rerank | metadata shortlist 和 typed optional rerank adapter 已实现；默认 deterministic/disabled，失败回退规则结果 | 可以讲可插拔 rerank 边界；不能说默认请求会调用模型 |
+| 中置信返回前端 `skill_confirm` 卡片 | REST/WS optional `explicit_skill`、typed `skill_confirm` 和同 session 确认/取消已实现 | 可以讲确认闭环；不扩展成 plan/step 控制台 |
 | Rewrite 与两个模型 Extractor 并发 | 当前三个职责已拆开，但均为确定性规则 | 可以讲分层，不能讲模型并发延迟收益 |
-| Planner 根据能力索引自由生成计划 | 当前是 deterministic requirement-to-tool | 当前方案优先可复现和安全，模型 Planner 延期 |
-| 自动扫描 vendor 构建 Capability Index | 当前为代码内 Tool Governance Catalog | 不得把静态目录称为完整自动发现 |
-| `search_web_news` 进入统一 Executor | 当前生产工具目录无该工具 | 网页检索整段属于设计/历史能力 |
+| Planner 根据能力索引自由生成计划 | 当前由已校验 `skill_spec.yaml` 的 tool-plan/evidence/concurrency contract 确定性生成，再经治理交集和 Validator | 可以讲 spec-driven Planner；不能讲模型自由规划 |
+| 自动扫描 vendor 构建 Capability Index | workspace/vendor 资产会经 Gate、Snapshot/LKG、ReferenceIndex 发布；执行权限仍与代码内 Tool Governance Catalog 求交 | 可以讲资产发现和原子发布，不能称动态工具安装市场 |
+| `search_web_news` 进入统一 Executor | 已作为默认关闭的 optional weak evidence 走同一 Validator/Executor/Verifier/Synthesis | 可以讲统一只读工具；不能说默认联网或把新闻当强事实 |
 | 默认 6 路并发 | 当前默认 `max_concurrency=4` | 使用当前配置事实，历史性能数字待复测 |
 | Redis 三态共享熔断、限流、幂等 | 当前主链未实现 | 作为高可用增强，不包装成当前成果 |
-| 前端展示 plan/step/verification/confirm | 当前只支持基础 WS 和上下文更新 | 明确未实现 |
+| 前端展示 plan/step/verification/confirm | confirm 已实现；plan/step/verification 卡片仍未实现 | 只讲确认卡，其他控制卡继续延期 |
 | WebSocket 逐 token 流式 | 当前只发送一段最终回答文本 | 称为兼容流式通道，不称 Provider token streaming |
 | Langfuse 已完成 trace-score-dataset 回流 | 当前只验证可选 exporter 边界，未真实发送 | 真实在线回流延期 |
-| 历史准确率/合规率/延迟均已冻结 | 当前没有同口径数据集 | 全部标记待复测 |
+| 历史准确率/合规率/延迟均已冻结 | 已建立 15×3 新基线并固定 hash，但与历史数据不同口径 | 当前数字可复现；历史数字继续标记待复测 |
 
 ## 6. 面试时推荐的统一表述
 
 可以用下面这段作为当前版本的主口径：
 
-> 我把对话模式从历史的巨型服务重构成了一条 workflow-style 受控主链。REST 和 WebSocket 共用同一个 Application Use Case；请求依次经过最小上下文、权威实体、两阶段路由、route-specific rewrite、请求级工具权限快照、确定性 Planner、Plan Validator、有界 Executor、Evidence Verifier、规则 Controller、最多一次补证和 accepted-evidence-only Synthesis，最后在同一事务里保存消息。当前默认测试完全离线，Compose 会真实经过 Nginx、FastAPI、工作流和 PostgreSQL；另外有显式保护的真实模型和只读 Tushare Live E2E。为了保证口径真实，我把 LLM rerank、前端确认/计划卡、网页新闻、Redis 共享熔断、逐 token streaming、在线 Langfuse 评测回流和历史指标复测明确留在后续阶段，不把设计方案说成已经上线。
+> 我把对话模式从历史的巨型服务重构成了一条 workflow-style 受控主链，并把五类投研 Skills 迁成 `SKILL.md + spec + references + tests` 四层资产。REST 和 WebSocket 共用同一个 Application Use Case；请求依次经过最小上下文、权威实体、两阶段路由、route-specific rewrite、请求级工具权限快照、spec-driven Planner、Plan Validator、唯一有界 Executor、Evidence Verifier、规则 Controller、最多一次补证和 accepted-evidence-only Synthesis。Registry 通过 Schema Gate、进程级 LKG 和请求快照保证版本一致；中置信已有公开确认卡，Web News 已作为默认关闭的统一弱证据工具。15×3 当前基线和完整 Compose E2E 可复现；默认在线 LLM rerank、任意多任务拆解、Redis 共享治理、逐 token streaming、在线 Langfuse 回流和历史黄金集复测仍明确延期。
 
 ## 7. 后续迁移与增强顺序
 
 受控主链本体已经迁移完成，后续不再重新复制历史 Runtime。建议按可验证价值推进：
 
 1. **重建黄金集并复测指标**：先把 150/90/75 等历史样例整理成版本化数据集，避免继续使用不可复现数字。
-2. **丰富公开事件协议和前端状态卡**：先定义版本化事件，再实现确认恢复、plan/step/verification 展示。
+2. **丰富公开事件协议和前端状态卡**：确认闭环已完成；继续定义版本化 plan/step/verification 事件与展示。
 3. **模型化理解阶段**：在现有 Typed 合同之后接入可替换 structured-output Provider，逐模块对比确定性基线，不绕过 schema gate。
-4. **网页新闻弱证据**：作为统一只读 Tool 接入治理目录、Executor、Verifier 和引用协议，不做 Skill 私有联网脚本。
+4. **扩展弱证据来源治理**：Web News 统一只读链路已完成；后续增加多源可信度、冲突和引用展示，不做 Skill 私有联网脚本。
 5. **分布式韧性**：另开规格引入 Redis 幂等、限流和共享熔断；必须带故障注入、恢复和多实例测试。
 6. **在线观测与发布治理**：配置真实 Langfuse、score/dataset 回流、分支保护和受保护 Live Environment；CD/生产部署需另行授权。
 

@@ -1,7 +1,59 @@
 skill_name: fund-compare
 skill_family: financial-sop
 version: "1.0.0"
+depends_on_tools:
+  - get_fund_basic_info
+  - get_etf_basic_info
+  - get_fund_nav
+  - get_fund_market_bars
+  - get_fund_share
+min_tool_schema_version: "1.0.0"
+output_schema_version: "1.0.0"
+skill_md_section_map:
+  purpose: Purpose
+  when_to_use: When to Use
+  when_not_to_use: When Not to Use
+  required_inputs: Required Inputs
+  workflow: Workflow
+  tool_use_guide: Tool Use Guide
+  evidence_rules: Evidence Rules
+  degrade_policy: Degrade Policy
+  output_contract: Output Contract
+  references: References
+requires_web_news: false
 execution_policy: deterministic
+route_metadata:
+  when_to_use:
+    - 用户比较两只或多只基金、ETF、LOF 或 QDII
+    - 用户问哪只更适合、A 和 B 怎么选
+  when_not_to_use:
+    - 用户只问基金或 ETF 的概念定义
+    - 用户要求筛选一类 ETF 或解释当天异动
+  positive_examples:
+    - 华安黄金 ETF 和博时黄金 ETF 哪个适合我
+    - 这两只基金的净值、规模和流动性对比一下
+  negative_examples:
+    - 黄金 ETF 是什么
+    - 帮我筛几只低波动红利 ETF
+  supported_entity_types:
+    - fund
+    - etf
+    - lof
+    - qdii
+input_contract:
+  required_slots:
+    - fund_subjects
+  optional_slots:
+    - comparison_dimensions
+    - risk_preference
+  entity_cardinality: at_least_two
+  supported_entity_types:
+    - fund
+    - etf
+    - lof
+    - qdii
+  on_missing_slots: ask_clarification
+  comparison_required: true
 allowed_tools:
   - get_fund_basic_info
   - get_etf_basic_info

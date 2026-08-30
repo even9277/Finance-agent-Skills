@@ -116,7 +116,7 @@ def test_synthesis_smoke_executes_accepted_only_context() -> None:
 
         assert model.calls[0].context.accepted_evidence == accepted
         assert model.calls[0].context.rejected_evidence == ()
-        assert model.calls[0].prompt_version == "chat-synthesis-v2"
+        assert model.calls[0].prompt_version == "chat-synthesis-v4"
         if missing:
             assert reply.startswith("部分结果：缺少 ")
         scored = dict(row)

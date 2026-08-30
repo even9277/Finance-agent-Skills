@@ -64,21 +64,44 @@ class FakeToolProvider:
         if self.behavior == "timeout_market" and call.tool_name == "get_market_bars":
             raise ToolTimeoutError("fixture timeout")
 
-        if call.evidence_dimension is EvidenceDimension.BASIC_PROFILE:
-            facts = (
-                EvidenceFact(key="name", value="贵州茅台"),
-                EvidenceFact(key="industry", value="白酒"),
-            )
-        elif self.behavior == "missing_market" or (
+        if self.behavior == "missing_market" or (
             self.behavior == "recover_market_with_alternative"
             and call.tool_name == "get_market_bars"
         ):
-            facts = ()
-        else:
             facts = (
-                EvidenceFact(key="close", value="1688.00", unit="CNY"),
-                EvidenceFact(key="trade_date", value=date.today().isoformat()),
+                (EvidenceFact(key="name", value="贵州茅台"),)
+                if call.evidence_dimension is EvidenceDimension.BASIC_PROFILE
+                else ()
             )
+        else:
+            dimension_facts = {
+                EvidenceDimension.BASIC_PROFILE: (EvidenceFact(key="name", value="贵州茅台"),),
+                EvidenceDimension.MARKET_SNAPSHOT: (EvidenceFact(key="close", value="1688.00"),),
+                EvidenceDimension.FINANCIAL_INDICATOR: (EvidenceFact(key="roe", value="12.3"),),
+                EvidenceDimension.INCOME_STATEMENT: (EvidenceFact(key="revenue", value="100"),),
+                EvidenceDimension.BALANCE_SHEET: (EvidenceFact(key="total_assets", value="200"),),
+                EvidenceDimension.CASHFLOW_STATEMENT: (
+                    EvidenceFact(key="n_cashflow_act", value="30"),
+                ),
+                EvidenceDimension.FUND_BASIC: (EvidenceFact(key="fund_name", value="离线基金"),),
+                EvidenceDimension.ETF_BASIC: (EvidenceFact(key="fund_name", value="离线 ETF"),),
+                EvidenceDimension.FUND_NAV: (EvidenceFact(key="unit_nav", value="1.1"),),
+                EvidenceDimension.FUND_MARKET: (EvidenceFact(key="close", value="1.2"),),
+                EvidenceDimension.FUND_SHARE: (EvidenceFact(key="fd_share", value="1000"),),
+                EvidenceDimension.INDEX_DAILY: (EvidenceFact(key="close", value="3500"),),
+                EvidenceDimension.SECTOR_SNAPSHOT: (
+                    EvidenceFact(key="pct_change", value="2.1"),
+                ),
+                EvidenceDimension.SECTOR_CONSTITUENTS: (
+                    EvidenceFact(key="constituent", value="离线成分股"),
+                ),
+                EvidenceDimension.WEB_NEWS: (
+                    EvidenceFact(key="W1.title", value="离线新闻线索"),
+                    EvidenceFact(key="W1.domain", value="news.example.com"),
+                    EvidenceFact(key="W1.summary", value="仅供离线弱证据测试"),
+                ),
+            }
+            facts = dimension_facts[call.evidence_dimension]
         return ToolObservation(
             step_id=call.step_id,
             tool_name=call.tool_name,

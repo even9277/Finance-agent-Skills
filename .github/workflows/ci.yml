@@ -50,6 +50,7 @@ jobs:
           backend/services/stm_compaction_worker.py
           backend/services/stm_context_service.py
           Financial-MCP-Agent/src/conversation
+          Financial-MCP-Agent/src/skills
           Financial-MCP-Agent/src/memory/contracts.py
           Financial-MCP-Agent/src/memory/memory_service.py
           Financial-MCP-Agent/src/memory/policy.py
@@ -70,6 +71,7 @@ jobs:
           backend/services/stm_compaction_worker.py
           backend/services/stm_context_service.py
           Financial-MCP-Agent/src/conversation
+          Financial-MCP-Agent/src/skills
           Financial-MCP-Agent/src/memory/contracts.py
           Financial-MCP-Agent/src/memory/memory_service.py
           Financial-MCP-Agent/src/memory/policy.py

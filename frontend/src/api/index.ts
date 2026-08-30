@@ -78,6 +78,20 @@ export interface ChatMessageResponse {
   memory_profile?: MemoryProfile | null
   context_window?: ChatContextWindow | null
   memory_command?: MemoryCommandResult | null
+  skill_confirmation?: SkillConfirmation | null
+}
+
+export interface SkillConfirmationCandidate {
+  skill_name: string
+  confidence: number
+  version: string
+  reason: string
+}
+
+export interface SkillConfirmation {
+  candidates: SkillConfirmationCandidate[]
+  reason: string
+  registry_snapshot_hash: string
 }
 
 export type MemoryCommandStatus =
@@ -266,11 +280,17 @@ export const reportApi = {
 // 对话 API
 // ─────────────────────────────────────────────────────────────
 export const chatApi = {
-  sendMessage: (userId: string, message: string, sessionId?: string) =>
+  sendMessage: (
+    userId: string,
+    message: string,
+    sessionId?: string,
+    explicitSkill?: string,
+  ) =>
     http.post<ChatMessageResponse>('/chat/message', {
       user_id: userId,
       message,
       session_id: sessionId,
+      explicit_skill: explicitSkill,
     }),
 
   listSessions: (userId: string, q?: string) =>
@@ -397,6 +417,7 @@ export interface WsStreamPayload {
   user_id: string
   message: string
   session_id?: string
+  explicit_skill?: string
 }
 
 export type WsControlFrame =
@@ -408,6 +429,7 @@ export type WsControlFrame =
   | { type: 'compaction_failed'; session_id: string; context_window: ChatContextWindow; message?: string }
   | { type: 'done'; session_id: string }
   | { type: 'memory_command'; session_id: string; memory_command: MemoryCommandResult }
+  | { type: 'skill_confirm'; session_id: string; confirmation: SkillConfirmation }
   | { type: 'compress_start'; session_id: string; progress: number; eta_seconds: number }
   | { type: 'compress_done'; session_id: string; progress: number; eta_seconds: number; elapsed_seconds: number; snapshot_id?: number; compressed_message_count?: number; total_message_count?: number; percent?: number }
   | { type: 'compress_skip'; session_id: string; progress: number; eta_seconds: number }

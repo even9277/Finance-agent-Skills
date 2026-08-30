@@ -54,6 +54,8 @@ class Settings(BaseSettings):
     enable_fundamental_analysis: bool = False
     enable_sector_analysis: bool = False
     enable_stock_selection: bool = False
+    # Web News 只作为 market-move-explain 的可选弱证据；默认不允许外部请求。
+    enable_web_news: bool = False
     enable_deterministic_skill_execution: bool = True
     enable_tool_prefetch_concurrency: bool = True
     enable_trace: bool = True
@@ -127,6 +129,11 @@ class Settings(BaseSettings):
     chat_router_model: str = "kimi-k2.5"
     chat_resolver_model: str = "kimi-k2.5"
     chat_skill_synthesis_model: str = ""
+    # Skill rerank 默认关闭；开启时只允许接收 top-K routing metadata。
+    skill_rerank_provider: str = "disabled"
+    skill_rerank_model: str = ""
+    skill_rerank_top_k: int = 3
+    skill_rerank_timeout_sec: int = 8
     # Trace / Langfuse
     trace_artifact_dir: str = str(_AGENT_DIR / "logs" / "chat_trace_artifacts")
     langfuse_base_url: str = ""
@@ -141,6 +148,16 @@ class Settings(BaseSettings):
     langfuse_flush_interval_sec: int = 5
     # Tushare（Phase 1）
     tushare_token: str = ""
+    # Tavily Web News（默认关闭，密钥只允许通过环境注入）
+    tavily_api_key: str = ""
+    web_news_timeout_sec: int = 5
+    web_news_max_results: int = 5
+    web_news_freshness_days: int = 7
+    web_news_max_summary_chars: int = 280
+    web_news_rate_limit_per_min: int = 10
+    web_news_daily_quota: int = 100
+    web_news_include_domains: List[str] = []
+    web_news_exclude_domains: List[str] = []
     # Auth/JWT
     jwt_secret_key: str = "change-me-in-production-please-use-a-long-random-secret"
     jwt_algorithm: str = "HS256"
@@ -208,6 +225,23 @@ class Settings(BaseSettings):
             raise ValueError("memory_embedding_provider must be deterministic or openai")
         return normalized
 
+    @field_validator("skill_rerank_provider")
+    @classmethod
+    def _validate_skill_rerank_provider(cls, value: str) -> str:
+        """限制 Skill rerank 为关闭或显式 OpenAI-compatible Provider。"""
+        normalized = value.strip().lower()
+        if normalized not in {"disabled", "openai"}:
+            raise ValueError("skill_rerank_provider must be disabled or openai")
+        return normalized
+
+    @field_validator("skill_rerank_top_k")
+    @classmethod
+    def _validate_skill_rerank_top_k(cls, value: int) -> int:
+        """限制在线候选规模，禁止把完整 Registry 交给 Provider。"""
+        if not 1 <= value <= 5:
+            raise ValueError("skill_rerank_top_k must be between 1 and 5")
+        return value
+
     @field_validator(
         "stm_context_budget_tokens",
         "stm_keep_recent",
@@ -235,6 +269,11 @@ class Settings(BaseSettings):
         "memory_index_worker_batch_size",
         "memory_index_worker_max_retries",
         "memory_index_worker_lease_sec",
+        "skill_rerank_timeout_sec",
+        "web_news_timeout_sec",
+        "web_news_freshness_days",
+        "web_news_rate_limit_per_min",
+        "web_news_daily_quota",
     )
     @classmethod
     def _validate_positive_stm_integer(cls, value: int) -> int:
@@ -242,6 +281,42 @@ class Settings(BaseSettings):
         if value < 1:
             raise ValueError("STM integer settings must be positive")
         return value
+
+    @field_validator("web_news_max_results")
+    @classmethod
+    def _validate_web_news_max_results(cls, value: int) -> int:
+        """限制单次返回规模，避免弱证据挤占上下文和配额。"""
+        if not 1 <= value <= 10:
+            raise ValueError("web_news_max_results must be between 1 and 10")
+        return value
+
+    @field_validator("web_news_max_summary_chars")
+    @classmethod
+    def _validate_web_news_summary_chars(cls, value: int) -> int:
+        """限制单条摘要长度，禁止网页正文进入模型上下文。"""
+        if not 80 <= value <= 500:
+            raise ValueError("web_news_max_summary_chars must be between 80 and 500")
+        return value
+
+    @field_validator("web_news_include_domains", "web_news_exclude_domains")
+    @classmethod
+    def _validate_web_news_domains(cls, value: List[str]) -> List[str]:
+        """规范域名白黑名单并拒绝 URL、路径和带凭证的输入。"""
+        normalized: list[str] = []
+        for item in value:
+            domain = item.strip().lower().removeprefix("www.")
+            if (
+                not domain
+                or "://" in domain
+                or "/" in domain
+                or "@" in domain
+                or ":" in domain
+                or any(character.isspace() for character in domain)
+            ):
+                raise ValueError("web news domains must be bare host names")
+            if domain not in normalized:
+                normalized.append(domain)
+        return normalized
 
     @field_validator("redis_connect_timeout_sec", "redis_socket_timeout_sec")
     @classmethod
@@ -293,6 +368,11 @@ class Settings(BaseSettings):
             raise ValueError(
                 "deterministic pgvector schema memory-index-v1 requires embed_dims=1536"
             )
+        overlap = set(self.web_news_include_domains).intersection(
+            self.web_news_exclude_domains
+        )
+        if overlap:
+            raise ValueError("web news include and exclude domains must not overlap")
         return self
 
     model_config = {

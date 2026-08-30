@@ -12,19 +12,28 @@ allowed_tools:
 
 # ETF Screen
 
+## Purpose
+
+围绕主题、指数、资产类别或风险约束筛出一组可继续研究的 ETF shortlist，并明确候选进入与排除逻辑；不承诺唯一最优产品。
+
 ## When to Use
 
 - 用户希望筛选、推荐、初步 shortlist 某类 ETF 或场内基金，例如宽基 ETF、黄金 ETF、红利 ETF、科创 ETF、半导体 ETF。
 - 用户给出了风险偏好、持有周期、主题偏好、是否看重流动性等约束，希望得到更适合的候选。
 - 用户需要“先找候选，再补证据”的真实筛选流程，而不是只比较两个已知产品。
 
-## Inputs
+## When Not to Use
+
+- 已明确两个产品做比较时交给 `fund-compare`；解释异动时交给 `market-move-explain`。
+- 没有主题、指数、资产类别或筛选条件时先澄清，不生成泛化榜单。
+
+## Required Inputs
 
 - 用户原始问题。
 - 主题、指数、行业、资产类别等筛选意图。
 - 用户画像摘要，主要用于风险偏好、持有周期和回答偏好。
 
-## Decision Rules
+## Workflow
 
 1. 先用基础信息发现候选 ETF/基金，再补净值、份额、场内行情做二次筛选。
 2. 输出优先是 shortlist 和筛选逻辑，不是唯一推荐答案。
@@ -32,13 +41,25 @@ allowed_tools:
 4. 如果候选很多，优先保留 2 到 3 只最像用户需求的产品。
 5. 若证据不足，只能给方向性 shortlist，不编造确定性排序。
 
-## Fallbacks
+## Tool Use Guide
+
+- 基础信息工具负责候选发现；净值、场内行情和份额用于二次筛选。
+- `get_etf_basic_info` 用于补充 ETF 产品口径，候选扩展受 `top_n` 约束。
+- 不使用私有脚本或网页搜索，新闻催化不是筛选主证据。
+
+## Evidence Rules
+
+- `fund_basic` 是候选进入 shortlist 的必要证据。
+- 净值、行情或份额至少命中一类，才允许给排序理由。
+- 规模、流动性、跟踪质量和主题风险优先于单一近期涨跌。
+
+## Degrade Policy
 
 - 主题过于宽泛：先给高相关 ETF 方向，再提醒用户补充持有周期或风险偏好。
 - 只有基础信息，没有表现或规模数据：只做候选归纳，不做强推荐。
 - 工具结果冲突或为空：说明当前 shortlist 可靠性有限。
 
-## Output Template
+## Output Contract
 
 - 默认结构：
   - 先给 shortlist 结论，再给筛选逻辑、候选差异、主要风险、适配建议、数据来源。
@@ -47,3 +68,7 @@ allowed_tools:
 - `response_pref=concise`：
   - 保留 shortlist、2 到 3 个筛选理由、风险提示、数据来源。
 - 始终标注：数据来源为 Tushare，并尽量给出数据日期。
+
+## References
+
+- `references/ETF筛选规则.md`：候选维度、规模流动性、跟踪质量和主题风险。

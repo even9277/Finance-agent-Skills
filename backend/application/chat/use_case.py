@@ -212,6 +212,7 @@ class ControlledChatUseCase:
             working_state=working_state,
             context_window=context_window,
             workflow_result=result,
+            skill_confirmation=result.skill_confirmation,
         )
 
     def _observe(

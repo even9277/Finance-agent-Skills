@@ -63,27 +63,35 @@ export function useChat() {
   // ─────────────────────────────────────────────────────────────
   // 同步发送（HTTP POST，Phase 1 保留兼容）
   // ─────────────────────────────────────────────────────────────
-  async function sendMessage(text: string) {
+  async function sendMessage(
+    text: string,
+    explicitSkill?: string,
+    appendUserMessage = true,
+  ) {
     if (!text.trim() || chatStore.isSending) return
 
     chatStore.isSending = true
+    if (!explicitSkill) chatStore.clearSkillConfirmation()
 
     // 乐观更新：先显示用户消息
-    const optimisticUser: ChatMessage = {
-      id: Date.now(),
-      session_id: chatStore.currentSessionId || '',
-      role: 'user',
-      content: text,
-      is_compressed: false,
-      created_at: new Date().toISOString(),
+    if (appendUserMessage) {
+      const optimisticUser: ChatMessage = {
+        id: Date.now(),
+        session_id: chatStore.currentSessionId || '',
+        role: 'user',
+        content: text,
+        is_compressed: false,
+        created_at: new Date().toISOString(),
+      }
+      chatStore.appendMessage(optimisticUser)
     }
-    chatStore.appendMessage(optimisticUser)
 
     try {
       const { data } = await chatApi.sendMessage(
         userStore.userId,
         text,
-        chatStore.currentSessionId || undefined
+        chatStore.currentSessionId || undefined,
+        explicitSkill,
       )
 
       if (!chatStore.currentSessionId) {
@@ -93,6 +101,13 @@ export function useChat() {
       chatStore.updateSessionContext(data.session_id, data.context_window || null)
       if (data.memory_command) {
         memoryStore.setCommandResult(data.memory_command)
+      }
+      if (data.skill_confirmation) {
+        chatStore.setSkillConfirmation({
+          originalMessage: text,
+          sessionId: data.session_id,
+          confirmation: data.skill_confirmation,
+        })
       }
       maybeStartContextRefreshPolling()
 
@@ -131,10 +146,11 @@ export function useChat() {
   // ─────────────────────────────────────────────────────────────
   // Phase 2 流式发送（WebSocket，打字机效果）
   // ─────────────────────────────────────────────────────────────
-  async function sendMessageStream(text: string) {
+  async function sendMessageStream(text: string, explicitSkill?: string) {
     if (!text.trim() || chatStore.isSending || chatStore.isStreaming) return
 
     chatStore.isSending = true
+    if (!explicitSkill) chatStore.clearSkillConfirmation()
 
     // 先追加用户消息（乐观更新）
     const sessionIdForOptimistic = chatStore.currentSessionId || ''
@@ -170,6 +186,7 @@ export function useChat() {
             user_id: userStore.userId,
             message: text,
             session_id: chatStore.currentSessionId || undefined,
+            explicit_skill: explicitSkill,
           })
         )
       }
@@ -190,6 +207,12 @@ export function useChat() {
             maybeStartContextRefreshPolling()
           } else if (frame.type === 'memory_command') {
             memoryStore.setCommandResult(frame.memory_command)
+          } else if (frame.type === 'skill_confirm') {
+            chatStore.setSkillConfirmation({
+              originalMessage: text,
+              sessionId: frame.session_id,
+              confirmation: frame.confirmation,
+            })
           } else if (frame.type === 'compaction_queued' || frame.type === 'compaction_running' || frame.type === 'compaction_done' || frame.type === 'compaction_failed') {
             chatStore.setContextWindow(frame.context_window)
             chatStore.updateSessionContext(frame.session_id, frame.context_window)
@@ -292,6 +315,19 @@ export function useChat() {
     stopContextRefreshPolling()
   }
 
+  async function confirmSkill(skillName: string) {
+    const pending = chatStore.pendingSkillConfirmation
+    if (!pending || chatStore.isSending || chatStore.isStreaming) return
+    if (!pending.confirmation.candidates.some((item) => item.skill_name === skillName)) return
+    if (chatStore.currentSessionId !== pending.sessionId) return
+    chatStore.clearSkillConfirmation()
+    await sendMessage(pending.originalMessage, skillName, false)
+  }
+
+  function cancelSkillConfirmation() {
+    chatStore.clearSkillConfirmation()
+  }
+
   async function deleteSession(sessionId: string) {
     await chatApi.deleteSession(sessionId, userStore.userId)
     chatStore.removeSession(sessionId)
@@ -314,6 +350,8 @@ export function useChat() {
     loadMessages,
     sendMessage,
     sendMessageStream,
+    confirmSkill,
+    cancelSkillConfirmation,
     newSession,
     deleteSession,
     renameSession,

@@ -1,7 +1,57 @@
 skill_name: etf-screen
 skill_family: financial-sop
 version: "1.0.0"
+depends_on_tools:
+  - get_fund_basic_info
+  - get_etf_basic_info
+  - get_fund_nav
+  - get_fund_market_bars
+  - get_fund_share
+min_tool_schema_version: "1.0.0"
+output_schema_version: "1.0.0"
+skill_md_section_map:
+  purpose: Purpose
+  when_to_use: When to Use
+  when_not_to_use: When Not to Use
+  required_inputs: Required Inputs
+  workflow: Workflow
+  tool_use_guide: Tool Use Guide
+  evidence_rules: Evidence Rules
+  degrade_policy: Degrade Policy
+  output_contract: Output Contract
+  references: References
+requires_web_news: false
 execution_policy: deterministic
+route_metadata:
+  when_to_use:
+    - 用户按主题、指数、风险偏好或持有周期筛选 ETF 候选
+    - 用户问帮我找几只、筛几只、配置哪些 ETF
+  when_not_to_use:
+    - 用户比较两个已经明确给出的产品
+    - 用户只问 ETF 概念、交易规则或异动原因
+  positive_examples:
+    - 帮我筛几只低波动红利 ETF
+    - 想配新能源主题 ETF，给几个候选
+  negative_examples:
+    - 黄金 ETF 是什么
+    - 华安黄金 ETF 和博时黄金 ETF 哪个适合我
+  supported_entity_types:
+    - fund
+    - etf
+input_contract:
+  required_slots:
+    - screen_intent
+  optional_slots:
+    - theme
+    - index
+    - asset_class
+    - risk_preference
+    - holding_period
+  entity_cardinality: zero_or_more
+  supported_entity_types:
+    - fund
+    - etf
+  on_missing_slots: ask_clarification
 allowed_tools:
   - get_fund_basic_info
   - get_etf_basic_info

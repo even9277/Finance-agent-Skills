@@ -60,16 +60,31 @@ def test_planner_eval_generates_permission_validated_dags() -> None:
     """验证四类固定任务只规划必要工具并通过权限/DAG 校验。"""
     rows = load_jsonl(Path("tests/evals/planner/data/smoke.jsonl"))
     catalog = ToolGovernanceCatalog.default()
+    registry = SkillRegistry()
+    runtime = registry.runtime_snapshot()
     resolver = ControlledPermissionResolver(
         catalog=catalog,
-        skill_catalog=SkillRegistry().conversation_snapshot(),
+        skill_catalog=registry.conversation_snapshot(runtime),
     )
+    loader = registry.get_loader(runtime)
     planner = ControlledPlanner(catalog=catalog)
 
     for row in rows:
         rewrite = _rewrite(row)
-        permissions = resolver.resolve(rewrite)
-        plan = planner.plan(rewrite, permissions, trace_id=row["case_id"])
+        skill_context = None
+        if isinstance(rewrite, SopRewriteResult):
+            assert rewrite.skill_name is not None
+            skill_context = loader.load_for_planner(
+                rewrite.skill_name,
+                query=rewrite.effective_query,
+            )
+        permissions = resolver.resolve(rewrite, skill_context=skill_context)
+        plan = planner.plan(
+            rewrite,
+            permissions,
+            trace_id=row["case_id"],
+            skill_context=skill_context,
+        )
         validation = PlanValidator().validate(plan, permissions)
         tools = {step.tool_name for step in plan.steps}
 

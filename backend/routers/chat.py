@@ -8,6 +8,7 @@ from dataclasses import asdict
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
+from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.application.chat.contracts import ChatCommand, ChatContextWindowData
@@ -26,6 +27,8 @@ from backend.schemas.chat import (
     ChatMessageRequest,
     ChatMessageResponse,
     MemoryCommandResultResponse,
+    SkillConfirmationCandidateResponse,
+    SkillConfirmationResponse,
     ChatSessionListItem,
     ChatSessionMessages,
     ChatSessionRenameRequest,
@@ -83,6 +86,25 @@ def _memory_command_schema(value):
     )
 
 
+def _skill_confirmation_schema(value) -> SkillConfirmationResponse | None:
+    """把领域确认载荷投影为不含权限和正文的公开模型。"""
+    if value is None:
+        return None
+    return SkillConfirmationResponse(
+        candidates=[
+            SkillConfirmationCandidateResponse(
+                skill_name=item.skill_name,
+                confidence=item.confidence,
+                version=item.version,
+                reason=item.reason,
+            )
+            for item in value.candidates
+        ],
+        reason=value.reason,
+        registry_snapshot_hash=value.registry_snapshot_hash,
+    )
+
+
 @router.post("/message", response_model=ChatMessageResponse, summary="发送消息（同步返回）")
 async def send_message(
     body: ChatMessageRequest,
@@ -97,6 +119,7 @@ async def send_message(
                 user_id=effective_user_id,
                 message=body.message,
                 session_id=body.session_id,
+                explicit_skill=body.explicit_skill,
             )
         )
     except Exception as exc:
@@ -113,6 +136,7 @@ async def send_message(
         memory_profile=outcome.memory_profile,
         context_window=_context_schema(outcome.context_window),
         memory_command=_memory_command_schema(outcome.memory_command),
+        skill_confirmation=_skill_confirmation_schema(outcome.skill_confirmation),
     )
 
 
@@ -134,10 +158,9 @@ async def chat_stream(websocket: WebSocket) -> None:
             )
             return
 
-        user_id = str(payload.get("user_id") or "").strip()
-        message = str(payload.get("message") or "").strip()
-        session_id = payload.get("session_id") or None
-        if not user_id or not message:
+        try:
+            request = ChatMessageRequest.model_validate(payload)
+        except ValidationError:
             await websocket.send_json(
                 {
                     "type": "error",
@@ -146,18 +169,28 @@ async def chat_stream(websocket: WebSocket) -> None:
                 }
             )
             return
-        effective_user_id = ensure_user_access(user_id, auth)
+        effective_user_id = ensure_user_access(request.user_id, auth)
 
         async with AsyncSessionFactory() as db:
             outcome = await build_chat_use_case(db).execute(
                 ChatCommand(
                     user_id=effective_user_id,
-                    message=message,
-                    session_id=session_id,
+                    message=request.message,
+                    session_id=request.session_id,
+                    explicit_skill=request.explicit_skill,
                 )
             )
 
         await websocket.send_json({"type": "session_id", "session_id": outcome.session_id})
+        skill_confirmation = _skill_confirmation_schema(outcome.skill_confirmation)
+        if skill_confirmation is not None:
+            await websocket.send_json(
+                {
+                    "type": "skill_confirm",
+                    "session_id": outcome.session_id,
+                    "confirmation": skill_confirmation.model_dump(mode="json"),
+                }
+            )
         memory_command = _memory_command_schema(outcome.memory_command)
         if memory_command is not None:
             await websocket.send_json(

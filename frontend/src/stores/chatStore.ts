@@ -1,6 +1,12 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
-import type { ChatContextWindow, ChatMessage, ChatSession } from '@/api'
+import type { ChatContextWindow, ChatMessage, ChatSession, SkillConfirmation } from '@/api'
+
+export interface PendingSkillConfirmation {
+  originalMessage: string
+  sessionId: string
+  confirmation: SkillConfirmation
+}
 
 export const useChatStore = defineStore('chat', () => {
   const sessions = ref<ChatSession[]>([])
@@ -8,6 +14,7 @@ export const useChatStore = defineStore('chat', () => {
   const messages = ref<ChatMessage[]>([])
   const isLoading = ref(false)
   const isSending = ref(false)
+  const pendingSkillConfirmation = ref<PendingSkillConfirmation | null>(null)
 
   // Phase 2 新增：流式输出状态
   const isStreaming = ref(false)
@@ -24,6 +31,12 @@ export const useChatStore = defineStore('chat', () => {
   const lastCompressPercent = ref<number | null>(null) // 本次压缩覆盖比例（用于摘要历史页展示）
 
   function setCurrentSession(sessionId: string | null) {
+    if (
+      pendingSkillConfirmation.value
+      && pendingSkillConfirmation.value.sessionId !== sessionId
+    ) {
+      pendingSkillConfirmation.value = null
+    }
     currentSessionId.value = sessionId
     if (!sessionId) {
       messages.value = []
@@ -38,6 +51,7 @@ export const useChatStore = defineStore('chat', () => {
 
   function setMessages(list: ChatMessage[]) {
     messages.value = list
+    pendingSkillConfirmation.value = null
   }
 
   function appendMessage(msg: ChatMessage) {
@@ -105,6 +119,14 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
+  function setSkillConfirmation(value: PendingSkillConfirmation) {
+    pendingSkillConfirmation.value = value
+  }
+
+  function clearSkillConfirmation() {
+    pendingSkillConfirmation.value = null
+  }
+
   function removeSession(sessionId: string) {
     sessions.value = sessions.value.filter((s) => s.session_id !== sessionId)
     if (currentSessionId.value === sessionId) {
@@ -151,6 +173,7 @@ export const useChatStore = defineStore('chat', () => {
     compressProgress.value = 0
     compressEtaSeconds.value = null
     lastCompressPercent.value = null
+    pendingSkillConfirmation.value = null
   }
 
   return {
@@ -159,6 +182,7 @@ export const useChatStore = defineStore('chat', () => {
     messages,
     isLoading,
     isSending,
+    pendingSkillConfirmation,
     isStreaming,
     currentRunningSummary,
     currentContextWindow,
@@ -174,6 +198,8 @@ export const useChatStore = defineStore('chat', () => {
     appendStreamToken,
     startStreamingMessage,
     finishStreamingMessage,
+    setSkillConfirmation,
+    clearSkillConfirmation,
     startCompress,
     updateCompressProgress,
     finishCompress,

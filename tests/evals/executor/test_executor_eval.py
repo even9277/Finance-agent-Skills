@@ -80,11 +80,22 @@ def _validated_plan(budget: RunBudget):
         time_scope=TimeScope.LATEST_TRADING_DAY,
     )
     catalog = ToolGovernanceCatalog.default()
+    registry = SkillRegistry()
+    runtime = registry.runtime_snapshot()
+    planner_context = registry.get_loader(runtime).load_for_planner(
+        "stock-first-pass",
+        query=rewrite.effective_query,
+    )
     permissions = ControlledPermissionResolver(
         catalog=catalog,
-        skill_catalog=SkillRegistry().conversation_snapshot(),
-    ).resolve(rewrite)
-    plan = ControlledPlanner(catalog=catalog).plan(rewrite, permissions, trace_id="eval-m4")
+        skill_catalog=registry.conversation_snapshot(runtime),
+    ).resolve(rewrite, skill_context=planner_context)
+    plan = ControlledPlanner(catalog=catalog).plan(
+        rewrite,
+        permissions,
+        trace_id="eval-m5",
+        skill_context=planner_context,
+    )
     result = PlanValidator().validate(plan, permissions, budget=budget)
     assert result.validated_plan is not None
     return result.validated_plan

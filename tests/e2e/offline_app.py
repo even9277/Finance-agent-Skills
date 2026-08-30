@@ -24,12 +24,15 @@ __all__ = ["app"]
 
 def build_offline_chat_use_case(db: AsyncSession) -> ControlledChatUseCase:
     """只替换外部 Model/Tool/Trace Ports，保留真实工作流与数据库 Repository。"""
+    registry = SkillRegistry()
+    runtime = registry.runtime_snapshot()
     return ControlledChatUseCase(
         workflow=ControlledConversationWorkflow(
             model=FakeModelProvider(),
             tool=FakeToolProvider(),
             trace=SkillTraceSink(),
-            skill_catalog=SkillRegistry().conversation_snapshot(),
+            skill_catalog=registry.conversation_snapshot(runtime),
+            skill_loader=registry.get_loader(runtime),
         ),
         repository=SqlAlchemyConversationRepository(db, cache=get_memory_cache()),
         retrieval=MemoryRetrievalUseCase(

@@ -18,6 +18,7 @@ from tests.evals.metrics import (
     schema_pass_rate,
     terminal_status_accuracy,
 )
+from tests.evals.skills_sop.runner import run_from_cli as run_skills_sop_from_cli
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -91,12 +92,25 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--target",
-        choices=["entity", "route", "rewrite", "planner", "executor", "verifier", "synthesis", "skill_activation", "web_search", "mainline"],
+        choices=["entity", "route", "rewrite", "planner", "executor", "verifier", "synthesis", "skill_activation", "web_search", "mainline", "skills_sop"],
         required=True,
     )
     parser.add_argument("--mode", choices=["smoke", "full"], default="smoke")
+    parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--output-dir", default="tests/evals/_runs/latest")
     args = parser.parse_args()
+    if not 1 <= args.repeat <= 10:
+        parser.error("--repeat must be between 1 and 10")
+    if args.target == "skills_sop":
+        dataset_path = Path("tests/evals/skills_sop/data") / f"{args.mode}.jsonl"
+        out = run_skills_sop_from_cli(
+            dataset_path=dataset_path,
+            output_dir=Path(args.output_dir),
+            repeat=args.repeat,
+            mode=args.mode,
+        )
+        print(out)
+        return
     path = Path("tests/evals") / args.target / "data" / "smoke.jsonl"
     records = load_jsonl(path)
     out = write_report(args.target, records, Path(args.output_dir))

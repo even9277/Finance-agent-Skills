@@ -8,6 +8,8 @@ from .contracts import (
     ConversationRequest,
     ConversationResult,
     ModelSynthesisRequest,
+    SkillRerankRequest,
+    SkillRerankResult,
     ToolCall,
     ToolObservation,
     WorkflowEvent,
@@ -35,6 +37,14 @@ class TraceSink(Protocol):
 
     def emit(self, event: WorkflowEvent) -> None:
         """尽力写入事件；Sink 失败不得改变业务结果。"""
+
+
+class SkillRerankerPort(Protocol):
+    """隔离可选在线 Skill rerank，实现不得接收完整 Skill 或历史。"""
+
+    def rerank(self, request: SkillRerankRequest) -> SkillRerankResult:
+        """仅重排 Retriever 已裁剪出的 top-K typed 候选。"""
+        ...
 
 
 class ConversationRepositoryPort(Protocol):

@@ -57,14 +57,22 @@ def _stock_rewrite() -> SopRewriteResult:
 
 def _validated_stock_plan(*, budget: RunBudget | None = None):
     catalog = ToolGovernanceCatalog.default()
+    registry = SkillRegistry()
+    runtime = registry.runtime_snapshot()
+    skill_catalog = registry.conversation_snapshot(runtime)
+    planner_context = registry.get_loader(runtime).load_for_planner(
+        "stock-first-pass",
+        query=_stock_rewrite().effective_query,
+    )
     permissions = ControlledPermissionResolver(
         catalog=catalog,
-        skill_catalog=SkillRegistry().conversation_snapshot(),
-    ).resolve(_stock_rewrite())
+        skill_catalog=skill_catalog,
+    ).resolve(_stock_rewrite(), skill_context=planner_context)
     plan = ControlledPlanner(catalog=catalog).plan(
         _stock_rewrite(),
         permissions,
         trace_id="trace-m4",
+        skill_context=planner_context,
     )
     validation = PlanValidator().validate(
         plan,
@@ -79,10 +87,16 @@ def _validated_stock_plan(*, budget: RunBudget | None = None):
 def test_skill_permission_snapshot_is_read_only_and_intersects_catalog() -> None:
     """确认 Skill 只能获得已登记且只读的工具权限。"""
     catalog = ToolGovernanceCatalog.default()
+    registry = SkillRegistry()
+    runtime = registry.runtime_snapshot()
+    planner_context = registry.get_loader(runtime).load_for_planner(
+        "stock-first-pass",
+        query=_stock_rewrite().effective_query,
+    )
     snapshot = ControlledPermissionResolver(
         catalog=catalog,
-        skill_catalog=SkillRegistry().conversation_snapshot(),
-    ).resolve(_stock_rewrite())
+        skill_catalog=registry.conversation_snapshot(runtime),
+    ).resolve(_stock_rewrite(), skill_context=planner_context)
 
     assert snapshot.allowed_tools == (
         "get_balance_sheet",
@@ -195,7 +209,7 @@ def test_executor_runs_independent_steps_with_bounded_concurrency() -> None:
             ),
         )
 
-        assert result.tool_call_count == 3
+        assert result.tool_call_count == 6
         assert result.batch_count == 1
         assert tool.max_active == 2
         assert all(item.status is StepStatus.SUCCEEDED for item in result.observations)
