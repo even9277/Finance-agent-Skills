@@ -27,6 +27,7 @@ from src.conversation.contracts import (  # noqa: E402
     EvidenceRole,
     EvidenceScoreBreakdown,
     EvidenceStatus,
+    ModelSynthesisChunk,
     ModelSynthesisRequest,
     TerminalStatus,
     VerificationResult,
@@ -43,9 +44,9 @@ class _FixtureModel:
         self.reply = reply
         self.calls: list[ModelSynthesisRequest] = []
 
-    async def synthesize(self, request: ModelSynthesisRequest) -> str:
+    async def stream_synthesize(self, request: ModelSynthesisRequest):
         self.calls.append(request)
-        return self.reply
+        yield ModelSynthesisChunk(content=self.reply, index=1)
 
 
 def _envelope(case_id: str, item: dict[str, Any]) -> EvidenceEnvelope:

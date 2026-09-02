@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from typing import Protocol
 
 from .contracts import (
     ConversationRequest,
     ConversationResult,
+    ModelSynthesisChunk,
     ModelSynthesisRequest,
     SkillRerankRequest,
     SkillRerankResult,
@@ -19,8 +21,11 @@ from .contracts import (
 class ModelPort(Protocol):
     """隔离具体 LLM 供应商的结构化总结边界。"""
 
-    async def synthesize(self, request: ModelSynthesisRequest) -> str:
-        """仅使用已验收 AnswerContextPack 生成回答。"""
+    def stream_synthesize(
+        self,
+        request: ModelSynthesisRequest,
+    ) -> AsyncIterator[ModelSynthesisChunk]:
+        """仅使用已验收 AnswerContextPack 生成有序文本增量。"""
         ...
 
 

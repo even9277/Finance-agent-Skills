@@ -10,6 +10,7 @@ from src.conversation.contracts import (
     ConversationResult,
     EvidenceDimension,
     EvidenceFact,
+    ModelSynthesisChunk,
     ModelSynthesisRequest,
     ToolCall,
     ToolObservation,
@@ -32,13 +33,16 @@ class FakeModelProvider:
 
     calls: list[ModelSynthesisRequest] = field(default_factory=list)
 
-    async def synthesize(self, request: ModelSynthesisRequest) -> str:
-        """记录结构化请求并生成不访问网络的固定回答。"""
+    async def stream_synthesize(self, request: ModelSynthesisRequest):
+        """记录结构化请求并生成一个显式离线增量。"""
         self.calls.append(request)
         entity = request.context.entity
         sources = sorted({item.source for item in request.context.accepted_evidence})
         subject = f"{entity.symbol}（{entity.name}）" if entity is not None else "当前主题"
-        return f"{subject}的离线只读证据来自：{'、'.join(sources)}。"
+        yield ModelSynthesisChunk(
+            content=f"{subject}的离线只读证据来自：{'、'.join(sources)}。",
+            index=1,
+        )
 
 
 @dataclass(slots=True)

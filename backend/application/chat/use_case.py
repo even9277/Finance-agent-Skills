@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import logging
+import time
+import uuid
+from collections.abc import AsyncGenerator
+from contextlib import suppress
+from dataclasses import dataclass, replace
 
 from src.conversation.contracts import ConversationRequest, MemoryContextItem
 from src.conversation.workflow import ControlledConversationWorkflow
@@ -17,10 +24,98 @@ from backend.application.memory.observability import (
     emit_memory_observation,
 )
 from src.conversation.contracts import TerminalStatus
-from .contracts import ChatCommand, ChatOutcome
+from .contracts import (
+    ChatCommand,
+    ChatContentDelta,
+    ChatOutcome,
+    ChatStreamCompleted,
+    ChatStreamEvent,
+    ChatStreamFailed,
+    ChatStreamFailureCode,
+    ChatStreamStarted,
+)
 from .ports import TransactionalConversationRepository
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class _QueuedChatStreamEvent:
+    """把一个应用事件与消费端发送完成确认绑定。"""
+
+    event: ChatStreamEvent
+    acknowledged: asyncio.Future[None]
+
+
+class _ChatStreamObserver:
+    """在单轮事务内累计增量，并把传输背压传播回模型。"""
+
+    def __init__(self, *, request_id: str, initial_session_id: str | None) -> None:
+        self.request_id = request_id
+        self.session_id = initial_session_id or "unavailable"
+        self.queue: asyncio.Queue[_QueuedChatStreamEvent] = asyncio.Queue(maxsize=1)
+        self.started_at = time.perf_counter()
+        self.first_delta_at: float | None = None
+        self._chunks: list[str] = []
+
+    @property
+    def chunk_count(self) -> int:
+        """返回已被应用层接受的内容增量数。"""
+        return len(self._chunks)
+
+    @property
+    def reply(self) -> str:
+        """按原始顺序重建当前已发送回答。"""
+        return "".join(self._chunks)
+
+    @property
+    def content_sha256(self) -> str:
+        """返回不暴露正文的最终内容哈希。"""
+        return hashlib.sha256(self.reply.encode("utf-8")).hexdigest()
+
+    @property
+    def ttft_ms(self) -> float | None:
+        """返回从应用流启动到首个 delta 的毫秒耗时。"""
+        if self.first_delta_at is None:
+            return None
+        return (self.first_delta_at - self.started_at) * 1000
+
+    @property
+    def elapsed_ms(self) -> float:
+        """返回应用流启动后的总毫秒耗时。"""
+        return (time.perf_counter() - self.started_at) * 1000
+
+    async def on_started(self, session_id: str) -> None:
+        """在 Repository 准备事务会话后发出唯一开始事件。"""
+        self.session_id = session_id
+        await self.emit(ChatStreamStarted(session_id=session_id, request_id=self.request_id))
+
+    async def on_content_delta(self, content: str) -> None:
+        """记录非空增量，并等待消费端确认已完成发送。"""
+        if not content:
+            return
+        if self.first_delta_at is None:
+            self.first_delta_at = time.perf_counter()
+        self._chunks.append(content)
+        await self.emit(
+            ChatContentDelta(
+                session_id=self.session_id,
+                request_id=self.request_id,
+                content=content,
+                chunk_index=self.chunk_count,
+            )
+        )
+
+    def validate_reply(self, reply: str) -> None:
+        """在持久化前确认公开增量与权威终态正文完全一致。"""
+        if self.reply != reply:
+            raise RuntimeError("streamed reply does not match workflow result")
+
+    async def emit(self, event: ChatStreamEvent) -> None:
+        """发送一个事件并等待下一次消费，以形成端到端背压。"""
+        acknowledged = asyncio.get_running_loop().create_future()
+        await self.queue.put(_QueuedChatStreamEvent(event=event, acknowledged=acknowledged))
+        await acknowledged
 
 
 class ControlledChatUseCase:
@@ -58,8 +153,113 @@ class ControlledChatUseCase:
         Raises:
             BaseException: 工作流、持久化或取消异常会在回滚后原样传播。
         """
+        return await self._execute(command)
+
+    async def stream(self, command: ChatCommand) -> AsyncGenerator[ChatStreamEvent, None]:
+        """通过同一执行核心产生带背压的协议无关流式事件。
+
+        Args:
+            command: 由 WebSocket 边界构造的聊天命令；缺少 request_id 时在此补全。
+
+        Yields:
+            Started、零到多个 ContentDelta，以及唯一 Completed 或 Failed 终态。
+
+        Raises:
+            asyncio.CancelledError: 消费端中止时取消运行任务，并由执行核心回滚未提交事务。
+        """
+        effective_command = (
+            command
+            if command.request_id
+            else replace(command, request_id=f"req_{uuid.uuid4().hex}")
+        )
+        request_id = effective_command.request_id
+        if request_id is None:  # pragma: no cover - replace 分支保证非空
+            raise RuntimeError("stream request_id is unavailable")
+        observer = _ChatStreamObserver(
+            request_id=request_id,
+            initial_session_id=effective_command.session_id,
+        )
+
+        async def run_execution() -> None:
+            try:
+                outcome = await self._execute(effective_command, stream_observer=observer)
+                await observer.emit(
+                    ChatStreamCompleted(
+                        session_id=outcome.session_id,
+                        request_id=request_id,
+                        outcome=outcome,
+                        chunk_count=observer.chunk_count,
+                        content_sha256=observer.content_sha256,
+                        ttft_ms=observer.ttft_ms,
+                        elapsed_ms=observer.elapsed_ms,
+                    )
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "chat.stream.failed request_id=%s session_id=%s stage=%s status=%s "
+                    "error_code=%s error_type=%s elapsed_ms=%.2f chunk_count=%d",
+                    request_id,
+                    observer.session_id,
+                    "chat.stream",
+                    "FAILED",
+                    "CHAT_STREAM_FAILED",
+                    type(exc).__name__,
+                    observer.elapsed_ms,
+                    observer.chunk_count,
+                )
+                await observer.emit(
+                    ChatStreamFailed(
+                        session_id=observer.session_id,
+                        request_id=request_id,
+                        error_code=ChatStreamFailureCode.STREAM_FAILED,
+                        chunk_count=observer.chunk_count,
+                        ttft_ms=observer.ttft_ms,
+                        elapsed_ms=observer.elapsed_ms,
+                    )
+                )
+
+        execution_task = asyncio.create_task(run_execution())
+        try:
+            while not execution_task.done() or not observer.queue.empty():
+                receive_task = asyncio.create_task(observer.queue.get())
+                done, _ = await asyncio.wait(
+                    {execution_task, receive_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if receive_task in done:
+                    queued = receive_task.result()
+                    try:
+                        yield queued.event
+                    except GeneratorExit:
+                        raise
+                    else:
+                        if not queued.acknowledged.done():
+                            queued.acknowledged.set_result(None)
+                    continue
+
+                receive_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await receive_task
+                await execution_task
+        finally:
+            if not execution_task.done():
+                execution_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await execution_task
+
+    async def _execute(
+        self,
+        command: ChatCommand,
+        *,
+        stream_observer: _ChatStreamObserver | None = None,
+    ) -> ChatOutcome:
+        """运行共享聊天核心，并在流式模式下把提交受发送确认约束。"""
         try:
             prepared = await self._repository.prepare_turn(command)
+            if stream_observer is not None:
+                await stream_observer.on_started(prepared.session_id)
             self._observe(
                 MemoryStage.PREFLIGHT,
                 MemoryStatus.SUCCEEDED,
@@ -74,7 +274,6 @@ class ControlledChatUseCase:
                 )
                 if intent is not None:
                     memory_result = await self._memory_commands.execute(intent)
-                    await self._repository.commit()
                     command_stage = (
                         MemoryStage.DELETE
                         if intent.kind.value in {"DELETE", "FORGET", "CONFIRM"}
@@ -97,7 +296,7 @@ class ControlledChatUseCase:
                         error_code=memory_result.error_code,
                     )
                     terminal_status = _terminal_status_for_memory(memory_result.status.value)
-                    return ChatOutcome(
+                    outcome = ChatOutcome(
                         reply=memory_result.user_message,
                         session_id=prepared.session_id,
                         status=terminal_status,
@@ -105,6 +304,11 @@ class ControlledChatUseCase:
                         working_state=prepared.working_state,
                         memory_command=memory_result,
                     )
+                    if stream_observer is not None and outcome.reply:
+                        await stream_observer.on_content_delta(outcome.reply)
+                        stream_observer.validate_reply(outcome.reply)
+                    await self._repository.commit()
+                    return outcome
             request = ConversationRequest(
                 user_id=command.user_id,
                 session_id=prepared.session_id,
@@ -174,10 +378,16 @@ class ControlledChatUseCase:
                 "running_summary": prepared.running_summary,
                 "working_state": prepared.working_state,
             }
-            # 未启用 M6 时不向旧的测试替身/兼容 Port 传递新增关键字，保持边界兼容。
+            # 仅注入当前运行实际启用的增强上下文和流式接收器，保持单一执行核心。
             if self._retrieval is not None:
                 workflow_kwargs["memory_context"] = memory_context
+            if stream_observer is not None:
+                workflow_kwargs["on_content_delta"] = stream_observer.on_content_delta
             result = await self._workflow.run(request, **workflow_kwargs)
+            if stream_observer is not None:
+                if stream_observer.chunk_count == 0 and result.reply:
+                    await stream_observer.on_content_delta(result.reply)
+                stream_observer.validate_reply(result.reply)
             working_state = await self._repository.apply_working_state(request, result)
             context_window = await self._repository.save_result(request, result)
             await self._repository.commit()

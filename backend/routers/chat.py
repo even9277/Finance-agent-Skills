@@ -2,16 +2,29 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-from dataclasses import asdict
-from typing import Optional
+import time
+import uuid
+from collections.abc import AsyncGenerator
+from contextlib import aclosing, suppress
+from dataclasses import asdict, dataclass
+from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.application.chat.contracts import ChatCommand, ChatContextWindowData
+from backend.application.chat.contracts import (
+    ChatCommand,
+    ChatContentDelta,
+    ChatContextWindowData,
+    ChatStreamCompleted,
+    ChatStreamEvent,
+    ChatStreamFailed,
+    ChatStreamStarted,
+)
 from backend.application.chat.factory import build_chat_session_use_case, build_chat_use_case
 from backend.db.database import AsyncSessionFactory, get_db
 from backend.middleware.auth import (
@@ -22,13 +35,22 @@ from backend.middleware.auth import (
     require_query_user,
 )
 from backend.schemas.chat import (
+    CHAT_STREAM_PROTOCOL_VERSION,
+    ChatContentDeltaFrame,
     ChatContextWindow,
+    ChatContextUpdateFrame,
     ChatMessage,
     ChatMessageRequest,
     ChatMessageResponse,
+    ChatMemoryCommandFrame,
     MemoryCommandResultResponse,
+    ChatSkillConfirmationFrame,
     SkillConfirmationCandidateResponse,
     SkillConfirmationResponse,
+    ChatStreamEndFrame,
+    ChatStreamEnvelope,
+    ChatStreamErrorFrame,
+    ChatStreamStartFrame,
     ChatSessionListItem,
     ChatSessionMessages,
     ChatSessionRenameRequest,
@@ -42,6 +64,7 @@ router = APIRouter()
 
 _CHAT_INTERNAL_ERROR = "CHAT_INTERNAL_ERROR"
 _CHAT_INTERNAL_MESSAGE = "对话处理失败"
+_CHAT_STREAM_INCOMPLETE = "CHAT_STREAM_INCOMPLETE"
 
 _TEMPLATES = [
     ChatTemplateItem(id="t1", label="基本面分析", content="帮我分析 [股票名] 的基本面"),
@@ -51,6 +74,285 @@ _TEMPLATES = [
     ChatTemplateItem(id="t5", label="对比分析", content="对比分析 [A] 和 [B] 哪只更值得买"),
     ChatTemplateItem(id="t6", label="持仓建议", content="结合我的风险偏好给出持仓建议"),
 ]
+
+
+@dataclass(slots=True)
+class _WebSocketStreamState:
+    """记录单连接的低敏协议状态和发送侧指标。"""
+
+    request_id: str
+    session_id: str
+    started_at: float
+    sequence: int = 0
+    chunk_count: int = 0
+    output_chars: int = 0
+    first_delta_sent_at: float | None = None
+    terminal_sent: bool = False
+
+    def next_sequence(self) -> int:
+        """返回连接内严格递增且从 1 开始的公开帧序号。"""
+        self.sequence += 1
+        return self.sequence
+
+    @property
+    def elapsed_ms(self) -> float:
+        """返回从连接进入聊天处理到当前时刻的毫秒耗时。"""
+        return (time.perf_counter() - self.started_at) * 1000
+
+    @property
+    def server_ttft_ms(self) -> float | None:
+        """返回首个非空正文成功写入 WebSocket 的毫秒耗时。"""
+        if self.first_delta_sent_at is None:
+            return None
+        return (self.first_delta_sent_at - self.started_at) * 1000
+
+
+async def _send_public_frame(
+    websocket: WebSocket,
+    frame: ChatStreamEnvelope,
+) -> None:
+    """发送一个已经通过 Pydantic 合同验证的 v2 公开帧。
+
+    Args:
+        websocket: 当前已接受的客户端连接。
+        frame: 包含协议版本、关联标识和严格序号的公开 Schema。
+
+    Raises:
+        WebSocketDisconnect: 客户端在发送期间断开。
+        RuntimeError: ASGI 传输拒绝写入；调用方必须关闭应用事件流。
+    """
+    await websocket.send_json(frame.model_dump(mode="json", exclude_none=True))
+
+
+async def _send_stream_error(
+    websocket: WebSocket,
+    state: _WebSocketStreamState,
+    *,
+    code: Literal[
+        "CHAT_STREAM_FAILED",
+        "CHAT_INVALID_JSON",
+        "CHAT_INVALID_REQUEST",
+        "CHAT_INTERNAL_ERROR",
+        "CHAT_STREAM_INCOMPLETE",
+    ],
+    message: str,
+) -> None:
+    """发送唯一安全失败终态，不包含内部异常或正文。"""
+    await _send_public_frame(
+        websocket,
+        ChatStreamErrorFrame(
+            protocol_version=CHAT_STREAM_PROTOCOL_VERSION,
+            request_id=state.request_id,
+            session_id=state.session_id,
+            sequence=state.next_sequence(),
+            code=code,
+            message=message,
+            chunk_count=state.chunk_count,
+        ),
+    )
+    state.terminal_sent = True
+
+
+async def _present_chat_stream(
+    websocket: WebSocket,
+    event_stream: AsyncGenerator[ChatStreamEvent, None],
+    state: _WebSocketStreamState,
+) -> None:
+    """把 Application 事件映射为单调有序的 WebSocket v2 生命周期。
+
+    Args:
+        websocket: 当前已接受的客户端连接。
+        event_stream: 唯一聊天用例产生的带背压异步事件流。
+        state: 当前连接的安全关联字段、序号和发送指标。
+
+    Raises:
+        WebSocketDisconnect: 发送中断开时原样传播，并由 ``aclosing`` 取消上游。
+        RuntimeError: Application 违反终态或 chunk 数量合同时终止连接。
+    """
+    async with aclosing(event_stream):
+        async for event in event_stream:
+            state.request_id = event.request_id
+            state.session_id = event.session_id
+
+            if isinstance(event, ChatStreamStarted):
+                await _send_public_frame(
+                    websocket,
+                    ChatStreamStartFrame(
+                        request_id=event.request_id,
+                        session_id=event.session_id,
+                        sequence=state.next_sequence(),
+                    ),
+                )
+                continue
+
+            if isinstance(event, ChatContentDelta):
+                await _send_public_frame(
+                    websocket,
+                    ChatContentDeltaFrame(
+                        request_id=event.request_id,
+                        session_id=event.session_id,
+                        sequence=state.next_sequence(),
+                        content=event.content,
+                        chunk_index=event.chunk_index,
+                    ),
+                )
+                state.chunk_count += 1
+                state.output_chars += len(event.content)
+                if state.first_delta_sent_at is None:
+                    state.first_delta_sent_at = time.perf_counter()
+                continue
+
+            if isinstance(event, ChatStreamCompleted):
+                if event.chunk_count != state.chunk_count:
+                    raise RuntimeError("application and WebSocket chunk counts do not match")
+                skill_confirmation = _skill_confirmation_schema(event.outcome.skill_confirmation)
+                if skill_confirmation is not None:
+                    await _send_public_frame(
+                        websocket,
+                        ChatSkillConfirmationFrame(
+                            request_id=event.request_id,
+                            session_id=event.session_id,
+                            sequence=state.next_sequence(),
+                            confirmation=skill_confirmation,
+                        ),
+                    )
+                memory_command = _memory_command_schema(event.outcome.memory_command)
+                if memory_command is not None:
+                    await _send_public_frame(
+                        websocket,
+                        ChatMemoryCommandFrame(
+                            request_id=event.request_id,
+                            session_id=event.session_id,
+                            sequence=state.next_sequence(),
+                            memory_command=memory_command,
+                        ),
+                    )
+                context = _context_schema(event.outcome.context_window)
+                if context is not None:
+                    await _send_public_frame(
+                        websocket,
+                        ChatContextUpdateFrame(
+                            request_id=event.request_id,
+                            session_id=event.session_id,
+                            sequence=state.next_sequence(),
+                            context_window=context,
+                        ),
+                    )
+                await _send_public_frame(
+                    websocket,
+                    ChatStreamEndFrame(
+                        request_id=event.request_id,
+                        session_id=event.session_id,
+                        sequence=state.next_sequence(),
+                        status=event.outcome.status,
+                        chunk_count=event.chunk_count,
+                        content_sha256=event.content_sha256,
+                    ),
+                )
+                state.terminal_sent = True
+                logger.info(
+                    "chat.websocket.stream_terminated request_id=%s session_id=%s stage=%s "
+                    "status=%s chunk_count=%d output_chars=%d server_ttft_ms=%s "
+                    "application_ttft_ms=%s elapsed_ms=%.2f error_code=%s",
+                    state.request_id,
+                    state.session_id,
+                    "chat.websocket.send",
+                    event.outcome.status.value,
+                    state.chunk_count,
+                    state.output_chars,
+                    state.server_ttft_ms,
+                    event.ttft_ms,
+                    state.elapsed_ms,
+                    event.outcome.error_code.value if event.outcome.error_code else None,
+                )
+                return
+
+            if isinstance(event, ChatStreamFailed):
+                await _send_stream_error(
+                    websocket,
+                    state,
+                    code=event.error_code.value,
+                    message=_CHAT_INTERNAL_MESSAGE,
+                )
+                logger.warning(
+                    "chat.websocket.stream_terminated request_id=%s session_id=%s stage=%s "
+                    "status=%s chunk_count=%d output_chars=%d server_ttft_ms=%s "
+                    "application_ttft_ms=%s elapsed_ms=%.2f error_code=%s",
+                    state.request_id,
+                    state.session_id,
+                    "chat.websocket.send",
+                    "FAILED",
+                    state.chunk_count,
+                    state.output_chars,
+                    state.server_ttft_ms,
+                    event.ttft_ms,
+                    state.elapsed_ms,
+                    event.error_code,
+                )
+                return
+
+            raise RuntimeError("unsupported application chat stream event")
+
+        if not state.terminal_sent:
+            await _send_stream_error(
+                websocket,
+                state,
+                code=_CHAT_STREAM_INCOMPLETE,
+                message=_CHAT_INTERNAL_MESSAGE,
+            )
+
+
+async def _wait_for_client_disconnect(websocket: WebSocket) -> None:
+    """持续读取 ASGI 连接事件，直到浏览器明确断开。
+
+    Args:
+        websocket: 已完成首个业务请求读取的当前连接。
+
+    Raises:
+        WebSocketDisconnect: 收到 ``websocket.disconnect`` 时携带客户端关闭码。
+        RuntimeError: Starlette 连接状态异常时原样传播，由公开入口安全收口。
+    """
+    while True:
+        message = await websocket.receive()
+        if message["type"] == "websocket.disconnect":
+            raise WebSocketDisconnect(code=int(message.get("code") or 1000))
+
+
+async def _present_chat_stream_until_disconnect(
+    websocket: WebSocket,
+    event_stream: AsyncGenerator[ChatStreamEvent, None],
+    state: _WebSocketStreamState,
+) -> None:
+    """竞争发送生命周期与主动断连监听，并确定性取消败方。
+
+    Args:
+        websocket: 当前已接受且已读取一轮请求的连接。
+        event_stream: 唯一 Application 事件流。
+        state: 当前连接的公开协议状态。
+
+    Raises:
+        WebSocketDisconnect: 客户端先断开时，在关闭上游事件流后传播。
+        BaseException: Presenter 或连接监听异常在清理另一个任务后传播。
+    """
+    presenter_task = asyncio.create_task(_present_chat_stream(websocket, event_stream, state))
+    disconnect_task = asyncio.create_task(_wait_for_client_disconnect(websocket))
+    done, _ = await asyncio.wait(
+        {presenter_task, disconnect_task},
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+
+    if presenter_task in done:
+        if not disconnect_task.done():
+            disconnect_task.cancel()
+        with suppress(asyncio.CancelledError, WebSocketDisconnect):
+            await disconnect_task
+        await presenter_task
+        return
+
+    presenter_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await presenter_task
+    await disconnect_task
 
 
 def _context_schema(value: ChatContextWindowData | None) -> ChatContextWindow | None:
@@ -119,6 +421,7 @@ async def send_message(
                 user_id=effective_user_id,
                 message=body.message,
                 session_id=body.session_id,
+                request_id=body.request_id,
                 explicit_skill=body.explicit_skill,
             )
         )
@@ -142,91 +445,93 @@ async def send_message(
 
 @router.websocket("/stream")
 async def chat_stream(websocket: WebSocket) -> None:
-    """把同一聊天用例结果映射为兼容的 WebSocket 基础帧。
+    """校验单轮输入并发送唯一 ``chat-stream-v2`` 生命周期。
 
-    客户端每次连接发送一轮 JSON。服务端依次发送 ``session_id``、回答文本、
-    可选 ``context_update`` 和 ``done``；内部异常只返回稳定错误码与安全文案。
+    WebSocket 层只负责认证、输入校验、v2 Schema 映射和连接清理。发送失败或
+    客户端断连会关闭 Application 异步生成器，使取消传播到模型和未提交事务。
     """
+    stream_state = _WebSocketStreamState(
+        request_id=f"req_{uuid.uuid4().hex}",
+        session_id="unavailable",
+        started_at=time.perf_counter(),
+    )
     await websocket.accept()
     try:
         auth = await authenticate_websocket(websocket)
         try:
             payload = json.loads(await websocket.receive_text())
         except json.JSONDecodeError:
-            await websocket.send_json(
-                {"type": "error", "code": "CHAT_INVALID_JSON", "message": "请求格式错误，需要 JSON"}
+            await _send_stream_error(
+                websocket,
+                stream_state,
+                code="CHAT_INVALID_JSON",
+                message="请求格式错误，需要 JSON",
             )
             return
 
         try:
             request = ChatMessageRequest.model_validate(payload)
         except ValidationError:
-            await websocket.send_json(
-                {
-                    "type": "error",
-                    "code": "CHAT_INVALID_REQUEST",
-                    "message": "user_id 和 message 不能为空",
-                }
+            await _send_stream_error(
+                websocket,
+                stream_state,
+                code="CHAT_INVALID_REQUEST",
+                message="user_id 和 message 不能为空",
             )
             return
         effective_user_id = ensure_user_access(request.user_id, auth)
+        stream_state.request_id = request.request_id or stream_state.request_id
+        stream_state.session_id = request.session_id or stream_state.session_id
 
         async with AsyncSessionFactory() as db:
-            outcome = await build_chat_use_case(db).execute(
+            use_case = build_chat_use_case(db)
+            event_stream = use_case.stream(
                 ChatCommand(
                     user_id=effective_user_id,
                     message=request.message,
                     session_id=request.session_id,
+                    request_id=request.request_id,
                     explicit_skill=request.explicit_skill,
                 )
             )
-
-        await websocket.send_json({"type": "session_id", "session_id": outcome.session_id})
-        skill_confirmation = _skill_confirmation_schema(outcome.skill_confirmation)
-        if skill_confirmation is not None:
-            await websocket.send_json(
-                {
-                    "type": "skill_confirm",
-                    "session_id": outcome.session_id,
-                    "confirmation": skill_confirmation.model_dump(mode="json"),
-                }
-            )
-        memory_command = _memory_command_schema(outcome.memory_command)
-        if memory_command is not None:
-            await websocket.send_json(
-                {
-                    "type": "memory_command",
-                    "session_id": outcome.session_id,
-                    "memory_command": memory_command.model_dump(mode="json"),
-                }
-            )
-        if outcome.reply:
-            await websocket.send_text(outcome.reply)
-        context = _context_schema(outcome.context_window)
-        if context is not None:
-            await websocket.send_json(
-                {
-                    "type": "context_update",
-                    "session_id": outcome.session_id,
-                    "context_window": context.model_dump(mode="json"),
-                }
-            )
-        await websocket.send_json({"type": "done", "session_id": outcome.session_id})
+            await _present_chat_stream_until_disconnect(websocket, event_stream, stream_state)
     except WebSocketDisconnect:
-        logger.info("chat.websocket.disconnected")
+        logger.info(
+            "chat.websocket.disconnected request_id=%s session_id=%s stage=%s status=%s "
+            "chunk_count=%d output_chars=%d elapsed_ms=%.2f disconnect_reason=%s",
+            stream_state.request_id,
+            stream_state.session_id,
+            "chat.websocket.send",
+            "CANCELLED",
+            stream_state.chunk_count,
+            stream_state.output_chars,
+            stream_state.elapsed_ms,
+            "CLIENT_DISCONNECT",
+        )
     except Exception as exc:
         logger.error(
-            "chat.websocket.failed error_code=%s error_type=%s",
+            "chat.websocket.failed request_id=%s session_id=%s stage=%s status=%s "
+            "chunk_count=%d output_chars=%d elapsed_ms=%.2f error_code=%s error_type=%s",
+            stream_state.request_id,
+            stream_state.session_id,
+            "chat.websocket.send",
+            "FAILED",
+            stream_state.chunk_count,
+            stream_state.output_chars,
+            stream_state.elapsed_ms,
             _CHAT_INTERNAL_ERROR,
             type(exc).__name__,
-            exc_info=True,
         )
-        try:
-            await websocket.send_json(
-                {"type": "error", "code": _CHAT_INTERNAL_ERROR, "message": _CHAT_INTERNAL_MESSAGE}
-            )
-        except Exception:
-            logger.debug("chat.websocket.error_frame_skipped")
+        if not stream_state.terminal_sent:
+            try:
+                await _send_stream_error(
+                    websocket,
+                    stream_state,
+                    code=_CHAT_INTERNAL_ERROR,
+                    message=_CHAT_INTERNAL_MESSAGE,
+                )
+            except Exception:
+                logger.debug("chat.websocket.error_frame_skipped")
     finally:
         try:
             await websocket.close()

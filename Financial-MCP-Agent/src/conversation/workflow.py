@@ -6,6 +6,7 @@ import hashlib
 import logging
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import date
 from typing import TYPE_CHECKING, cast
@@ -60,7 +61,7 @@ from .contracts import (
 )
 from .control import RuleController
 from .entity import AuthoritativeEntityResolver
-from .errors import StepBudgetExceededError
+from .errors import ModelSynthesisError, StepBudgetExceededError
 from .execution import ControlledExecutor
 from .permissions import ControlledPermissionResolver
 from .planning import ControlledPlanner
@@ -321,6 +322,7 @@ class ControlledConversationWorkflow:
         running_summary: str | None = None,
         working_state: WorkingState | None = None,
         memory_context: tuple[MemoryContextItem, ...] = (),
+        on_content_delta: Callable[[str], Awaitable[None]] | None = None,
     ) -> ConversationResult:
         """执行一轮受控对话并返回唯一终态。
 
@@ -331,6 +333,7 @@ class ControlledConversationWorkflow:
             working_state: 当前会话版本化热状态；仅作为受门控继承候选。
             memory_context: 已经由 Application 召回并通过 PostgreSQL 后过滤的历史记忆；
                 只允许进入上下文和合成阶段。
+            on_content_delta: 可选协议无关增量接收器；其背压和取消应传播到模型流。
 
         Returns:
             包含阶段事件、证据门控和终态的不可变结果。
@@ -983,7 +986,10 @@ class ControlledConversationWorkflow:
                 retrieved_memories=packet.retrieved_memories,
                 skill_guidance=skill_guidance,
             )
-            reply = await self._services.synthesizer.synthesize(pack)
+            reply = await self._synthesize_reply(
+                pack,
+                on_content_delta=on_content_delta,
+            )
             self._emit(
                 events,
                 context,
@@ -1052,21 +1058,77 @@ class ControlledConversationWorkflow:
                 reply="受控对话已达到本轮步骤预算，已安全终止。",
             )
         except Exception as exc:
-            # 领域兜底只记录异常类型，防止 Provider 原始消息绕过脱敏边界。
-            logger.error(
-                "controlled_chat.workflow_failed trace_id=%s stage=%s error_code=%s error_type=%s",
-                context.trace_id,
-                state.phase.value,
-                ErrorCode.INTERNAL_ERROR.value,
-                type(exc).__name__,
-            )
-            return self._failed_result(
+            return self._handle_unexpected_failure(
+                exc,
                 state=state,
                 events=events,
                 context=context,
-                error_code=ErrorCode.INTERNAL_ERROR,
-                reply="受控对话处理失败，请稍后重试。",
             )
+
+    def _handle_unexpected_failure(
+        self,
+        exc: Exception,
+        *,
+        state: ConversationState,
+        events: list[WorkflowEvent],
+        context: ConversationRunContext,
+    ) -> ConversationResult:
+        """执行工作流异常策略，并隔离 Provider 技术失败与业务终态。
+
+        Args:
+            exc: 主编排阶段捕获的未预期异常。
+            state: 当前领域状态机，用于安全终止和低敏日志。
+            events: 当前轮已经产生的受控事件。
+            context: 当前轮稳定追踪上下文。
+
+        Returns:
+            非 Provider 异常对应的安全领域失败终态。
+
+        Raises:
+            ModelSynthesisError: Provider 流式技术失败必须交由 Application 回滚。
+        """
+        if isinstance(exc, ModelSynthesisError):
+            raise exc
+        # 领域兜底只记录异常类型，防止 Provider 原始消息绕过脱敏边界。
+        logger.error(
+            "controlled_chat.workflow_failed trace_id=%s stage=%s error_code=%s error_type=%s",
+            context.trace_id,
+            state.phase.value,
+            ErrorCode.INTERNAL_ERROR.value,
+            type(exc).__name__,
+        )
+        return self._failed_result(
+            state=state,
+            events=events,
+            context=context,
+            error_code=ErrorCode.INTERNAL_ERROR,
+            reply="受控对话处理失败，请稍后重试。",
+        )
+
+    async def _synthesize_reply(
+        self,
+        pack: AnswerContextPack,
+        *,
+        on_content_delta: Callable[[str], Awaitable[None]] | None,
+    ) -> str:
+        """聚合模型增量，并把每个非空片段同步交给应用层。
+
+        Args:
+            pack: 已通过证据门控的权威回答上下文。
+            on_content_delta: 可选应用层接收器；其背压和取消原样向上游传播。
+
+        Returns:
+            按模型原始顺序拼接的完整回答正文。
+
+        Raises:
+            ModelSynthesisError: 模型流启动或消费过程中发生技术失败。
+        """
+        reply_chunks: list[str] = []
+        async for content in self._services.synthesizer.stream(pack):
+            reply_chunks.append(content)
+            if on_content_delta is not None:
+                await on_content_delta(content)
+        return "".join(reply_chunks)
 
     @staticmethod
     def _result_error_code(verification: VerificationResult) -> ErrorCode | None:

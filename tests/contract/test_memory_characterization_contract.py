@@ -140,12 +140,23 @@ def test_prepared_turn_exposes_typed_working_state() -> None:
 
 @pytest.mark.contract
 def test_chat_use_case_enqueues_compaction_after_a_committed_turn() -> None:
-    """目标触发器：聊天用例必须在提交后进入压缩任务应用边界。"""
-    source = dedent(inspect.getsource(ControlledChatUseCase.execute))
-    tree = ast.parse(source)
+    """目标触发器：公开入口委托的共享核心必须在提交后进入压缩边界。"""
+    public_source = dedent(inspect.getsource(ControlledChatUseCase.execute))
+    public_tree = ast.parse(public_source)
+    public_awaited_calls = [
+        node.value.func.attr
+        for node in ast.walk(public_tree)
+        if isinstance(node, ast.Await)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Attribute)
+    ]
+    assert public_awaited_calls == ["_execute"]
+
+    core_source = dedent(inspect.getsource(ControlledChatUseCase._execute))
+    core_tree = ast.parse(core_source)
     awaited_calls = [
         node.value.func.attr
-        for node in ast.walk(tree)
+        for node in ast.walk(core_tree)
         if isinstance(node, ast.Await)
         and isinstance(node.value, ast.Call)
         and isinstance(node.value.func, ast.Attribute)

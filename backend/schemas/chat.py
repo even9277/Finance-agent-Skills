@@ -1,9 +1,10 @@
 """对话相关 Pydantic 模型"""
 
 from datetime import datetime
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
+from src.conversation.contracts import TerminalStatus
 
 
 class SkillConfirmationCandidateResponse(BaseModel):
@@ -27,6 +28,13 @@ class ChatMessageRequest(BaseModel):
     user_id: str = Field(..., min_length=1, description="用户唯一标识")
     message: str = Field(..., min_length=1, max_length=10_000, description="用户消息内容")
     session_id: Optional[str] = Field(None, description="会话ID，为空则创建新会话")
+    request_id: Optional[str] = Field(
+        None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+        description="客户端可选请求关联标识；为空时服务端生成。",
+    )
     explicit_skill: Optional[str] = Field(
         None,
         min_length=1,
@@ -41,10 +49,10 @@ class ChatMessageRequest(BaseModel):
         """在长度校验前去除边界空白，避免空白请求进入业务层。"""
         return value.strip() if isinstance(value, str) else value
 
-    @field_validator("session_id", mode="before")
+    @field_validator("session_id", "request_id", mode="before")
     @classmethod
-    def _normalize_optional_session_id(cls, value: object) -> object:
-        """把空白 session_id 视为新会话，保持旧客户端兼容。"""
+    def _normalize_optional_identifier(cls, value: object) -> object:
+        """把空白可选标识视为未提供，保持旧客户端兼容。"""
         if isinstance(value, str):
             return value.strip() or None
         return value
@@ -100,6 +108,77 @@ class ChatMessageResponse(BaseModel):
         exclude_if=lambda value: value is None,
         description="仅在中置信 Skill 路由时返回；旧响应形状保持不变。",
     )
+
+
+CHAT_STREAM_PROTOCOL_VERSION = "chat-stream-v2"
+
+
+class ChatStreamEnvelope(BaseModel):
+    """公开 WebSocket v2 帧的稳定关联与顺序字段。"""
+
+    protocol_version: Literal["chat-stream-v2"] = CHAT_STREAM_PROTOCOL_VERSION
+    request_id: str = Field(..., min_length=1, max_length=128)
+    session_id: str = Field(..., min_length=1, max_length=128)
+    sequence: int = Field(..., ge=1)
+
+
+class ChatStreamStartFrame(ChatStreamEnvelope):
+    """表示服务端已经准备好本轮事务会话。"""
+
+    type: Literal["stream_start"] = "stream_start"
+
+
+class ChatContentDeltaFrame(ChatStreamEnvelope):
+    """表示可直接追加到同一助手消息的一段非空正文。"""
+
+    type: Literal["content_delta"] = "content_delta"
+    content: str = Field(..., min_length=1)
+    chunk_index: int = Field(..., ge=1)
+
+
+class ChatContextUpdateFrame(ChatStreamEnvelope):
+    """表示已提交终态对应的上下文窗口快照。"""
+
+    type: Literal["context_update"] = "context_update"
+    context_window: ChatContextWindow
+
+
+class ChatMemoryCommandFrame(ChatStreamEnvelope):
+    """表示已提交记忆命令的安全公开结果。"""
+
+    type: Literal["memory_command"] = "memory_command"
+    memory_command: MemoryCommandResultResponse
+
+
+class ChatSkillConfirmationFrame(ChatStreamEnvelope):
+    """表示需要用户确认的 Skill 候选，不包含工具权限。"""
+
+    type: Literal["skill_confirm"] = "skill_confirm"
+    confirmation: SkillConfirmationResponse
+
+
+class ChatStreamEndFrame(ChatStreamEnvelope):
+    """表示回答已经提交且本轮不会再产生正文增量。"""
+
+    type: Literal["stream_end"] = "stream_end"
+    status: TerminalStatus
+    chunk_count: int = Field(..., ge=0)
+    content_sha256: str = Field(..., pattern=r"^[a-f0-9]{64}$")
+
+
+class ChatStreamErrorFrame(ChatStreamEnvelope):
+    """表示技术失败或边界拒绝的唯一安全终态。"""
+
+    type: Literal["stream_error"] = "stream_error"
+    code: Literal[
+        "CHAT_STREAM_FAILED",
+        "CHAT_INVALID_JSON",
+        "CHAT_INVALID_REQUEST",
+        "CHAT_INTERNAL_ERROR",
+        "CHAT_STREAM_INCOMPLETE",
+    ]
+    message: str = Field(..., min_length=1, max_length=200)
+    chunk_count: int = Field(..., ge=0)
 
 
 class ChatSessionRenameRequest(BaseModel):

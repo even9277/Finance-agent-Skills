@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import json
+import hashlib
 import sys
 from contextlib import AbstractAsyncContextManager
 from pathlib import Path
@@ -17,7 +17,12 @@ for import_root in (ROOT, AGENT_ROOT):
     if str(import_root) not in sys.path:
         sys.path.insert(0, str(import_root))
 
-from backend.application.chat.contracts import ChatOutcome  # noqa: E402
+from backend.application.chat.contracts import (  # noqa: E402
+    ChatContentDelta,
+    ChatOutcome,
+    ChatStreamCompleted,
+    ChatStreamStarted,
+)
 from backend.config import settings  # noqa: E402
 from backend.main import app  # noqa: E402
 from backend.routers import chat as chat_router  # noqa: E402
@@ -70,6 +75,27 @@ def _confirmation_outcome() -> ChatOutcome:
     )
 
 
+async def _stream_outcome(command, outcome: ChatOutcome):
+    """把非模型业务回复表示为一个显式降级 delta 和提交终态。"""
+    request_id = command.request_id or "request-skill-confirm"
+    yield ChatStreamStarted(session_id=outcome.session_id, request_id=request_id)
+    yield ChatContentDelta(
+        session_id=outcome.session_id,
+        request_id=request_id,
+        content=outcome.reply,
+        chunk_index=1,
+    )
+    yield ChatStreamCompleted(
+        session_id=outcome.session_id,
+        request_id=request_id,
+        outcome=outcome,
+        chunk_count=1,
+        content_sha256=hashlib.sha256(outcome.reply.encode()).hexdigest(),
+        ttft_ms=0.0,
+        elapsed_ms=1.0,
+    )
+
+
 @pytest.mark.contract
 def test_rest_forwards_explicit_skill_and_returns_optional_confirmation() -> None:
     """REST 必须透传显式选择，并仅在需要时增量返回确认载荷。"""
@@ -102,10 +128,13 @@ def test_rest_forwards_explicit_skill_and_returns_optional_confirmation() -> Non
 
 
 @pytest.mark.contract
-def test_websocket_emits_skill_confirm_frame_without_changing_normal_text_frame() -> None:
-    """中置信 WS 应先发确认控制帧，同时保留旧文本澄清和 done。"""
+def test_websocket_emits_skill_confirm_inside_v2_envelope() -> None:
+    """中置信 WS 应在单 delta 后发送带统一关联字段的确认帧。"""
     use_case = Mock()
-    use_case.execute = AsyncMock(return_value=_confirmation_outcome())
+    use_case.execute = AsyncMock(side_effect=AssertionError("legacy execute path must not run"))
+    use_case.stream = Mock(
+        side_effect=lambda command: _stream_outcome(command, _confirmation_outcome())
+    )
 
     with patch.object(settings, "auth_enabled", False), patch.object(
         chat_router,
@@ -118,30 +147,39 @@ def test_websocket_emits_skill_confirm_frame_without_changing_normal_text_frame(
                     "user_id": "user-confirm",
                     "message": "帮我分析一下黄金相关产品",
                     "session_id": "session-confirm",
+                    "request_id": "request-skill-confirm",
                 }
             )
-            frames = [websocket.receive_text() for _ in range(4)]
+            frames = [websocket.receive_json() for _ in range(4)]
 
-    assert json.loads(frames[0]) == {"type": "session_id", "session_id": "session-confirm"}
-    confirmation_frame = json.loads(frames[1])
+    assert [frame["type"] for frame in frames] == [
+        "stream_start",
+        "content_delta",
+        "skill_confirm",
+        "stream_end",
+    ]
+    assert [frame["sequence"] for frame in frames] == [1, 2, 3, 4]
+    assert all(frame["protocol_version"] == "chat-stream-v2" for frame in frames)
+    assert all(frame["request_id"] == "request-skill-confirm" for frame in frames)
+    confirmation_frame = frames[2]
     assert confirmation_frame["type"] == "skill_confirm"
     assert confirmation_frame["session_id"] == "session-confirm"
     assert confirmation_frame["confirmation"]["reason"] == "需要用户确认专业分析任务"
-    assert frames[2] == "请选择更符合意图的分析 Skill。"
-    assert json.loads(frames[3]) == {"type": "done", "session_id": "session-confirm"}
+    assert frames[1]["content"] == "请选择更符合意图的分析 Skill。"
+    assert frames[3]["status"] == "NEEDS_CLARIFICATION"
 
 
 @pytest.mark.contract
 def test_websocket_forwards_explicit_skill_on_same_session() -> None:
     """确认后的 WS 重提必须携带原 session 与 explicit Skill。"""
     use_case = Mock()
-    use_case.execute = AsyncMock(
-        return_value=ChatOutcome(
-            reply="已按基金比较执行。",
-            session_id="session-confirm",
-            status=TerminalStatus.SUCCEEDED,
-        )
+    outcome = ChatOutcome(
+        reply="已按基金比较执行。",
+        session_id="session-confirm",
+        status=TerminalStatus.SUCCEEDED,
     )
+    use_case.execute = AsyncMock(side_effect=AssertionError("legacy execute path must not run"))
+    use_case.stream = Mock(side_effect=lambda command: _stream_outcome(command, outcome))
 
     with patch.object(settings, "auth_enabled", False), patch.object(
         chat_router,
@@ -154,14 +192,19 @@ def test_websocket_forwards_explicit_skill_on_same_session() -> None:
                     "user_id": "user-confirm",
                     "message": "比较两只黄金基金",
                     "session_id": "session-confirm",
+                    "request_id": "request-explicit-skill",
                     "explicit_skill": "fund-compare",
                 }
             )
-            frames = [websocket.receive_text() for _ in range(3)]
+            frames = [websocket.receive_json() for _ in range(3)]
 
-    assert json.loads(frames[0])["type"] == "session_id"
-    assert frames[1] == "已按基金比较执行。"
-    assert json.loads(frames[2])["type"] == "done"
-    command = use_case.execute.await_args.args[0]
+    assert [frame["type"] for frame in frames] == [
+        "stream_start",
+        "content_delta",
+        "stream_end",
+    ]
+    assert frames[1]["content"] == "已按基金比较执行。"
+    command = use_case.stream.call_args.args[0]
     assert command.session_id == "session-confirm"
+    assert command.request_id == "request-explicit-skill"
     assert command.explicit_skill == "fund-compare"

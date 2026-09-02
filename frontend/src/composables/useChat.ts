@@ -1,9 +1,16 @@
-import { ref } from 'vue'
+import { getCurrentScope, onScopeDispose, ref } from 'vue'
 import { chatApi, buildWsUrl, parseWsFrame, type ChatMessage, type ChatTemplate } from '@/api'
 import { useChatStore } from '@/stores/chatStore'
 import { useUserStore } from '@/stores/userStore'
 import { useMemory } from '@/composables/useMemory'
 import { useMemoryStore } from '@/stores/memoryStore'
+
+let streamRequestCounter = 0
+
+function createStreamRequestId(): string {
+  streamRequestCounter += 1
+  return `web_${Date.now().toString(36)}_${streamRequestCounter.toString(36)}`
+}
 
 export function useChat() {
   const userStore = useUserStore()
@@ -13,6 +20,19 @@ export function useChat() {
   const templates = ref<ChatTemplate[]>([])
   let compressTimer: number | null = null
   let contextRefreshTimer: number | null = null
+  let activeStreamSocket: WebSocket | null = null
+
+  const closeActiveStream = () => {
+    const socket = activeStreamSocket
+    activeStreamSocket = null
+    if (socket && socket.readyState < WebSocket.CLOSING) {
+      socket.close(1000, 'client lifecycle ended')
+    }
+  }
+
+  if (getCurrentScope()) {
+    onScopeDispose(closeActiveStream)
+  }
 
   function stopContextRefreshPolling() {
     if (contextRefreshTimer) {
@@ -167,16 +187,58 @@ export function useChat() {
     // 占位 assistant 消息（流式追加用）
     const currentSid = chatStore.currentSessionId || `temp_${Date.now()}`
     chatStore.startStreamingMessage(currentSid)
+    const requestId = createStreamRequestId()
 
     return new Promise<void>((resolve) => {
       let ws: WebSocket | null = null
-      try {
-        ws = new WebSocket(buildWsUrl('/chat/stream'))
-      } catch (err) {
+      let settled = false
+      let started = false
+      let streamSessionId: string | null = null
+      let expectedSequence = 1
+      let receivedChunkCount = 0
+      const closeOnPageExit = () => closeActiveStream()
+
+      const clearCompressTimer = () => {
+        if (compressTimer) {
+          window.clearInterval(compressTimer)
+          compressTimer = null
+        }
+      }
+
+      const finish = (errorMessage?: string) => {
+        if (settled) return
+        settled = true
+        window.removeEventListener('beforeunload', closeOnPageExit)
+        if (activeStreamSocket === ws) activeStreamSocket = null
+        if (errorMessage) chatStore.appendStreamDelta(`\n\n[${errorMessage}]`)
+        clearCompressTimer()
         chatStore.finishStreamingMessage()
         chatStore.isSending = false
-        console.error('[WS] 连接失败:', err)
+        if (!errorMessage) {
+          loadProfile().catch(e => console.warn('[useChat] 刷新画像失败:', e))
+          loadSessions().catch(console.error)
+          maybeStartContextRefreshPolling()
+        }
         resolve()
+      }
+
+      const failProtocol = () => {
+        console.error('[WS] chat-stream-v2 协议错误')
+        finish('协议错误，请重试')
+        try {
+          ws?.close(1002, 'chat-stream-v2 protocol error')
+        } catch {
+          // 浏览器可能已经关闭连接；本地状态已完成失败收口。
+        }
+      }
+
+      try {
+        ws = new WebSocket(buildWsUrl('/chat/stream'))
+        activeStreamSocket = ws
+        window.addEventListener('beforeunload', closeOnPageExit, { once: true })
+      } catch (err) {
+        console.error('[WS] 连接失败:', err)
+        finish('连接失败，请重试')
         return
       }
 
@@ -186,6 +248,7 @@ export function useChat() {
             user_id: userStore.userId,
             message: text,
             session_id: chatStore.currentSessionId || undefined,
+            request_id: requestId,
             explicit_skill: explicitSkill,
           })
         )
@@ -195,116 +258,112 @@ export function useChat() {
         const raw = event.data as string
         const frame = parseWsFrame(raw)
 
-        if (frame) {
-          if (frame.type === 'session_id') {
-            // 新建会话时更新 store 的 currentSessionId
-            if (!chatStore.currentSessionId) {
-              chatStore.setCurrentSession(frame.session_id)
-            }
-          } else if (frame.type === 'context_update') {
-            chatStore.setContextWindow(frame.context_window)
-            chatStore.updateSessionContext(frame.session_id, frame.context_window)
-            maybeStartContextRefreshPolling()
-          } else if (frame.type === 'memory_command') {
-            memoryStore.setCommandResult(frame.memory_command)
-          } else if (frame.type === 'skill_confirm') {
-            chatStore.setSkillConfirmation({
-              originalMessage: text,
-              sessionId: frame.session_id,
-              confirmation: frame.confirmation,
-            })
-          } else if (frame.type === 'compaction_queued' || frame.type === 'compaction_running' || frame.type === 'compaction_done' || frame.type === 'compaction_failed') {
-            chatStore.setContextWindow(frame.context_window)
-            chatStore.updateSessionContext(frame.session_id, frame.context_window)
-            maybeStartContextRefreshPolling()
-          } else if (frame.type === 'compress_start') {
-            chatStore.startCompress(frame.eta_seconds)
-            // 用 ETA 模拟平滑进度（0% → 95%），收到 compress_done 再置 100%
-            if (compressTimer) window.clearInterval(compressTimer)
-            const eta = Math.max(2, frame.eta_seconds || 8)
-            const startAt = Date.now()
-            compressTimer = window.setInterval(() => {
-              const elapsed = (Date.now() - startAt) / 1000
-              const ratio = Math.min(1, elapsed / eta)
-              const progress = Math.floor(ratio * 95)
-              const etaLeft = Math.max(0, Math.ceil(eta - elapsed))
-              chatStore.updateCompressProgress(progress, etaLeft)
-              if (progress >= 95) {
-                // 到 95% 后停住，等待服务端 done
-                chatStore.updateCompressProgress(95, 0)
-                if (compressTimer) {
-                  window.clearInterval(compressTimer)
-                  compressTimer = null
-                }
-              }
-            }, 200)
-          } else if (frame.type === 'compress_done') {
-            if (compressTimer) {
-              window.clearInterval(compressTimer)
-              compressTimer = null
-            }
-            chatStore.finishCompress(typeof frame.percent === 'number' ? frame.percent : undefined)
-            // 压缩完成后，刷新 running_summary / 摘要历史入口依赖 sessions
-            loadSessions().catch(console.error)
-          } else if (frame.type === 'compress_skip') {
-            if (compressTimer) {
-              window.clearInterval(compressTimer)
-              compressTimer = null
-            }
-            chatStore.finishCompress(undefined)
-          } else if (frame.type === 'done') {
-            if (compressTimer) {
-              window.clearInterval(compressTimer)
-              compressTimer = null
-            }
-            chatStore.finishStreamingMessage()
-            chatStore.isSending = false
-            // Phase 3: 流式结束后同步刷新画像（防止对话中用 <action> 更新了画像但前端未刷新）
-            loadProfile().catch(e => console.warn('[useChat] 刷新画像失败:', e))
-            // 刷新会话列表（获取最新 running_summary）
-            loadSessions().catch(console.error)
-            maybeStartContextRefreshPolling()
-            resolve()
-          } else if (frame.type === 'error') {
-            console.error('[WS] 服务端错误:', frame.message)
-            chatStore.appendStreamToken(`\n\n[错误：${frame.message}]`)
-            if (compressTimer) {
-              window.clearInterval(compressTimer)
-              compressTimer = null
-            }
-            chatStore.finishStreamingMessage()
-            chatStore.isSending = false
-            resolve()
+        if (settled) return
+        if (!frame || frame.request_id !== requestId || frame.sequence !== expectedSequence) {
+          failProtocol()
+          return
+        }
+        expectedSequence += 1
+
+        if (streamSessionId && frame.session_id !== streamSessionId) {
+          failProtocol()
+          return
+        }
+
+        if (frame.type === 'stream_error') {
+          if (frame.chunk_count !== receivedChunkCount) {
+            failProtocol()
+            return
           }
-        } else {
-          // 普通 token，追加到最后的 assistant 消息
-          chatStore.appendStreamToken(raw)
+          console.error('[WS] 服务端错误:', frame.code)
+          finish(`错误：${frame.message}`)
+          return
+        }
+
+        if (frame.type === 'stream_start') {
+          if (started || (chatStore.currentSessionId
+            && chatStore.currentSessionId !== frame.session_id)) {
+            failProtocol()
+            return
+          }
+          started = true
+          streamSessionId = frame.session_id
+          if (!chatStore.currentSessionId) chatStore.setCurrentSession(frame.session_id)
+          chatStore.setStreamingSessionId(frame.session_id)
+          return
+        }
+
+        if (!started || frame.session_id !== streamSessionId) {
+          failProtocol()
+          return
+        }
+
+        if (frame.type === 'content_delta') {
+          if (frame.chunk_index !== receivedChunkCount + 1) {
+            failProtocol()
+            return
+          }
+          chatStore.appendStreamDelta(frame.content)
+          receivedChunkCount += 1
+        } else if (frame.type === 'context_update') {
+          chatStore.setContextWindow(frame.context_window)
+          chatStore.updateSessionContext(frame.session_id, frame.context_window)
+          maybeStartContextRefreshPolling()
+        } else if (frame.type === 'memory_command') {
+          memoryStore.setCommandResult(frame.memory_command)
+        } else if (frame.type === 'skill_confirm') {
+          chatStore.setSkillConfirmation({
+            originalMessage: text,
+            sessionId: frame.session_id,
+            confirmation: frame.confirmation,
+          })
+        } else if (frame.type === 'compaction_queued'
+          || frame.type === 'compaction_running'
+          || frame.type === 'compaction_done'
+          || frame.type === 'compaction_failed') {
+          chatStore.setContextWindow(frame.context_window)
+          chatStore.updateSessionContext(frame.session_id, frame.context_window)
+          maybeStartContextRefreshPolling()
+        } else if (frame.type === 'compress_start') {
+          chatStore.startCompress(frame.eta_seconds)
+          clearCompressTimer()
+          const eta = Math.max(2, frame.eta_seconds || 8)
+          const startAt = Date.now()
+          compressTimer = window.setInterval(() => {
+            const elapsed = (Date.now() - startAt) / 1000
+            const ratio = Math.min(1, elapsed / eta)
+            const progress = Math.floor(ratio * 95)
+            const etaLeft = Math.max(0, Math.ceil(eta - elapsed))
+            chatStore.updateCompressProgress(progress, etaLeft)
+            if (progress >= 95) {
+              chatStore.updateCompressProgress(95, 0)
+              clearCompressTimer()
+            }
+          }, 200)
+        } else if (frame.type === 'compress_done') {
+          clearCompressTimer()
+          chatStore.finishCompress(typeof frame.percent === 'number' ? frame.percent : undefined)
+          loadSessions().catch(console.error)
+        } else if (frame.type === 'compress_skip') {
+          clearCompressTimer()
+          chatStore.finishCompress(undefined)
+        } else if (frame.type === 'stream_end') {
+          if (frame.chunk_count !== receivedChunkCount) {
+            failProtocol()
+            return
+          }
+          finish()
         }
       }
 
       ws.onerror = (event) => {
+        if (settled) return
         console.error('[WS] 连接错误:', event)
-        chatStore.appendStreamToken('\n\n[连接错误，请重试]')
-        if (compressTimer) {
-          window.clearInterval(compressTimer)
-          compressTimer = null
-        }
-        chatStore.finishStreamingMessage()
-        chatStore.isSending = false
-        resolve()
+        finish('连接错误，请重试')
       }
 
       ws.onclose = () => {
-        // 若还在流式状态（非正常关闭），强制结束
-        if (chatStore.isStreaming) {
-          if (compressTimer) {
-            window.clearInterval(compressTimer)
-            compressTimer = null
-          }
-          chatStore.finishStreamingMessage()
-          chatStore.isSending = false
-          resolve()
-        }
+        if (!settled) finish('连接已中断，请重试')
       }
     })
   }
