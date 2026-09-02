@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { chatApi, http, parseWsFrame } from '@/api'
+import { CHAT_STREAM_PROTOCOL_VERSION, chatApi, http, parseWsFrame } from '@/api'
 
 describe('public chat Skill contract', () => {
   it('sends optional explicit_skill without changing old call arguments', async () => {
@@ -25,7 +25,10 @@ describe('public chat Skill contract', () => {
   it('parses the typed skill_confirm WebSocket frame', () => {
     const frame = parseWsFrame(JSON.stringify({
       type: 'skill_confirm',
+      protocol_version: CHAT_STREAM_PROTOCOL_VERSION,
+      request_id: 'request-skill-confirm',
       session_id: 'session-1',
+      sequence: 3,
       confirmation: {
         reason: '需要确认',
         registry_snapshot_hash: 'a'.repeat(64),

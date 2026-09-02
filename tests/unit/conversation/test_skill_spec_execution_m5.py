@@ -28,6 +28,7 @@ from src.conversation.contracts import (  # noqa: E402
     EvidenceFact,
     EvidenceRejectionCode,
     ExecutedPlanStep,
+    ModelSynthesisChunk,
     ModelSynthesisRequest,
     RunBudget,
     StepStatus,
@@ -293,9 +294,9 @@ def test_synthesis_guidance_contains_output_contract_and_references_without_tool
     class _Model:
         calls: list[ModelSynthesisRequest] = field(default_factory=list)
 
-        async def synthesize(self, request: ModelSynthesisRequest) -> str:
+        async def stream_synthesize(self, request: ModelSynthesisRequest):
             self.calls.append(request)
-            return "受控结论"
+            yield ModelSynthesisChunk(content="受控结论", index=1)
 
     _, loader, rewrite, _, _, plan = _build_skill_plan(
         "华安黄金ETF和博时黄金ETF哪个更适合长期持有，先说风险"
@@ -391,10 +392,10 @@ class _M5Model:
 
     calls: list[ModelSynthesisRequest] = field(default_factory=list)
 
-    async def synthesize(self, request: ModelSynthesisRequest) -> str:
+    async def stream_synthesize(self, request: ModelSynthesisRequest):
         """返回不访问网络的固定回答。"""
         self.calls.append(request)
-        return "基于已验收证据的离线结论。"
+        yield ModelSynthesisChunk(content="基于已验收证据的离线结论。", index=1)
 
 
 @pytest.mark.e2e

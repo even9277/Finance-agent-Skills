@@ -58,12 +58,17 @@ export const useChatStore = defineStore('chat', () => {
     messages.value.push(msg)
   }
 
-  // Phase 2：追加 token 到最后一条 assistant 消息（流式输出）
-  function appendStreamToken(token: string) {
+  // D03：只把已通过 v2 sequence 校验的正文增量追加到当前 assistant 占位消息。
+  function appendStreamDelta(content: string) {
     const last = messages.value[messages.value.length - 1]
     if (last && last.role === 'assistant' && last.id === streamingMessageId.value) {
-      last.content += token
+      last.content += content
     }
+  }
+
+  function setStreamingSessionId(sessionId: string) {
+    const target = messages.value.find((item) => item.id === streamingMessageId.value)
+    if (target?.role === 'assistant') target.session_id = sessionId
   }
 
   // Phase 2：开始流式输出，先占位一条空白 assistant 消息
@@ -195,8 +200,9 @@ export const useChatStore = defineStore('chat', () => {
     setSessions,
     setMessages,
     appendMessage,
-    appendStreamToken,
+    appendStreamDelta,
     startStreamingMessage,
+    setStreamingSessionId,
     finishStreamingMessage,
     setSkillConfirmation,
     clearSkillConfirmation,

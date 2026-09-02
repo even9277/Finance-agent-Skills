@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from dataclasses import asdict, is_dataclass
 from datetime import date, datetime
@@ -15,11 +16,17 @@ from pydantic import SecretStr
 from backend.config import settings
 from src.conversation.contracts import (
     EvidenceFact,
+    ModelSynthesisChunk,
     ModelSynthesisRequest,
     ToolCall,
     ToolObservation,
 )
-from src.conversation.errors import ToolPermanentError, ToolTimeoutError, ToolTransientError
+from src.conversation.errors import (
+    ModelSynthesisError,
+    ToolPermanentError,
+    ToolTimeoutError,
+    ToolTransientError,
+)
 from src.conversation.ports import ToolPort
 from src.tools.chat_tushare_tools import get_tushare_toolkit
 
@@ -64,21 +71,47 @@ class OpenAICompatibleModelProvider:
             max_retries=1,
         )
 
-    async def synthesize(self, request: ModelSynthesisRequest) -> str:
-        """只把 AnswerContextPack 中已验收内容发送给模型。"""
+    async def stream_synthesize(
+        self,
+        request: ModelSynthesisRequest,
+    ) -> AsyncIterator[ModelSynthesisChunk]:
+        """把真实模型流归一化为非空、严格有序的文本增量。
+
+        Args:
+            request: 包含版本化 Prompt 和已验收 AnswerContextPack 的安全请求。
+
+        Yields:
+            不携带 LangChain 或供应商私有对象的文本增量。
+
+        Raises:
+            ModelSynthesisError: 模型流失败或没有产生任何文本。
+        """
         from langchain_core.messages import HumanMessage, SystemMessage
 
         payload = json.dumps(_jsonable(request.context), ensure_ascii=False)
-        response = await self._client.ainvoke(
-            [
-                SystemMessage(content=request.system_prompt),
-                HumanMessage(content=f"请根据以下结构化证据回答：\n{payload}"),
-            ]
-        )
-        content = response.content
-        if isinstance(content, str):
-            return content
-        return json.dumps(content, ensure_ascii=False, default=str)
+        messages = [
+            SystemMessage(content=request.system_prompt),
+            HumanMessage(content=f"请根据以下结构化证据回答：\n{payload}"),
+        ]
+        index = 0
+        try:
+            async for response in self._client.astream(messages):
+                content = response.content
+                text = (
+                    content
+                    if isinstance(content, str)
+                    else json.dumps(content, ensure_ascii=False, default=str)
+                )
+                if not text:
+                    continue
+                index += 1
+                yield ModelSynthesisChunk(content=text, index=index)
+        except ModelSynthesisError:
+            raise
+        except Exception as exc:
+            raise ModelSynthesisError("model synthesis stream failed") from exc
+        if index == 0:
+            raise ModelSynthesisError("model synthesis stream returned no text")
 
 
 class TushareToolProvider:

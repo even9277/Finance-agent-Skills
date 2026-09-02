@@ -27,6 +27,7 @@ from src.conversation.contracts import (  # noqa: E402
     EvidenceFact,
     EvidenceRejectionCode,
     ExecutedPlanStep,
+    ModelSynthesisChunk,
     ModelSynthesisRequest,
     ReplyPreference,
     RunBudget,
@@ -283,9 +284,9 @@ def test_synthesis_receives_accepted_facts_and_reason_only_rejection_summaries()
         def __init__(self) -> None:
             self.calls: list[ModelSynthesisRequest] = []
 
-        async def synthesize(self, request: ModelSynthesisRequest) -> str:
+        async def stream_synthesize(self, request: ModelSynthesisRequest):
             self.calls.append(request)
-            return "基于已验收证据的保守结论。"
+            yield ModelSynthesisChunk(content="基于已验收证据的保守结论。", index=1)
 
     plan, _ = _plan_and_permissions()
     basic_step, market_step = plan.steps

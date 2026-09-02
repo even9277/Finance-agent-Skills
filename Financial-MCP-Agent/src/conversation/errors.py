@@ -31,5 +31,9 @@ class StepBudgetExceededError(ConversationError, RuntimeError):
     """工作流在到达终态前耗尽允许的阶段事件预算。"""
 
 
+class ModelSynthesisError(ConversationError, RuntimeError):
+    """模型增量生成失败；该技术异常必须越过业务终态并触发事务回滚。"""
+
+
 class PersistenceError(ConversationError, RuntimeError):
     """应用层无法原子保存本轮最终结果。"""

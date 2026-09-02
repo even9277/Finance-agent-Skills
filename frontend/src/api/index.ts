@@ -417,39 +417,199 @@ export interface WsStreamPayload {
   user_id: string
   message: string
   session_id?: string
+  request_id?: string
   explicit_skill?: string
 }
 
-export type WsControlFrame =
-  | { type: 'session_id'; session_id: string }
-  | { type: 'context_update'; session_id: string; context_window: ChatContextWindow }
-  | { type: 'compaction_queued'; session_id: string; context_window: ChatContextWindow }
-  | { type: 'compaction_running'; session_id: string; context_window: ChatContextWindow }
-  | { type: 'compaction_done'; session_id: string; context_window: ChatContextWindow }
-  | { type: 'compaction_failed'; session_id: string; context_window: ChatContextWindow; message?: string }
-  | { type: 'done'; session_id: string }
-  | { type: 'memory_command'; session_id: string; memory_command: MemoryCommandResult }
-  | { type: 'skill_confirm'; session_id: string; confirmation: SkillConfirmation }
-  | { type: 'compress_start'; session_id: string; progress: number; eta_seconds: number }
-  | { type: 'compress_done'; session_id: string; progress: number; eta_seconds: number; elapsed_seconds: number; snapshot_id?: number; compressed_message_count?: number; total_message_count?: number; percent?: number }
-  | { type: 'compress_skip'; session_id: string; progress: number; eta_seconds: number }
-  | { type: 'error'; code?: string; message: string }
+export const CHAT_STREAM_PROTOCOL_VERSION = 'chat-stream-v2' as const
+
+export interface WsStreamEnvelope {
+  protocol_version: typeof CHAT_STREAM_PROTOCOL_VERSION
+  request_id: string
+  session_id: string
+  sequence: number
+}
+
+export type ChatTerminalStatus =
+  | 'SUCCEEDED'
+  | 'PARTIAL'
+  | 'NEEDS_CLARIFICATION'
+  | 'REJECTED'
+  | 'FAILED'
+  | 'CANCELLED'
+  | 'UNSUPPORTED'
+
+export type ChatStreamErrorCode =
+  | 'CHAT_STREAM_FAILED'
+  | 'CHAT_INVALID_JSON'
+  | 'CHAT_INVALID_REQUEST'
+  | 'CHAT_INTERNAL_ERROR'
+  | 'CHAT_STREAM_INCOMPLETE'
+
+export type WsStreamV2Frame = WsStreamEnvelope & (
+  | { type: 'stream_start' }
+  | { type: 'content_delta'; content: string; chunk_index: number }
+  | { type: 'stream_end'; status: ChatTerminalStatus; chunk_count: number; content_sha256: string }
+  | { type: 'stream_error'; code: ChatStreamErrorCode; message: string; chunk_count: number }
+  | { type: 'context_update'; context_window: ChatContextWindow }
+  | { type: 'memory_command'; memory_command: MemoryCommandResult }
+  | { type: 'skill_confirm'; confirmation: SkillConfirmation }
+  | { type: 'compaction_queued'; context_window: ChatContextWindow }
+  | { type: 'compaction_running'; context_window: ChatContextWindow }
+  | { type: 'compaction_done'; context_window: ChatContextWindow }
+  | { type: 'compaction_failed'; context_window: ChatContextWindow; message?: string }
+  | { type: 'compress_start'; progress: number; eta_seconds: number }
+  | { type: 'compress_done'; progress: number; eta_seconds: number; elapsed_seconds: number; snapshot_id?: number; compressed_message_count?: number; total_message_count?: number; percent?: number }
+  | { type: 'compress_skip'; progress: number; eta_seconds: number }
+)
+
+const CHAT_TERMINAL_STATUSES = new Set<ChatTerminalStatus>([
+  'SUCCEEDED',
+  'PARTIAL',
+  'NEEDS_CLARIFICATION',
+  'REJECTED',
+  'FAILED',
+  'CANCELLED',
+  'UNSUPPORTED',
+])
+
+const CHAT_STREAM_ERROR_CODES = new Set<ChatStreamErrorCode>([
+  'CHAT_STREAM_FAILED',
+  'CHAT_INVALID_JSON',
+  'CHAT_INVALID_REQUEST',
+  'CHAT_INTERNAL_ERROR',
+  'CHAT_STREAM_INCOMPLETE',
+])
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return Number.isInteger(value) && Number(value) >= 0
+}
+
+function isPositiveInteger(value: unknown): value is number {
+  return Number.isInteger(value) && Number(value) >= 1
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value)
+}
+
+function isContextWindow(value: unknown): value is ChatContextWindow {
+  if (!isRecord(value)) return false
+  return isNonNegativeInteger(value.used_tokens)
+    && isNonNegativeInteger(value.budget_tokens)
+    && isNonNegativeInteger(value.usage_percent)
+    && isNonEmptyString(value.counting_mode)
+    && isNonEmptyString(value.compression_status)
+    && isNonEmptyString(value.strategy)
+    && (value.updated_at === undefined || value.updated_at === null || typeof value.updated_at === 'string')
+}
+
+function isSkillConfirmation(value: unknown): value is SkillConfirmation {
+  if (!isRecord(value) || !Array.isArray(value.candidates)) return false
+  return isNonEmptyString(value.reason)
+    && isNonEmptyString(value.registry_snapshot_hash)
+    && value.candidates.every((candidate) => (
+      isRecord(candidate)
+      && isNonEmptyString(candidate.skill_name)
+      && isFiniteNumber(candidate.confidence)
+      && isNonEmptyString(candidate.version)
+      && isNonEmptyString(candidate.reason)
+    ))
+}
+
+function isMemoryCommandResult(value: unknown): value is MemoryCommandResult {
+  if (!isRecord(value)) return false
+  return isNonEmptyString(value.status)
+    && isNonNegativeInteger(value.affected_count)
+    && Array.isArray(value.affected_record_ids)
+    && value.affected_record_ids.every(isNonEmptyString)
+    && isNonEmptyString(value.consistency_status)
+    && typeof value.user_message === 'string'
+    && Array.isArray(value.preview_items)
+}
+
+function hasV2Envelope(value: Record<string, unknown>): boolean {
+  return value.protocol_version === CHAT_STREAM_PROTOCOL_VERSION
+    && isNonEmptyString(value.request_id)
+    && isNonEmptyString(value.session_id)
+    && isPositiveInteger(value.sequence)
+}
+
+function isContextFrame(value: Record<string, unknown>): boolean {
+  return isContextWindow(value.context_window)
+}
+
+function isCompressBase(value: Record<string, unknown>): boolean {
+  return isFiniteNumber(value.progress) && isFiniteNumber(value.eta_seconds)
+}
+
+function isWsStreamV2Frame(value: unknown): value is WsStreamV2Frame {
+  if (!isRecord(value) || !hasV2Envelope(value) || typeof value.type !== 'string') return false
+
+  switch (value.type) {
+    case 'stream_start':
+      return true
+    case 'content_delta':
+      return isNonEmptyString(value.content) && isPositiveInteger(value.chunk_index)
+    case 'stream_end':
+      return typeof value.status === 'string'
+        && CHAT_TERMINAL_STATUSES.has(value.status as ChatTerminalStatus)
+        && isNonNegativeInteger(value.chunk_count)
+        && typeof value.content_sha256 === 'string'
+        && /^[a-f0-9]{64}$/.test(value.content_sha256)
+    case 'stream_error':
+      return typeof value.code === 'string'
+        && CHAT_STREAM_ERROR_CODES.has(value.code as ChatStreamErrorCode)
+        && isNonEmptyString(value.message)
+        && isNonNegativeInteger(value.chunk_count)
+    case 'context_update':
+    case 'compaction_queued':
+    case 'compaction_running':
+    case 'compaction_done':
+      return isContextFrame(value)
+    case 'compaction_failed':
+      return isContextFrame(value)
+        && (value.message === undefined || typeof value.message === 'string')
+    case 'memory_command':
+      return isMemoryCommandResult(value.memory_command)
+    case 'skill_confirm':
+      return isSkillConfirmation(value.confirmation)
+    case 'compress_start':
+    case 'compress_skip':
+      return isCompressBase(value)
+    case 'compress_done':
+      return isCompressBase(value)
+        && isFiniteNumber(value.elapsed_seconds)
+        && (value.snapshot_id === undefined || isNonNegativeInteger(value.snapshot_id))
+        && (value.compressed_message_count === undefined
+          || isNonNegativeInteger(value.compressed_message_count))
+        && (value.total_message_count === undefined
+          || isNonNegativeInteger(value.total_message_count))
+        && (value.percent === undefined || isFiniteNumber(value.percent))
+    default:
+      return false
+  }
+}
 
 /**
- * 解析 WebSocket 收到的帧：
- * - 若是控制帧（JSON，包含 type 字段）返回 WsControlFrame
- * - 否则视为普通 token 文本，返回 null（由调用方直接追加）
+ * 解析并校验 WebSocket ``chat-stream-v2`` 帧。
+ * Legacy 控制帧、裸文本、未知事件和字段不完整的 JSON 一律拒绝，不再保留双协议。
  */
-export function parseWsFrame(raw: string): WsControlFrame | null {
-  if (raw.startsWith('{')) {
-    try {
-      const obj = JSON.parse(raw) as WsControlFrame
-      if ('type' in obj) return obj
-    } catch {
-      // 不是 JSON，当作普通文本
-    }
+export function parseWsFrame(raw: string): WsStreamV2Frame | null {
+  try {
+    const value: unknown = JSON.parse(raw)
+    return isWsStreamV2Frame(value) ? value : null
+  } catch {
+    return null
   }
-  return null
 }
 
 /**

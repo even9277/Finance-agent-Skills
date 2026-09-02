@@ -1327,6 +1327,25 @@ class ModelSynthesisRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class ModelSynthesisChunk:
+    """模型 Provider 返回的供应商无关文本增量。
+
+    Attributes:
+        content: 当前增量中的非空文本；不得携带 Provider 私有对象。
+        index: 当前模型调用内从 1 开始严格递增的增量序号。
+    """
+
+    content: str
+    index: int
+
+    def __post_init__(self) -> None:
+        if not self.content:
+            raise ContractViolationError("model synthesis chunk content must not be empty")
+        if self.index < 1:
+            raise ContractViolationError("model synthesis chunk index must start from one")
+
+
+@dataclass(frozen=True, slots=True)
 class EventAttribute:
     """阶段事件允许携带的低风险标量属性。"""
 
@@ -1372,9 +1391,7 @@ class ConversationResult:
 
 _ALLOWED_TRANSITIONS: dict[RunPhase, frozenset[RunPhase]] = {
     RunPhase.RECEIVED: frozenset({RunPhase.PREFLIGHTED, RunPhase.FAILED, RunPhase.CANCELLED}),
-    RunPhase.PREFLIGHTED: frozenset(
-        {RunPhase.ENTITY_RESOLVED, RunPhase.REJECTED, RunPhase.FAILED}
-    ),
+    RunPhase.PREFLIGHTED: frozenset({RunPhase.ENTITY_RESOLVED, RunPhase.REJECTED, RunPhase.FAILED}),
     RunPhase.ENTITY_RESOLVED: frozenset(
         {
             RunPhase.ROUTED,
@@ -1402,9 +1419,7 @@ _ALLOWED_TRANSITIONS: dict[RunPhase, frozenset[RunPhase]] = {
     RunPhase.PLANNED: frozenset({RunPhase.VALIDATED, RunPhase.FAILED}),
     RunPhase.VALIDATED: frozenset({RunPhase.EXECUTING, RunPhase.REJECTED, RunPhase.FAILED}),
     RunPhase.EXECUTING: frozenset({RunPhase.VERIFIED, RunPhase.CANCELLED, RunPhase.FAILED}),
-    RunPhase.VERIFIED: frozenset(
-        {RunPhase.REPLANNING, RunPhase.SYNTHESIZING, RunPhase.FAILED}
-    ),
+    RunPhase.VERIFIED: frozenset({RunPhase.REPLANNING, RunPhase.SYNTHESIZING, RunPhase.FAILED}),
     RunPhase.REPLANNING: frozenset({RunPhase.VALIDATED, RunPhase.SYNTHESIZING, RunPhase.FAILED}),
     RunPhase.SYNTHESIZING: frozenset(
         {RunPhase.SUCCEEDED, RunPhase.PARTIAL, RunPhase.FAILED, RunPhase.UNSUPPORTED}

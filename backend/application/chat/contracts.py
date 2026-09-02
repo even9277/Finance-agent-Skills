@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from enum import StrEnum
 
 from src.conversation.contracts import (
     ControllerDecision,
@@ -110,6 +111,77 @@ class ChatOutcome:
     def tool_call_count(self) -> int:
         """返回本轮真实工具调用次数。"""
         return self.workflow_result.tool_call_count if self.workflow_result is not None else 0
+
+
+class ChatStreamEventKind(StrEnum):
+    """Application 流式输出的有限生命周期类型。"""
+
+    STARTED = "STARTED"
+    CONTENT_DELTA = "CONTENT_DELTA"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+
+
+class ChatStreamFailureCode(StrEnum):
+    """Application 流式技术失败的稳定机器码。"""
+
+    STREAM_FAILED = "CHAT_STREAM_FAILED"
+
+
+@dataclass(frozen=True, slots=True)
+class ChatStreamStarted:
+    """表示会话已在同一事务中完成准备，可以开始发送公开事件。"""
+
+    session_id: str
+    request_id: str
+    kind: ChatStreamEventKind = field(default=ChatStreamEventKind.STARTED, init=False)
+
+
+@dataclass(frozen=True, slots=True)
+class ChatContentDelta:
+    """表示模型或显式降级分支产生的一段非空回答文本。"""
+
+    session_id: str
+    request_id: str
+    content: str
+    chunk_index: int
+    kind: ChatStreamEventKind = field(default=ChatStreamEventKind.CONTENT_DELTA, init=False)
+
+    def __post_init__(self) -> None:
+        if not self.content:
+            raise ValueError("chat content delta must not be empty")
+        if self.chunk_index < 1:
+            raise ValueError("chat content delta index must start from one")
+
+
+@dataclass(frozen=True, slots=True)
+class ChatStreamCompleted:
+    """表示唯一聊天终态已提交，可安全发送公开完成帧。"""
+
+    session_id: str
+    request_id: str
+    outcome: ChatOutcome
+    chunk_count: int
+    content_sha256: str
+    ttft_ms: float | None
+    elapsed_ms: float
+    kind: ChatStreamEventKind = field(default=ChatStreamEventKind.COMPLETED, init=False)
+
+
+@dataclass(frozen=True, slots=True)
+class ChatStreamFailed:
+    """表示技术失败已回滚，只携带稳定错误码和安全统计。"""
+
+    session_id: str
+    request_id: str
+    error_code: ChatStreamFailureCode
+    chunk_count: int
+    ttft_ms: float | None
+    elapsed_ms: float
+    kind: ChatStreamEventKind = field(default=ChatStreamEventKind.FAILED, init=False)
+
+
+type ChatStreamEvent = ChatStreamStarted | ChatContentDelta | ChatStreamCompleted | ChatStreamFailed
 
 
 @dataclass(frozen=True, slots=True)

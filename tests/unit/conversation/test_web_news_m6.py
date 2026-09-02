@@ -34,6 +34,7 @@ from src.conversation.contracts import (  # noqa: E402
     EvidenceDimension,
     EvidenceFact,
     EvidenceStatus,
+    ModelSynthesisChunk,
     ModelSynthesisRequest,
     RunBudget,
     ToolArgument,
@@ -353,10 +354,10 @@ class _RecordingModel:
 
     calls: list[ModelSynthesisRequest] = field(default_factory=list)
 
-    async def synthesize(self, request: ModelSynthesisRequest) -> str:
+    async def stream_synthesize(self, request: ModelSynthesisRequest):
         """保存结构化上下文并返回固定文本。"""
         self.calls.append(request)
-        return "行情事实与新闻弱线索已分层验收。"
+        yield ModelSynthesisChunk(content="行情事实与新闻弱线索已分层验收。", index=1)
 
 
 @pytest.mark.e2e
