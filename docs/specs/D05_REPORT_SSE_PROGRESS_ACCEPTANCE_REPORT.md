@@ -5,6 +5,7 @@
 - Feature: D05 authoritative report progress with SSE and bounded polling fallback
 - Branch: `feat/50-report-sse-progress`
 - Issue: #50
+- Pull request: #51 (`https://github.com/even9277/Finance-agent-Skills/pull/51`)
 - Acceptance date: 2026-09-05
 - Result: Passed
 
@@ -56,6 +57,7 @@ Tushare `sw_daily` 因当前账号权限不足返回局部错误；tool contract
 | Compose production proxy chain | 289 passed, 3 skipped, 48 deselected, 3 xfailed |
 | Changed-surface Ruff/Pyright | Passed / 0 errors |
 | Secret/redaction scan | No usable credentials found |
+| GitHub CI | Python、frontend、Docker packaging、Offline Compose E2E passed after environment-isolation repair |
 
 ## 5. Accepted Limitations
 

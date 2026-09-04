@@ -3,13 +3,14 @@
 ## 1. Milestone Status
 
 - Milestone: Milestone 5 — Protected Live, Documentation, Review, and Handoff
-- Status: Delivery in progress
+- Status: Completed
+- Completed: 2026-09-05
 - Date: 2026-09-05
 - Branch: `feat/50-report-sse-progress`
 - Issue: #50
-- Pull request: pending
+- Pull request: #51 (`https://github.com/even9277/Finance-agent-Skills/pull/51`)
 
-实现、受保护 Live、最终回归与 staged diff review 已经完成；GitHub CI 与 squash merge 完成后，本报告将更新为 `Completed`。
+实现、受保护 Live、最终回归、staged diff review 与修复后 GitHub CI 已经完成。用户已授权 squash merge；本报告所在的最终文档提交通过同一门禁后执行机械合并，并以 GitHub PR/Issue 状态作为合并事实来源。
 
 ## 2. Frozen Contract Followed
 
@@ -69,8 +70,9 @@
 - Remaining P0/P1: 0。
 - PR: #51，`https://github.com/even9277/Finance-agent-Skills/pull/51`。
 - Initial CI: frontend、Docker packaging、Offline Compose E2E passed；Python job 的 4 个 failure 来自隐私测试隐式继承本机 Provider 环境，CI 无 secrets 时提前走 missing-config 分支。
-- CI repair: 测试显式设置无效的离线占位 Provider 配置，使 success/failure fake 路径在任何环境都真实执行；focused 8 passed，Ruff/Pyright passed；CI rerun pending。
-- Squash merge: pending green checks。
+- CI repair: 测试显式设置无效的离线占位 Provider 配置，使 success/failure fake 路径在任何环境都真实执行；focused 8 passed，Ruff/Pyright passed。
+- Repair rerun: Python quality、frontend、Docker packaging、Offline Compose E2E 四项全部通过。
+- Squash merge: 用户已授权；最终文档提交复用同一 CI 后立即执行，最终状态见 PR #51。
 
 最终回归已刷新：Python `402 passed, 7 skipped, 8 deselected, 3 xfailed`；frontend `43 passed` 且 lint/type-check/build 通过；最终 Compose `289 passed, 3 skipped, 48 deselected, 3 xfailed`、退出码 0。Compose 临时容器、网络和 `trace-e2e` 卷已通过冻结 cleanup 命令清理，`ps -a` 为空。
 

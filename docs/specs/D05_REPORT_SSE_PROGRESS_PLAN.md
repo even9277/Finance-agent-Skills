@@ -441,7 +441,9 @@ Before implementation, rollback is simply discarding the unexecuted plan. During
 - [x] Milestone 4: Offline Full Verification and Narrow Fixes
   - Completed: 2026-09-05
   - Evidence: Docker Desktop 经用户授权升级到 4.89.0 后恢复 Linux engine；首次 Compose 发现并修复契约测试继承 `AUTH_ENABLED=false` 的隔离缺陷，复跑真 PostgreSQL/FastAPI/Vue-Nginx 链路 `288 passed, 3 skipped, 40 deselected, 3 xfailed`、退出码 0；D05-T08 经过 BackgroundTask→真实 LangGraph→DB→SSE→Nginx→详情查询，临时容器/网络/卷清理后 `ps -a` 为空。详见 `D05_REPORT_SSE_PROGRESS_MILESTONE_4_EXECUTION_REPORT.md`，历史阻塞证据保留于 `D05_REPORT_SSE_PROGRESS_MILESTONE_4_EXECUTION_BLOCKED.md`。
-- [ ] Milestone 5: Protected Live, Documentation, Review, and Handoff
+- [x] Milestone 5: Protected Live, Documentation, Review, and Handoff
+  - Completed: 2026-09-05
+  - Evidence: protected Live `1 passed`（14 model runs、39 个只读 Tushare attempts、整图 1 次/fallback 0）；review 修复终端/异常泄露、两类前端竞态和 snapshot-subscribe 竞态；D05 backend focused 25 passed、Python full 402 passed、frontend 43 passed、Compose 289 passed；PR #51 修复后四项 CI 全绿，用户已授权最终 squash merge。
 
 ## 16. Decision Log
 
@@ -524,8 +526,8 @@ Before implementation, rollback is simply discarding the unexecuted plan. During
 
 - What changed: M0/M1 冻结基线和测试；M2 实现后端事实/SSE；M3 贯通 strict TS parser、task-scoped 单一 reducer、fetch Bearer SSE、5 秒首帧预算、SSE→串行有界 polling、统一 abort/cleanup、真实阶段 UI 与 Nginx 专用禁缓冲 location；M5 又根据真实运行与 review 修复 Prompt/正文/raw exception 泄露、Windows stdout 编码、response-header hang、迟到 create 与 snapshot-subscribe 竞态；无 schema/Redis/npm dependency。
 - What was verified: D05 backend focused 25 passed、Python full 402 passed、frontend 43 passed、最终真 PostgreSQL/FastAPI/Vue-Nginx Compose 289 passed；protected Live 在 191.97 秒内完成一份真实模型 + Tushare 只读报告，14 个模型 run、39 个只读调用、整图 1 次且 fallback 0，进度单调到 completed；正文与 acceptance artifact 均以 hash 验证且 artifact 脱敏。
-- What remains risky: 进程内 hub 不提供 multi-worker/replay；当前 Tushare 账号缺少 `sw_daily` 权限，局部行业证据会降级；`stock_resolver` 注释/实现不一致属 D05 外问题；Compose migration/worker 共享库产生非致命日志噪声；仓库全量 Ruff 的 94 个历史问题仍是既有基线；GitHub PR/CI/merge 尚待 M5 最后交付步骤。
-- What should be improved next: 完成最终 staged review、CI 与 squash merge；随后 D06 实现 Redis snapshot/pub-sub/idempotency/reconnect，并单独治理实体解析文档漂移和数据接口权限矩阵。
+- What remains risky: 进程内 hub 不提供 multi-worker/replay；当前 Tushare 账号缺少 `sw_daily` 权限，局部行业证据会降级；`stock_resolver` 注释/实现不一致属 D05 外问题；Compose migration/worker 共享库产生非致命日志噪声；仓库全量 Ruff 的 94 个历史问题仍是既有基线。
+- What should be improved next: D06 实现 Redis snapshot/pub-sub/idempotency/reconnect，并单独治理实体解析文档漂移、Compose worker/migration 测试隔离和数据接口权限矩阵。
 
 ## 19. Deferred Work
 
