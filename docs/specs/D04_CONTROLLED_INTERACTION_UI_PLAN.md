@@ -4,7 +4,7 @@
 
 - Plan name: D04 受控交互与执行状态 UI
 - Task type: New Feature + Test/Evaluation + Engineering Governance + Interview Demo Alignment
-- Status: In implementation; Milestone 5 delivery gate in progress
+- Status: Complete; final merge identity is recorded by PR #49 and `origin/main`
 - Target executor: Codex
 - Related artifacts:
   - `docs/specs/D04_CONTROLLED_INTERACTION_UI_REQUIREMENT_SPEC.md`
@@ -470,8 +470,9 @@ Before implementation, rollback is simply discarding the unexecuted plan. During
 - [x] Milestone 2: Implement Core Change
 - [x] Milestone 3: Add Validation, Error Handling, and Observability / Frontend UI
 - [x] Milestone 4: Verification and Narrow Fixes
-- [ ] Milestone 5: Documentation and Handoff
-  - In progress: README/acceptance truth and self-review are complete; commit、PR、GitHub CI、squash merge and `origin/main` verification remain.
+- [x] Milestone 5: Documentation and Handoff
+  - Completed: 2026-09-04
+  - Evidence: PR #49；code HEAD `d9d6b98` 的四项 GitHub Actions 全绿；D01 不在 PR；squash merge 与最终 main SHA 以不可变 PR 记录为准。
 
 ## 16. Decision Log
 
@@ -503,6 +504,8 @@ Before implementation, rollback is simply discarding the unexecuted plan. During
 | 2026-09-04 | Defer only local Compose runtime evidence to M5 GitHub Actions | Both Compose configs are valid, but Docker Desktop 4.86.0 crashes on an inaccessible host reparse point before repository code runs | Milestone 4 execution |
 | 2026-09-04 | Approve the D04 implementation after final scoped self-review | Architecture, state/concurrency, cancellation, public payload redaction, generated files and secret scans found no blocking issue; final approval remains conditional on PR CI including Compose | Milestone 5 review |
 | 2026-09-04 | Keep D01 outside every D04 stage and commit | The untracked D01 requirement belongs to another delivery and must not enter Issue #48 | User-change protection |
+| 2026-09-04 | Fix D04 type aliases instead of upgrading the production image | GitHub Actions proved the Python 3.11 backend image rejected PEP 695 syntax; `TypeAlias` keeps the same contract without deployment/dependency expansion | PR #49 CI diagnosis |
+| 2026-09-04 | Use PR #49 as the immutable final merge record | A commit cannot truthfully contain its own future squash SHA; the committed report records pre-merge evidence while GitHub and `origin/main` record the resulting identity | Milestone 5 delivery |
 
 ## 17. Surprises & Discoveries
 
@@ -527,13 +530,15 @@ Before implementation, rollback is simply discarding the unexecuted plan. During
 | The real Tushare run lacked `financial_indicator` evidence | A hard `SUFFICIENT` Live assertion incorrectly rejects the system's intended safe degradation | Assert `sufficiency`, missing dimensions, limitation and terminal status as one coherent contract |
 | Docker Desktop repeatedly exits before engine creation | Local Compose runtime cannot exercise repository code; reset/destructive work would be disproportionate | Record exact host failure and require the M5 GitHub Actions Compose job before merge |
 | Uvicorn WebSocket connection logging can expose a query token | D04 payload redaction does not solve transport/logging secrecy | Keep auth redesign out of D04 and carry a dedicated security follow-up |
+| The first PR CI run failed in the Python 3.11 production image while Python 3.12 quality checks passed | D04 used PEP 695 aliases that the packaging smoke import could not parse | Replace both touched stream aliases with `typing.TypeAlias`; 3.11 syntax, focused tests and all four rerun jobs passed |
+| GitHub Copilot review could not run because the account quota was exhausted | No independent automated review findings were available | Record the limitation honestly; rely on the requested systematic Codex self-review and mandatory CI, without fabricating approval |
 
 ## 18. Outcomes & Retrospective
 
-- What changed: Milestones 2-4 now provide the complete D04 chain from Workflow/Executor authority points through Application safe projection, Pydantic `chat-stream-v2` frames, strict TypeScript parsing, request-scoped Pinia reduction, controlled execution rendering, visible user stop and a usable narrow layout. Pre-start WebSocket failure is an explicit HTTP fallback; post-start failure never re-executes.
-- What was verified: 15 focused D04 Python tests, 377 root offline tests and 27 frontend tests pass; scoped Ruff/Pyright, ESLint/vue-tsc and production build pass. A real-model + real-Tushare run proves control-frame ordering/redaction and safe `PARTIAL` degradation. Browser checks prove desktop/narrow rendering, stop and Skill confirmation.
-- What remains risky: the repository has historical full-scope Ruff/Pyright debt, dependency advisories, WebSocket query-token logging debt and local Docker Desktop corruption. Compose syntax is valid, but actual container runtime must pass in M5 GitHub Actions before merge.
-- What should be improved next: finish Milestone 5 only—push the reviewed D04 commit, create the PR, require green CI including Compose, resolve findings, squash merge and verify `origin/main`.
+- What changed: D04 now provides the complete chain from Workflow/Executor authority points through Application safe projection, Pydantic `chat-stream-v2` frames, strict TypeScript parsing, request-scoped Pinia reduction, controlled execution rendering, visible user stop and a usable narrow layout. README and acceptance evidence now match the running behavior.
+- What was verified: 15 focused D04 Python tests, 377 root offline tests and 27 frontend tests pass; scoped Ruff/Pyright, ESLint/vue-tsc and production build pass. A real-model + real-Tushare run proves control-frame ordering/redaction and safe `PARTIAL` degradation. Browser checks prove desktop/narrow rendering, stop and Skill confirmation. PR #49 then passed Python、frontend、production Docker packaging and full Offline Compose E2E on GitHub Actions after the Python 3.11 compatibility fix.
+- What remains risky: the repository has historical full-scope Ruff/Pyright debt, dependency advisories, WebSocket query-token logging debt and local Docker Desktop corruption. GitHub Actions proved repository Docker/Compose correctness, so the remaining Docker failure is host-specific.
+- What should be improved next: do not extend D04. Continue with D05 only after PR #49 is squash-merged and `origin/main` resolves to its merge commit.
 
 ## 19. Deferred Work
 
@@ -548,4 +553,4 @@ Before implementation, rollback is simply discarding the unexecuted plan. During
 
 ## 20. Handoff to Small-step Implementation
 
-Milestone 4 is complete with the local Docker runtime limitation recorded in its execution report. Start with Milestone 5 only: update repository truth, review and stage only D04, commit/push/open the PR linked to #48, require GitHub Actions to prove the Compose runtime gate, resolve review/CI findings, squash merge and verify `origin/main`. Do not start D05/D06 or touch the unrelated D01 file until D04 is merged.
+Milestone 5 is complete. PR #49 is the immutable delivery record; its final squash commit and `origin/main` verification are recorded externally because a commit cannot contain its own future SHA. Do not start D05/D06 or touch the unrelated D01 file until PR #49 is merged and the remote main identity is verified.
