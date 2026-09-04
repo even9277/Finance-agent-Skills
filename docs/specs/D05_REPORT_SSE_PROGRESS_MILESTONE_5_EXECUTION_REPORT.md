@@ -67,7 +67,10 @@
 - Review method: `code-review-excellence` checklist，覆盖 architecture、correctness、security、concurrency、compatibility、tests 和 observability。
 - Blocking findings fixed: Prompt/report terminal leakage、raw provider exception leakage、SSE response-header hang、迟到 create 响应重启观察器、snapshot-to-subscription 终态竞态、Windows unresolved-stock stdout 编码失败。
 - Remaining P0/P1: 0。
-- Commit/push/PR/checks/merge: pending。
+- PR: #51，`https://github.com/even9277/Finance-agent-Skills/pull/51`。
+- Initial CI: frontend、Docker packaging、Offline Compose E2E passed；Python job 的 4 个 failure 来自隐私测试隐式继承本机 Provider 环境，CI 无 secrets 时提前走 missing-config 分支。
+- CI repair: 测试显式设置无效的离线占位 Provider 配置，使 success/failure fake 路径在任何环境都真实执行；focused 8 passed，Ruff/Pyright passed；CI rerun pending。
+- Squash merge: pending green checks。
 
 最终回归已刷新：Python `402 passed, 7 skipped, 8 deselected, 3 xfailed`；frontend `43 passed` 且 lint/type-check/build 通过；最终 Compose `289 passed, 3 skipped, 48 deselected, 3 xfailed`、退出码 0。Compose 临时容器、网络和 `trace-e2e` 卷已通过冻结 cleanup 命令清理，`ps -a` 为空。
 

@@ -481,6 +481,7 @@ Before implementation, rollback is simply discarding the unexecuted plan. During
 | 2026-09-05 | 四个旧分析 Agent 的失败路径只保存错误类型和安全消息 | raw Provider exception 可能携带请求或鉴权信息，不能进入普通日志、Agent state 或 ExecutionLogger | M5 security review + failure privacy tests |
 | 2026-09-05 | 首帧 5 秒预算从发起 fetch 开始，并用 observation epoch 丢弃停止后的迟到创建响应 | 响应头悬挂和 generate 竞态都会绕过原 cleanup 语义 | M5 frontend concurrency review + 2 regression cases |
 | 2026-09-05 | SSE 在 Hub 注册后立即重新读取一次数据库权威快照 | 关闭首查与订阅间的终态丢失窗口，避免最多 15 秒的终态延迟 | M5 backend concurrency review + race contract |
+| 2026-09-05 | Agent 隐私单测显式注入离线占位 Provider 配置 | 测试必须真实进入 fake Agent success/failure 路径，不能隐式依赖开发机 `.env` 或 CI secrets | PR #51 initial Python CI failure |
 
 ## 17. Surprises & Discoveries
 
@@ -517,6 +518,7 @@ Before implementation, rollback is simply discarding the unexecuted plan. During
 | 前端首帧计时器等待响应头后才启动，且停止期间返回的 generate 响应可重新启动观察 | 网络半开或退出竞态会造成永久等待/旧任务复活 | 计时覆盖 fetch 全过程并引入 observation epoch；focused composable 9 passed |
 | 数据库首查与 Hub subscribe 之间存在终态通知窗口 | 极端快任务可能等待 15 秒 reconcile 才关闭 SSE | subscribe 后立即权威核对；新增 race contract |
 | Compose migration 隔离用例与常驻 memory worker 共用数据库 | 测试临时删表期间产生非致命 `ProgrammingError` 日志噪声 | D05 测试和报告链仍通过；登记为独立测试基础设施治理项 |
+| 首轮 PR CI 暴露隐私测试继承开发机 Provider 配置 | 本机测试真实进入 fake 路径，CI 却提前返回 missing-config，形成环境相关假覆盖 | 测试内设置无效离线占位配置；focused 8 passed 后推送复跑 |
 
 ## 18. Outcomes & Retrospective
 

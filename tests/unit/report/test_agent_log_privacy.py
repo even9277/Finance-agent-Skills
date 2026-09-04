@@ -22,6 +22,13 @@ _OUTPUT_SENTINEL = "D05_PRIVATE_MODEL_OUTPUT_SENTINEL"
 _EXCEPTION_SENTINEL = "Authorization=Bearer D05_PRIVATE_EXCEPTION_SENTINEL"
 
 
+def _set_fake_provider_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """让 fake Agent 测试不依赖开发机 `.env` 或 CI secrets。"""
+    monkeypatch.setenv("OPENAI_COMPATIBLE_API_KEY", "offline-test-key")
+    monkeypatch.setenv("OPENAI_COMPATIBLE_BASE_URL", "https://offline.invalid/v1")
+    monkeypatch.setenv("OPENAI_COMPATIBLE_MODEL", "offline-test-model")
+
+
 @pytest.mark.parametrize(
     ("module_name", "function_name"),
     [
@@ -43,6 +50,7 @@ def test_analysis_agent_terminal_logs_exclude_prompt_and_model_output(
     execution_logger = MagicMock()
     fake_agent = SimpleNamespace(ainvoke=AsyncMock(return_value={"messages": []}))
 
+    _set_fake_provider_env(monkeypatch)
     monkeypatch.setattr(module, "logger", logger)
     monkeypatch.setattr(module, "get_execution_logger", lambda: execution_logger)
     monkeypatch.setattr(module, "ChatOpenAI", lambda **kwargs: object())
@@ -96,6 +104,7 @@ def test_analysis_agent_failure_artifacts_exclude_raw_provider_exception(
         ainvoke=AsyncMock(side_effect=RuntimeError(_EXCEPTION_SENTINEL))
     )
 
+    _set_fake_provider_env(monkeypatch)
     monkeypatch.setattr(module, "logger", logger)
     monkeypatch.setattr(module, "get_execution_logger", lambda: execution_logger)
     monkeypatch.setattr(module, "ChatOpenAI", lambda **kwargs: object())
