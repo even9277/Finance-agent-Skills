@@ -66,6 +66,13 @@ from .execution import ControlledExecutor
 from .permissions import ControlledPermissionResolver
 from .planning import ControlledPlanner
 from .ports import ModelPort, SkillRerankerPort, ToolPort, TraceSink
+from .progress import (
+    ConversationProgressObserver,
+    PlanPreviewProgress,
+    TraceSummaryProgress,
+    VerificationSummaryProgress,
+    emit_progress,
+)
 from .replanning import BoundedEvidenceReplanner
 from .rewriting import RouteAwareRewriter
 from .routing import TwoStageRouter
@@ -323,6 +330,7 @@ class ControlledConversationWorkflow:
         working_state: WorkingState | None = None,
         memory_context: tuple[MemoryContextItem, ...] = (),
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+        progress_observer: ConversationProgressObserver | None = None,
     ) -> ConversationResult:
         """执行一轮受控对话并返回唯一终态。
 
@@ -334,6 +342,7 @@ class ControlledConversationWorkflow:
             memory_context: 已经由 Application 召回并通过 PostgreSQL 后过滤的历史记忆；
                 只允许进入上下文和合成阶段。
             on_content_delta: 可选协议无关增量接收器；其背压和取消应传播到模型流。
+            progress_observer: 可选协议无关受控进度观察器；只接收权威状态投影输入。
 
         Returns:
             包含阶段事件、证据门控和终态的不可变结果。
@@ -725,6 +734,7 @@ class ControlledConversationWorkflow:
                 error_code=None if validation.is_valid else ErrorCode.PLAN_INVALID,
                 attributes=(EventAttribute(key="issue_count", value=len(validation.issues)),),
             )
+            await self._publish_trace_summary(progress_observer, events[-1])
             if validation.validated_plan is None:
                 return self._failed_result(
                     state=state,
@@ -738,6 +748,10 @@ class ControlledConversationWorkflow:
                 )
 
             current_validated = validation.validated_plan
+            await emit_progress(
+                progress_observer,
+                PlanPreviewProgress(validated_plan=current_validated, revision=1),
+            )
             combined_plan = plan
             all_observations: tuple[ToolObservation, ...] = ()
             executed_steps: list[ExecutedPlanStep] = []
@@ -748,7 +762,13 @@ class ControlledConversationWorkflow:
             while True:
                 started = time.perf_counter()
                 state.transition(RunPhase.EXECUTING)
-                execution = await self._services.executor.execute(current_validated, context)
+                plan_revision = runtime.replan_count + 1
+                execution = await self._services.executor.execute(
+                    current_validated,
+                    context,
+                    progress_observer=progress_observer,
+                    plan_revision=plan_revision,
+                )
                 total_tool_calls += execution.tool_call_count
                 all_observations += execution.observations
                 is_replanned = runtime.replan_count > 0
@@ -785,6 +805,7 @@ class ControlledConversationWorkflow:
                         EventAttribute(key="replan_count", value=runtime.replan_count),
                     ),
                 )
+                await self._publish_trace_summary(progress_observer, events[-1])
 
                 started = time.perf_counter()
                 state.transition(RunPhase.VERIFIED)
@@ -814,6 +835,15 @@ class ControlledConversationWorkflow:
                         EventAttribute(key="evidence_score", value=verification.score.total),
                     )
                     + _web_source_trace_attributes(verification),
+                )
+                await self._publish_trace_summary(progress_observer, events[-1])
+                await emit_progress(
+                    progress_observer,
+                    VerificationSummaryProgress(
+                        plan_id=current_validated.plan.plan_id,
+                        revision=plan_revision,
+                        verification=verification,
+                    ),
                 )
 
                 started = time.perf_counter()
@@ -852,6 +882,7 @@ class ControlledConversationWorkflow:
                         ),
                     ),
                 )
+                await self._publish_trace_summary(progress_observer, events[-1])
                 if replan.plan is None:
                     runtime = ControllerRuntimeState(
                         replan_count=context.budget.max_replans,
@@ -894,6 +925,7 @@ class ControlledConversationWorkflow:
                         EventAttribute(key="replan_count", value=attempt),
                     ),
                 )
+                await self._publish_trace_summary(progress_observer, events[-1])
                 if replan_validation.validated_plan is None:
                     return self._failed_result(
                         state=state,
@@ -920,6 +952,14 @@ class ControlledConversationWorkflow:
                     previous_missing_requirements=verification.missing_requirements,
                 )
                 current_validated = replan_validation.validated_plan
+                await emit_progress(
+                    progress_observer,
+                    PlanPreviewProgress(
+                        validated_plan=current_validated,
+                        revision=attempt + 1,
+                        replan_reason=replan.reason,
+                    ),
+                )
 
             if decision.terminal_status is TerminalStatus.FAILED:
                 return self._failed_result(
@@ -1250,3 +1290,24 @@ class ControlledConversationWorkflow:
                 stage.value,
                 type(exc).__name__,
             )
+
+    @staticmethod
+    async def _publish_trace_summary(
+        observer: ConversationProgressObserver | None,
+        event: WorkflowEvent,
+    ) -> None:
+        """把已落入内部 Trace 的阶段结果投影为无 attributes 的进度摘要。
+
+        Args:
+            observer: 流式请求注入的可选观察器。
+            event: 已由工作流写入内部 Trace 的权威阶段事件。
+        """
+        await emit_progress(
+            observer,
+            TraceSummaryProgress(
+                stage=event.stage,
+                status=event.status,
+                elapsed_ms=event.elapsed_ms,
+                error_code=event.error_code,
+            ),
+        )

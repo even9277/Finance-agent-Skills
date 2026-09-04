@@ -446,8 +446,101 @@ export type ChatStreamErrorCode =
   | 'CHAT_INTERNAL_ERROR'
   | 'CHAT_STREAM_INCOMPLETE'
 
+export type ChatStepLifecycleStatus =
+  | 'PLANNED'
+  | 'RUNNING'
+  | 'SUCCEEDED'
+  | 'FAILED'
+  | 'SKIPPED'
+  | 'REPLANNED'
+  | 'CANCELLED'
+
+export type ChatToolLifecycleStatus =
+  | 'STARTED'
+  | 'SUCCEEDED'
+  | 'FAILED'
+  | 'SKIPPED'
+  | 'CANCELLED'
+
+export type ChatEvidenceSufficiency = 'SUFFICIENT' | 'PARTIAL' | 'INSUFFICIENT'
+
+export interface ChatPlanStepPreview {
+  step_id: string
+  title: string
+  purpose: string
+  required: boolean
+  status: 'PLANNED'
+  depends_on: string[]
+  subject_summary: string
+}
+
+export type ChatTraceSummaryFrame = WsStreamEnvelope & {
+  type: 'trace_summary'
+  stage: string
+  status: 'STARTED' | 'SUCCEEDED' | 'FAILED' | 'SKIPPED' | 'PARTIAL'
+  elapsed_ms: number
+  summary: string
+  error_code?: string
+}
+
+export type ChatPlanPreviewFrame = WsStreamEnvelope & {
+  type: 'plan_preview'
+  plan_id: string
+  revision: number
+  validated: true
+  steps: ChatPlanStepPreview[]
+  replan_reason?: string
+  replaced_step_ids?: string[]
+}
+
+export type ChatStepStatusFrame = WsStreamEnvelope & {
+  type: 'step_status'
+  plan_id: string
+  revision: number
+  step_id: string
+  status: ChatStepLifecycleStatus
+  elapsed_ms?: number
+  error_code?: string
+}
+
+export type ChatToolStatusFrame = WsStreamEnvelope & {
+  type: 'tool_status'
+  plan_id: string
+  revision: number
+  tool_call_id: string
+  step_id: string
+  display_name: string
+  status: ChatToolLifecycleStatus
+  attempt: number
+  elapsed_ms?: number
+  parameter_summary: string[]
+  result_summary?: string
+  error_code?: string
+}
+
+export type ChatVerificationSummaryFrame = WsStreamEnvelope & {
+  type: 'verification_summary'
+  plan_id: string
+  revision: number
+  sufficiency: ChatEvidenceSufficiency
+  claim_level: 'ANALYTICAL' | 'DESCRIPTIVE' | 'REFUSE'
+  accepted_count: number
+  rejected_count: number
+  covered_dimensions: string[]
+  missing_dimensions: string[]
+  limitation: string
+}
+
+export type ChatControlledFrame =
+  | ChatTraceSummaryFrame
+  | ChatPlanPreviewFrame
+  | ChatStepStatusFrame
+  | ChatToolStatusFrame
+  | ChatVerificationSummaryFrame
+
 export type WsStreamV2Frame = WsStreamEnvelope & (
   | { type: 'stream_start' }
+  | ChatControlledFrame
   | { type: 'content_delta'; content: string; chunk_index: number }
   | { type: 'stream_end'; status: ChatTerminalStatus; chunk_count: number; content_sha256: string }
   | { type: 'stream_error'; code: ChatStreamErrorCode; message: string; chunk_count: number }
@@ -481,6 +574,30 @@ const CHAT_STREAM_ERROR_CODES = new Set<ChatStreamErrorCode>([
   'CHAT_STREAM_INCOMPLETE',
 ])
 
+const CHAT_STEP_STATUSES = new Set<ChatStepLifecycleStatus>([
+  'PLANNED',
+  'RUNNING',
+  'SUCCEEDED',
+  'FAILED',
+  'SKIPPED',
+  'REPLANNED',
+  'CANCELLED',
+])
+
+const CHAT_TOOL_STATUSES = new Set<ChatToolLifecycleStatus>([
+  'STARTED',
+  'SUCCEEDED',
+  'FAILED',
+  'SKIPPED',
+  'CANCELLED',
+])
+
+const CHAT_EVIDENCE_SUFFICIENCY = new Set<ChatEvidenceSufficiency>([
+  'SUFFICIENT',
+  'PARTIAL',
+  'INSUFFICIENT',
+])
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
@@ -499,6 +616,47 @@ function isPositiveInteger(value: unknown): value is number {
 
 function isFiniteNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value)
+}
+
+function isNonNegativeNumber(value: unknown): value is number {
+  return isFiniteNumber(value) && value >= 0
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every(isNonEmptyString)
+}
+
+function hasOnlyKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
+  const allowedKeys = new Set([
+    'protocol_version',
+    'request_id',
+    'session_id',
+    'sequence',
+    'type',
+    ...allowed,
+  ])
+  return Object.keys(value).every((key) => allowedKeys.has(key))
+}
+
+function isOptionalString(value: unknown): boolean {
+  return value === undefined || isNonEmptyString(value)
+}
+
+function isOptionalElapsed(value: unknown): boolean {
+  return value === undefined || isNonNegativeNumber(value)
+}
+
+function isPlanStep(value: unknown): value is ChatPlanStepPreview {
+  if (!isRecord(value) || !hasOnlyKeys(value, [
+    'step_id', 'title', 'purpose', 'required', 'status', 'depends_on', 'subject_summary',
+  ])) return false
+  return isNonEmptyString(value.step_id)
+    && isNonEmptyString(value.title)
+    && isNonEmptyString(value.purpose)
+    && typeof value.required === 'boolean'
+    && value.status === 'PLANNED'
+    && isStringArray(value.depends_on)
+    && isNonEmptyString(value.subject_summary)
 }
 
 function isContextWindow(value: unknown): value is ChatContextWindow {
@@ -557,6 +715,69 @@ function isWsStreamV2Frame(value: unknown): value is WsStreamV2Frame {
   switch (value.type) {
     case 'stream_start':
       return true
+    case 'trace_summary':
+      return hasOnlyKeys(value, ['stage', 'status', 'elapsed_ms', 'summary', 'error_code'])
+        && isNonEmptyString(value.stage)
+        && typeof value.status === 'string'
+        && ['STARTED', 'SUCCEEDED', 'FAILED', 'SKIPPED', 'PARTIAL'].includes(value.status)
+        && isNonNegativeNumber(value.elapsed_ms)
+        && isNonEmptyString(value.summary)
+        && isOptionalString(value.error_code)
+    case 'plan_preview':
+      return hasOnlyKeys(value, [
+        'plan_id', 'revision', 'validated', 'steps', 'replan_reason', 'replaced_step_ids',
+      ])
+        && isNonEmptyString(value.plan_id)
+        && isPositiveInteger(value.revision)
+        && value.validated === true
+        && Array.isArray(value.steps)
+        && value.steps.every(isPlanStep)
+        && isOptionalString(value.replan_reason)
+        && (value.replaced_step_ids === undefined || isStringArray(value.replaced_step_ids))
+    case 'step_status':
+      return hasOnlyKeys(value, [
+        'plan_id', 'revision', 'step_id', 'status', 'elapsed_ms', 'error_code',
+      ])
+        && isNonEmptyString(value.plan_id)
+        && isPositiveInteger(value.revision)
+        && isNonEmptyString(value.step_id)
+        && typeof value.status === 'string'
+        && CHAT_STEP_STATUSES.has(value.status as ChatStepLifecycleStatus)
+        && isOptionalElapsed(value.elapsed_ms)
+        && isOptionalString(value.error_code)
+    case 'tool_status':
+      return hasOnlyKeys(value, [
+        'plan_id', 'revision', 'tool_call_id', 'step_id', 'display_name', 'status', 'attempt',
+        'elapsed_ms', 'parameter_summary', 'result_summary', 'error_code',
+      ])
+        && isNonEmptyString(value.plan_id)
+        && isPositiveInteger(value.revision)
+        && isNonEmptyString(value.tool_call_id)
+        && isNonEmptyString(value.step_id)
+        && isNonEmptyString(value.display_name)
+        && typeof value.status === 'string'
+        && CHAT_TOOL_STATUSES.has(value.status as ChatToolLifecycleStatus)
+        && isNonNegativeInteger(value.attempt)
+        && isOptionalElapsed(value.elapsed_ms)
+        && isStringArray(value.parameter_summary)
+        && isOptionalString(value.result_summary)
+        && isOptionalString(value.error_code)
+    case 'verification_summary':
+      return hasOnlyKeys(value, [
+        'plan_id', 'revision', 'sufficiency', 'claim_level', 'accepted_count',
+        'rejected_count', 'covered_dimensions', 'missing_dimensions', 'limitation',
+      ])
+        && isNonEmptyString(value.plan_id)
+        && isPositiveInteger(value.revision)
+        && typeof value.sufficiency === 'string'
+        && CHAT_EVIDENCE_SUFFICIENCY.has(value.sufficiency as ChatEvidenceSufficiency)
+        && typeof value.claim_level === 'string'
+        && ['ANALYTICAL', 'DESCRIPTIVE', 'REFUSE'].includes(value.claim_level)
+        && isNonNegativeInteger(value.accepted_count)
+        && isNonNegativeInteger(value.rejected_count)
+        && isStringArray(value.covered_dimensions)
+        && isStringArray(value.missing_dimensions)
+        && isNonEmptyString(value.limitation)
     case 'content_delta':
       return isNonEmptyString(value.content) && isPositiveInteger(value.chunk_index)
     case 'stream_end':

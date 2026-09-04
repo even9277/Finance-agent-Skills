@@ -24,6 +24,14 @@ from .errors import (
     ToolTransientError,
 )
 from .ports import ToolPort
+from .progress import (
+    ConversationProgressObserver,
+    ProgressStepStatus,
+    ProgressToolStatus,
+    StepStatusProgress,
+    ToolStatusProgress,
+    emit_progress,
+)
 
 
 class ControlledExecutor:
@@ -36,12 +44,17 @@ class ControlledExecutor:
         self,
         plan: ValidatedToolPlan,
         context: ConversationRunContext,
+        *,
+        progress_observer: ConversationProgressObserver | None = None,
+        plan_revision: int = 1,
     ) -> ExecutionResult:
         """在请求预算内执行已校验计划并归一化步骤结果。
 
         Args:
             plan: Validator 生成、携带同一权限快照和执行层的计划。
             context: 单次/总超时、尝试次数和并发上限的运行上下文。
+            progress_observer: 可选请求级进度观察器；同步调用保持为空。
+            plan_revision: 当前已校验计划版本，从 1 开始。
 
         Returns:
             按原计划顺序排列的观察、真实调用数和批次统计。
@@ -51,6 +64,8 @@ class ControlledExecutor:
         """
         if not isinstance(plan, ValidatedToolPlan):
             raise ContractViolationError("executor accepts ValidatedToolPlan only")
+        if plan_revision < 1:
+            raise ContractViolationError("plan revision must start from one")
         by_id = {step.step_id: step for step in plan.plan.steps}
         if any(step_id not in by_id for layer in plan.execution_layers for step_id in layer):
             raise ContractViolationError("validated execution layers reference unknown steps")
@@ -79,6 +94,8 @@ class ControlledExecutor:
                     previous=observations,
                     seen_actions=seen_actions,
                     semaphore=semaphore,
+                    progress_observer=progress_observer,
+                    plan_revision=plan_revision,
                 )
                 for step_id in layer
             ]
@@ -117,32 +134,61 @@ class ControlledExecutor:
         previous: dict[str, ToolObservation],
         seen_actions: set[str],
         semaphore: asyncio.Semaphore,
+        progress_observer: ConversationProgressObserver | None,
+        plan_revision: int,
     ) -> tuple[ToolObservation, int, bool]:
+        step_started = time.perf_counter()
         if any(previous[item].status is not StepStatus.SUCCEEDED for item in step.depends_on):
+            observation = self._failure_observation(
+                step,
+                attempts=0,
+                status=StepStatus.SKIPPED,
+                error_code=ErrorCode.TOOL_DEPENDENCY_FAILED,
+                message="上游工具步骤失败，本步骤未执行。",
+            )
+            await self._emit_skipped_progress(
+                validated,
+                step,
+                observation,
+                progress_observer=progress_observer,
+                plan_revision=plan_revision,
+            )
             return (
-                self._failure_observation(
-                    step,
-                    attempts=0,
-                    status=StepStatus.SKIPPED,
-                    error_code=ErrorCode.TOOL_DEPENDENCY_FAILED,
-                    message="上游工具步骤失败，本步骤未执行。",
-                ),
+                observation,
                 0,
                 False,
             )
         if step.idempotency_key in seen_actions:
+            observation = self._failure_observation(
+                step,
+                attempts=0,
+                status=StepStatus.SKIPPED,
+                error_code=ErrorCode.DUPLICATE_TOOL_ACTION,
+                message="相同只读动作已执行，本步骤已去重。",
+            )
+            await self._emit_skipped_progress(
+                validated,
+                step,
+                observation,
+                progress_observer=progress_observer,
+                plan_revision=plan_revision,
+            )
             return (
-                self._failure_observation(
-                    step,
-                    attempts=0,
-                    status=StepStatus.SKIPPED,
-                    error_code=ErrorCode.DUPLICATE_TOOL_ACTION,
-                    message="相同只读动作已执行，本步骤已去重。",
-                ),
+                observation,
                 0,
                 True,
             )
         seen_actions.add(step.idempotency_key)
+
+        await emit_progress(
+            progress_observer,
+            StepStatusProgress(
+                plan_id=validated.plan.plan_id,
+                revision=plan_revision,
+                step_id=step.step_id,
+                status=ProgressStepStatus.RUNNING,
+            ),
+        )
 
         policy = validated.permissions.require(step.tool_name)
         max_attempts = context.budget.max_tool_attempts if policy.retryable else 1
@@ -157,72 +203,284 @@ class ControlledExecutor:
         calls = 0
         for attempt in range(1, max_attempts + 1):
             calls += 1
+            tool_call_id = f"{validated.plan.plan_id}:{step.step_id}:attempt-{attempt}"
+            tool_started = time.perf_counter()
+            failure: ToolObservation | None = None
+            retryable_failure = False
+
+            # STARTED 紧贴真实 ToolPort 调用；仅捕获 Provider 调用本身的异常，
+            # 观察器的背压、失败和取消必须越过 Executor 传播到事务边界。
+            await semaphore.acquire()
             try:
-                async with semaphore:
+                await emit_progress(
+                    progress_observer,
+                    ToolStatusProgress(
+                        plan_id=validated.plan.plan_id,
+                        revision=plan_revision,
+                        tool_call_id=tool_call_id,
+                        step_id=step.step_id,
+                        tool_name=step.tool_name,
+                        symbol=step.symbol,
+                        evidence_dimension=step.evidence_dimension,
+                        arguments=step.arguments,
+                        status=ProgressToolStatus.STARTED,
+                        attempt=attempt,
+                    ),
+                )
+                try:
                     observation = await asyncio.wait_for(
                         self._tool.execute(call),
                         timeout=max(0.001, context.budget.per_tool_timeout_ms / 1000),
                     )
-                if not self._matches_call(observation, call):
-                    return (
-                        self._failure_observation(
-                            step,
-                            attempts=attempt,
-                            error_code=ErrorCode.TOOL_INVALID_RESULT,
-                            message="工具结果与已授权调用合同不一致。",
-                        ),
-                        calls,
-                        False,
+                except (ToolTimeoutError, TimeoutError):
+                    failure = self._failure_observation(
+                        step,
+                        attempts=attempt,
+                        error_code=ErrorCode.TOOL_TIMEOUT,
+                        message="只读工具在调用预算内超时。",
                     )
-                return replace(observation, attempts=attempt), calls, False
-            except (ToolTimeoutError, TimeoutError):
-                if attempt == max_attempts:
-                    return (
-                        self._failure_observation(
-                            step,
-                            attempts=attempt,
-                            error_code=ErrorCode.TOOL_TIMEOUT,
-                            message="只读工具在调用预算内超时。",
-                        ),
-                        calls,
-                        False,
+                    retryable_failure = True
+                except ToolTransientError:
+                    failure = self._failure_observation(
+                        step,
+                        attempts=attempt,
+                        error_code=ErrorCode.TOOL_TRANSIENT_FAILURE,
+                        message="只读工具的瞬时故障在重试预算内未恢复。",
                     )
-            except ToolTransientError:
-                if attempt == max_attempts:
-                    return (
-                        self._failure_observation(
-                            step,
-                            attempts=attempt,
-                            error_code=ErrorCode.TOOL_TRANSIENT_FAILURE,
-                            message="只读工具的瞬时故障在重试预算内未恢复。",
-                        ),
-                        calls,
-                        False,
-                    )
-            except ToolPermanentError:
-                return (
-                    self._failure_observation(
+                    retryable_failure = True
+                except ToolPermanentError:
+                    failure = self._failure_observation(
                         step,
                         attempts=attempt,
                         error_code=ErrorCode.TOOL_EXECUTION_FAILED,
                         message="只读工具返回不可重试失败。",
-                    ),
-                    calls,
-                    False,
-                )
-            except Exception:
-                # 未知 Provider 异常只保留稳定错误码，不让原始消息进入状态或 Trace。
-                return (
-                    self._failure_observation(
+                    )
+                except Exception:
+                    # 未知 Provider 异常只保留稳定错误码，不进入状态或公开进度。
+                    failure = self._failure_observation(
                         step,
                         attempts=attempt,
                         error_code=ErrorCode.TOOL_EXECUTION_FAILED,
                         message="只读工具执行失败。",
-                    ),
-                    calls,
-                    False,
+                    )
+            finally:
+                semaphore.release()
+
+            if failure is not None:
+                await self._emit_attempt_failure(
+                    validated,
+                    step,
+                    failure,
+                    tool_call_id=tool_call_id,
+                    attempt=attempt,
+                    tool_started=tool_started,
+                    progress_observer=progress_observer,
+                    plan_revision=plan_revision,
                 )
+                if retryable_failure and attempt < max_attempts:
+                    continue
+                await self._emit_step_failure(
+                    validated,
+                    step,
+                    failure,
+                    step_started=step_started,
+                    progress_observer=progress_observer,
+                    plan_revision=plan_revision,
+                )
+                return failure, calls, False
+
+            if not self._matches_call(observation, call):
+                failure = self._failure_observation(
+                    step,
+                    attempts=attempt,
+                    error_code=ErrorCode.TOOL_INVALID_RESULT,
+                    message="工具结果与已授权调用合同不一致。",
+                )
+                await self._emit_failed_progress(
+                    validated,
+                    step,
+                    failure,
+                    tool_call_id=tool_call_id,
+                    attempt=attempt,
+                    tool_started=tool_started,
+                    step_started=step_started,
+                    progress_observer=progress_observer,
+                    plan_revision=plan_revision,
+                )
+                return failure, calls, False
+
+            normalized = replace(observation, attempts=attempt)
+            succeeded = normalized.status is StepStatus.SUCCEEDED
+            await emit_progress(
+                progress_observer,
+                ToolStatusProgress(
+                    plan_id=validated.plan.plan_id,
+                    revision=plan_revision,
+                    tool_call_id=tool_call_id,
+                    step_id=step.step_id,
+                    tool_name=step.tool_name,
+                    symbol=step.symbol,
+                    evidence_dimension=step.evidence_dimension,
+                    arguments=step.arguments,
+                    status=(
+                        ProgressToolStatus.SUCCEEDED
+                        if succeeded
+                        else ProgressToolStatus.FAILED
+                    ),
+                    attempt=attempt,
+                    elapsed_ms=self._elapsed_ms(tool_started),
+                    observation=normalized,
+                    error_code=normalized.error_code,
+                ),
+            )
+            await emit_progress(
+                progress_observer,
+                StepStatusProgress(
+                    plan_id=validated.plan.plan_id,
+                    revision=plan_revision,
+                    step_id=step.step_id,
+                    status=(
+                        ProgressStepStatus.SUCCEEDED
+                        if succeeded
+                        else ProgressStepStatus.FAILED
+                    ),
+                    elapsed_ms=self._elapsed_ms(step_started),
+                    error_code=normalized.error_code,
+                ),
+            )
+            return normalized, calls, False
         raise ContractViolationError("tool retry loop exited without a normalized result")
+
+    async def _emit_skipped_progress(
+        self,
+        validated: ValidatedToolPlan,
+        step: ToolPlanStep,
+        observation: ToolObservation,
+        *,
+        progress_observer: ConversationProgressObserver | None,
+        plan_revision: int,
+    ) -> None:
+        """发布未实际调用工具的跳过状态，禁止伪造 STARTED。"""
+        await emit_progress(
+            progress_observer,
+            ToolStatusProgress(
+                plan_id=validated.plan.plan_id,
+                revision=plan_revision,
+                tool_call_id=f"{validated.plan.plan_id}:{step.step_id}:skipped",
+                step_id=step.step_id,
+                tool_name=step.tool_name,
+                symbol=step.symbol,
+                evidence_dimension=step.evidence_dimension,
+                arguments=step.arguments,
+                status=ProgressToolStatus.SKIPPED,
+                attempt=0,
+                observation=observation,
+                error_code=observation.error_code,
+            ),
+        )
+        await emit_progress(
+            progress_observer,
+            StepStatusProgress(
+                plan_id=validated.plan.plan_id,
+                revision=plan_revision,
+                step_id=step.step_id,
+                status=ProgressStepStatus.SKIPPED,
+                error_code=observation.error_code,
+            ),
+        )
+
+    async def _emit_attempt_failure(
+        self,
+        validated: ValidatedToolPlan,
+        step: ToolPlanStep,
+        observation: ToolObservation,
+        *,
+        tool_call_id: str,
+        attempt: int,
+        tool_started: float,
+        progress_observer: ConversationProgressObserver | None,
+        plan_revision: int,
+    ) -> None:
+        """发布一次真实工具尝试的归一化失败。"""
+        await emit_progress(
+            progress_observer,
+            ToolStatusProgress(
+                plan_id=validated.plan.plan_id,
+                revision=plan_revision,
+                tool_call_id=tool_call_id,
+                step_id=step.step_id,
+                tool_name=step.tool_name,
+                symbol=step.symbol,
+                evidence_dimension=step.evidence_dimension,
+                arguments=step.arguments,
+                status=ProgressToolStatus.FAILED,
+                attempt=attempt,
+                elapsed_ms=self._elapsed_ms(tool_started),
+                observation=observation,
+                error_code=observation.error_code,
+            ),
+        )
+
+    async def _emit_step_failure(
+        self,
+        validated: ValidatedToolPlan,
+        step: ToolPlanStep,
+        observation: ToolObservation,
+        *,
+        step_started: float,
+        progress_observer: ConversationProgressObserver | None,
+        plan_revision: int,
+    ) -> None:
+        """在所有允许尝试结束后闭合步骤失败状态。"""
+        await emit_progress(
+            progress_observer,
+            StepStatusProgress(
+                plan_id=validated.plan.plan_id,
+                revision=plan_revision,
+                step_id=step.step_id,
+                status=ProgressStepStatus.FAILED,
+                elapsed_ms=self._elapsed_ms(step_started),
+                error_code=observation.error_code,
+            ),
+        )
+
+    async def _emit_failed_progress(
+        self,
+        validated: ValidatedToolPlan,
+        step: ToolPlanStep,
+        observation: ToolObservation,
+        *,
+        tool_call_id: str,
+        attempt: int,
+        tool_started: float,
+        step_started: float,
+        progress_observer: ConversationProgressObserver | None,
+        plan_revision: int,
+    ) -> None:
+        """连续发布不可重试的工具失败和步骤失败。"""
+        await self._emit_attempt_failure(
+            validated,
+            step,
+            observation,
+            tool_call_id=tool_call_id,
+            attempt=attempt,
+            tool_started=tool_started,
+            progress_observer=progress_observer,
+            plan_revision=plan_revision,
+        )
+        await self._emit_step_failure(
+            validated,
+            step,
+            observation,
+            step_started=step_started,
+            progress_observer=progress_observer,
+            plan_revision=plan_revision,
+        )
+
+    @staticmethod
+    def _elapsed_ms(started: float) -> float:
+        """返回非负毫秒耗时，统一进度事件的计时口径。"""
+        return max(0.0, (time.perf_counter() - started) * 1000)
 
     @staticmethod
     def _matches_call(observation: ToolObservation, call: ToolCall) -> bool:

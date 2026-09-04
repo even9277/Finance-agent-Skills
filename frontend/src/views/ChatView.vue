@@ -5,6 +5,7 @@ import ChatHistorySidebar from '@/components/chat/ChatHistorySidebar.vue'
 import ChatWindow from '@/components/chat/ChatWindow.vue'
 import ChatInput from '@/components/chat/ChatInput.vue'
 import SkillConfirmationCard from '@/components/chat/SkillConfirmationCard.vue'
+import ControlledExecutionPanel from '@/components/chat/ControlledExecutionPanel.vue'
 import TemplatePrompts from '@/components/chat/TemplatePrompts.vue'
 import MemorySidebar from '@/components/memory/MemorySidebar.vue'
 import { useChat } from '@/composables/useChat'
@@ -18,6 +19,7 @@ const {
   templates,
   loadSessions, loadMessages, sendMessage, sendMessageStream,
   confirmSkill, cancelSkillConfirmation,
+  stopStreaming,
   newSession, deleteSession, renameSession, loadTemplates,
 } = useChat()
 
@@ -58,7 +60,7 @@ async function handleSend(text: string) {
     await sendMessageStream(text)
   } catch {
     // WebSocket 不可用时降级同步
-    await sendMessage(text)
+    await sendMessage(text, undefined, false)
   }
 }
 
@@ -83,7 +85,7 @@ async function handleViewSummaryHistory() {
 </script>
 
 <template>
-  <AppLayout :sidebar="true">
+  <AppLayout :sidebar="true" class="controlled-chat-layout">
     <!-- 左侧：会话历史侧边栏 -->
     <template #sidebar>
       <ChatHistorySidebar
@@ -190,10 +192,14 @@ async function handleViewSummaryHistory() {
         @cancel="cancelSkillConfirmation"
       />
 
+      <ControlledExecutionPanel :execution="chatStore.controlledExecution" />
+
       <ChatInput
         :disabled="chatStore.isSending || chatStore.isStreaming"
+        :streaming="chatStore.isStreaming"
         :context-window="chatStore.currentContextWindow"
         @send="handleSend"
+        @stop="stopStreaming"
       />
 
     </div>
@@ -275,3 +281,12 @@ async function handleViewSummaryHistory() {
     </Teleport>
   </AppLayout>
 </template>
+
+<style scoped>
+/* 窄屏优先保留受控对话主链，避免两个固定侧栏把输入区挤压到不可操作。 */
+@media (max-width: 1023px) {
+  .controlled-chat-layout :deep(aside) {
+    display: none;
+  }
+}
+</style>

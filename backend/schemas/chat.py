@@ -128,6 +128,93 @@ class ChatStreamStartFrame(ChatStreamEnvelope):
     type: Literal["stream_start"] = "stream_start"
 
 
+class ChatTraceSummaryFrame(ChatStreamEnvelope):
+    """表示不含内部 Trace attributes 的阶段摘要。"""
+
+    type: Literal["trace_summary"] = "trace_summary"
+    stage: str = Field(..., min_length=1, max_length=64)
+    status: str = Field(..., min_length=1, max_length=32)
+    elapsed_ms: float = Field(..., ge=0)
+    summary: str = Field(..., min_length=1, max_length=200)
+    error_code: Optional[str] = Field(None, max_length=64)
+
+
+class ChatPlanStepPreviewFrame(BaseModel):
+    """表示已校验计划中的一个公开步骤摘要。"""
+
+    step_id: str = Field(..., min_length=1, max_length=128)
+    title: str = Field(..., min_length=1, max_length=100)
+    purpose: str = Field(..., min_length=1, max_length=200)
+    required: bool
+    status: Literal["PLANNED"] = "PLANNED"
+    depends_on: list[str] = Field(default_factory=list, max_length=64)
+    subject_summary: str = Field(..., min_length=1, max_length=100)
+
+
+class ChatPlanPreviewFrame(ChatStreamEnvelope):
+    """表示 Validator 已接受的公开计划版本。"""
+
+    type: Literal["plan_preview"] = "plan_preview"
+    plan_id: str = Field(..., min_length=1, max_length=128)
+    revision: int = Field(..., ge=1)
+    validated: Literal[True] = True
+    steps: list[ChatPlanStepPreviewFrame] = Field(default_factory=list, max_length=128)
+    replan_reason: Optional[str] = Field(None, max_length=200)
+    replaced_step_ids: list[str] = Field(default_factory=list, max_length=128)
+
+
+class ChatStepStatusFrame(ChatStreamEnvelope):
+    """表示一个稳定步骤 ID 的公开生命周期状态。"""
+
+    type: Literal["step_status"] = "step_status"
+    plan_id: str = Field(..., min_length=1, max_length=128)
+    revision: int = Field(..., ge=1)
+    step_id: str = Field(..., min_length=1, max_length=128)
+    status: Literal[
+        "PLANNED",
+        "RUNNING",
+        "SUCCEEDED",
+        "FAILED",
+        "SKIPPED",
+        "REPLANNED",
+        "CANCELLED",
+    ]
+    elapsed_ms: Optional[float] = Field(None, ge=0)
+    error_code: Optional[str] = Field(None, max_length=64)
+
+
+class ChatToolStatusFrame(ChatStreamEnvelope):
+    """表示一次工具尝试经过白名单投影后的公开状态。"""
+
+    type: Literal["tool_status"] = "tool_status"
+    plan_id: str = Field(..., min_length=1, max_length=128)
+    revision: int = Field(..., ge=1)
+    tool_call_id: str = Field(..., min_length=1, max_length=256)
+    step_id: str = Field(..., min_length=1, max_length=128)
+    display_name: str = Field(..., min_length=1, max_length=100)
+    status: Literal["STARTED", "SUCCEEDED", "FAILED", "SKIPPED", "CANCELLED"]
+    attempt: int = Field(..., ge=0)
+    elapsed_ms: Optional[float] = Field(None, ge=0)
+    parameter_summary: list[str] = Field(default_factory=list, max_length=5)
+    result_summary: Optional[str] = Field(None, max_length=200)
+    error_code: Optional[str] = Field(None, max_length=64)
+
+
+class ChatVerificationSummaryFrame(ChatStreamEnvelope):
+    """表示 Evidence Verifier 权威结论的公开摘要。"""
+
+    type: Literal["verification_summary"] = "verification_summary"
+    plan_id: str = Field(..., min_length=1, max_length=128)
+    revision: int = Field(..., ge=1)
+    sufficiency: Literal["SUFFICIENT", "PARTIAL", "INSUFFICIENT"]
+    claim_level: Literal["ANALYTICAL", "DESCRIPTIVE", "REFUSE"]
+    accepted_count: int = Field(..., ge=0)
+    rejected_count: int = Field(..., ge=0)
+    covered_dimensions: list[str] = Field(default_factory=list, max_length=32)
+    missing_dimensions: list[str] = Field(default_factory=list, max_length=32)
+    limitation: str = Field(..., min_length=1, max_length=200)
+
+
 class ChatContentDeltaFrame(ChatStreamEnvelope):
     """表示可直接追加到同一助手消息的一段非空正文。"""
 

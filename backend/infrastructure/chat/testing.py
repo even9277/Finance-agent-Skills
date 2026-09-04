@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from datetime import date
 
@@ -32,10 +33,13 @@ class FakeModelProvider:
     """只读取 AnswerContextPack 的离线模型 Port。"""
 
     calls: list[ModelSynthesisRequest] = field(default_factory=list)
+    chunk_delay_seconds: float = 0.0
 
     async def stream_synthesize(self, request: ModelSynthesisRequest):
         """记录结构化请求并生成一个显式离线增量。"""
         self.calls.append(request)
+        if self.chunk_delay_seconds > 0:
+            await asyncio.sleep(self.chunk_delay_seconds)
         entity = request.context.entity
         sources = sorted({item.source for item in request.context.accepted_evidence})
         subject = f"{entity.symbol}（{entity.name}）" if entity is not None else "当前主题"

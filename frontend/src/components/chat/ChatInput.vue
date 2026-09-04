@@ -4,9 +4,14 @@ import type { ChatContextWindow } from '@/api'
 import ContextUsageRing from '@/components/chat/ContextUsageRing.vue'
 import { countDraftTokens } from '@/utils/tokenCounter'
 
-const props = defineProps<{ disabled?: boolean; contextWindow?: ChatContextWindow | null }>()
+const props = defineProps<{
+  disabled?: boolean
+  streaming?: boolean
+  contextWindow?: ChatContextWindow | null
+}>()
 const emit = defineEmits<{
   (e: 'send', text: string): void
+  (e: 'stop'): void
 }>()
 
 const text = ref('')
@@ -97,6 +102,16 @@ function autoResize(e: Event) {
         >
           {{ charCount }}/{{ MAX_CHARS }}
         </span>
+
+        <button
+          v-if="streaming"
+          type="button"
+          aria-label="停止生成"
+          class="h-8 rounded-lg border border-red-500/50 px-3 text-xs text-red-300 transition-colors hover:bg-red-950/50"
+          @click="emit('stop')"
+        >
+          停止生成
+        </button>
 
         <!-- 发送按钮 -->
         <button

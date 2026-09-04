@@ -60,14 +60,19 @@ class _ChunkedModel:
         yield ModelSynthesisChunk(content="第二段：结论保持审慎。", index=2)
 
 
-def _collect_frames(client: TestClient, *, request_id: str) -> list[dict[str, object]]:
+def _collect_frames(
+    client: TestClient,
+    *,
+    request_id: str,
+    message: str = _QUESTION,
+) -> list[dict[str, object]]:
     """发送一轮合法请求并读取到唯一公开终态。"""
     frames: list[dict[str, object]] = []
     with client.websocket_connect("/api/chat/stream") as websocket:
         websocket.send_json(
             {
                 "user_id": _USER_ID,
-                "message": _QUESTION,
+                "message": message,
                 "request_id": request_id,
             }
         )
@@ -104,6 +109,8 @@ def _run_offline_websocket_case(
     *,
     model: _ChunkedModel,
     request_id: str,
+    tool_behavior: str = "success",
+    message: str = _QUESTION,
 ) -> tuple[list[dict[str, object]], list[Message]]:
     """装配真实 Router/Workflow/Repository 并执行一轮隔离 WS。"""
     engine = create_async_engine(
@@ -112,7 +119,7 @@ def _run_offline_websocket_case(
     )
     session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     asyncio.run(_prepare_database(engine, session_factory))
-    tool = FakeToolProvider()
+    tool = FakeToolProvider(behavior=tool_behavior)
     trace = InMemoryTraceSink()
 
     def build_use_case(db: AsyncSession) -> ControlledChatUseCase:
@@ -132,7 +139,11 @@ def _run_offline_websocket_case(
             patch.object(chat_router, "AsyncSessionFactory", new=session_factory),
             patch.object(chat_router, "build_chat_use_case", new=build_use_case),
         ):
-            frames = _collect_frames(TestClient(app), request_id=request_id)
+            frames = _collect_frames(
+                TestClient(app),
+                request_id=request_id,
+                message=message,
+            )
         messages = asyncio.run(_read_messages(session_factory))
         return frames, messages
     finally:
@@ -165,6 +176,108 @@ def test_offline_websocket_multichunk_reply_matches_persisted_message(tmp_path: 
 
 
 @pytest.mark.e2e
+def test_offline_websocket_exposes_real_controlled_execution_before_final_text(
+    tmp_path: Path,
+) -> None:
+    """D04-C01：真实工作流必须在正文前公开已校验计划、工具和证据状态。"""
+    frames, _ = _run_offline_websocket_case(
+        tmp_path,
+        model=_ChunkedModel(),
+        request_id="offline-ws-controlled-progress",
+    )
+    frame_types = [str(frame["type"]) for frame in frames]
+
+    plan_index = frame_types.index("plan_preview")
+    first_step_running = next(
+        index
+        for index, frame in enumerate(frames)
+        if frame["type"] == "step_status" and frame["status"] == "RUNNING"
+    )
+    first_tool_started = next(
+        index
+        for index, frame in enumerate(frames)
+        if frame["type"] == "tool_status" and frame["status"] == "STARTED"
+    )
+    verification_index = frame_types.index("verification_summary")
+    first_delta_index = frame_types.index("content_delta")
+
+    assert plan_index < first_step_running <= first_tool_started
+    assert first_tool_started < verification_index < first_delta_index
+    assert frames[plan_index]["validated"] is True
+    assert all(
+        frame["status"] in {"SUCCEEDED", "FAILED", "SKIPPED", "CANCELLED"}
+        for frame in frames
+        if frame["type"] == "tool_status" and frame["status"] != "STARTED"
+    )
+    assert all(
+        frame["status"] in {"SUCCEEDED", "FAILED", "SKIPPED", "CANCELLED"}
+        for frame in frames
+        if frame["type"] == "step_status" and frame["status"] != "RUNNING"
+    )
+    public_payload = repr(frames)
+    for forbidden in ("idempotency_key", "permission_hash", "facts", "arguments"):
+        assert forbidden not in public_payload
+
+
+@pytest.mark.e2e
+def test_offline_websocket_replan_preserves_history_and_increments_revision(
+    tmp_path: Path,
+) -> None:
+    """D04-C04：真实补证必须新增计划版本并保留旧步骤的已完成历史。"""
+    frames, _ = _run_offline_websocket_case(
+        tmp_path,
+        model=_ChunkedModel(),
+        request_id="offline-ws-controlled-replan",
+        tool_behavior="recover_market_with_alternative",
+    )
+    plans = [frame for frame in frames if frame["type"] == "plan_preview"]
+    steps = [frame for frame in frames if frame["type"] == "step_status"]
+
+    assert [frame["revision"] for frame in plans] == [1, 2]
+    assert plans[1]["replan_reason"]
+    plan_steps = plans[0]["steps"]
+    assert isinstance(plan_steps, list)
+    revision_one_step_ids = {
+        str(step["step_id"])
+        for step in plan_steps
+        if isinstance(step, dict)
+    }
+    assert any(
+        frame["revision"] == 1
+        and frame["step_id"] in revision_one_step_ids
+        and frame["status"] == "SUCCEEDED"
+        for frame in steps
+    )
+    assert any(
+        frame["revision"] == 2
+        and frame["status"] in {"RUNNING", "SUCCEEDED"}
+        for frame in steps
+    )
+    assert frames[-1]["type"] == "stream_end"
+    assert frames[-1]["status"] == "SUCCEEDED"
+
+
+@pytest.mark.e2e
+def test_offline_websocket_clarification_has_no_fake_execution_cards(
+    tmp_path: Path,
+) -> None:
+    """D04-C05：澄清分支不得为了展示而生成计划、工具或证据卡。"""
+    frames, _ = _run_offline_websocket_case(
+        tmp_path,
+        model=_ChunkedModel(),
+        request_id="offline-ws-controlled-clarification",
+        message="平安现在能买吗",
+    )
+
+    assert frames[-1]["type"] == "stream_end"
+    assert frames[-1]["status"] == "NEEDS_CLARIFICATION"
+    assert not any(
+        frame["type"] in {"plan_preview", "step_status", "tool_status", "verification_summary"}
+        for frame in frames
+    )
+
+
+@pytest.mark.e2e
 def test_offline_websocket_midstream_failure_rolls_back_database(tmp_path: Path) -> None:
     """首增量后 Provider 失败必须返回 Error，且用户/助手消息均不落库。"""
     frames, messages = _run_offline_websocket_case(
@@ -173,11 +286,12 @@ def test_offline_websocket_midstream_failure_rolls_back_database(tmp_path: Path)
         request_id="offline-ws-midstream-failure",
     )
 
-    assert [frame["type"] for frame in frames] == [
-        "stream_start",
-        "content_delta",
-        "stream_error",
-    ]
+    frame_types = [str(frame["type"]) for frame in frames]
+    assert frame_types[0] == "stream_start"
+    assert frame_types[-2:] == ["content_delta", "stream_error"]
+    assert "plan_preview" in frame_types
+    assert "verification_summary" in frame_types
+    assert frame_types.index("verification_summary") < frame_types.index("content_delta")
     assert frames[-1]["code"] == "CHAT_STREAM_FAILED"
     assert frames[-1]["chunk_count"] == 1
     assert "offline provider mid-stream detail" not in str(frames[-1])

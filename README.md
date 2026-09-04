@@ -11,7 +11,7 @@
 
 围绕这些问题，当前仓库已经实现：
 
-- 对话模式：多轮追问、受控记忆主链（STM 滚动摘要与 Working State、LTM 画像与语义召回）、Tushare Skill 数据增强；自然语言记忆命令可在对话中直接查看、更新、删除记忆
+- 对话模式：多轮追问、Provider 真流式正文、已校验计划/步骤/工具/证据状态展示与主动停止，以及受控记忆主链（STM 滚动摘要与 Working State、LTM 画像与语义召回）和 Tushare Skill 数据增强；自然语言记忆命令可在对话中直接查看、更新、删除记忆
 - 报告模式：多 Agent 协作生成基本面、技术面、估值、新闻等综合分析报告
 - 账号体系：登录、注册、切换账号、JWT 登录态恢复
 - 工程化链路：Router / Planner / Executor / Evidence 校验、结构化 Trace、可选 Langfuse 观测、Docker 部署
@@ -262,14 +262,17 @@ Workspace 金融场景扩展与 Trace / Langfuse 配置见下面两节。
   -> 请求级只读工具权限快照 -> Planner -> Validator -> 有界 Executor
   -> Evidence Verifier -> Controller -> 最多一次补证
   -> accepted-evidence-only LLM Synthesis
+  -> 同一背压流输出受控状态与 Provider 正文增量
   -> 同一事务保存会话消息 -> 脱敏 root / stage Trace
 ```
 
 受控对话主链的当前实现、限制和面试材料逐模块映射见
 [`INTERVIEW_NARRATIVE_IMPLEMENTATION_MATRIX.md`](docs/specs/controlled-conversation-mainline/INTERVIEW_NARRATIVE_IMPLEMENTATION_MATRIX.md)。
-当前 WebSocket 发送兼容的终态文本帧，不是 Provider 逐 token streaming；前端
-`skill_confirm/plan_preview/step_status/verification_summary`、网页新闻、Redis 共享熔断和
-完整在线 Langfuse 评测回流属于后续增强。
+当前 `chat-stream-v2` WebSocket 会把 Provider 正文增量与 `plan_preview`、`step_status`、
+`tool_status`、`verification_summary` 等白名单控制帧放入同一条带背压的有序流；前端按请求
+展示已校验计划、真实执行状态和证据限制，并允许主动停止当前请求。过程状态只在当前页面
+维护，刷新恢复、事件重放和重复提交保护仍属于后续增强；原始工具参数/结果、Trace attributes
+和模型思考不会进入公开帧。
 
 ### 报告模式主链路
 
@@ -727,6 +730,7 @@ Finance-agent-Skills/
 - 唯一受控对话主链：Typed State、实体、两阶段路由、三路 Rewrite、权限快照、
   Planner、Validator、有界 Executor、Evidence、Controller/Replanner 和 Synthesis
 - 当前理解和规划阶段使用确定性可复现基线；真实模型仅用于 accepted-evidence-only Synthesis
+- `chat-stream-v2` 同时输出 Provider 正文增量和已校验计划、步骤、工具、证据摘要；前端按请求做单调状态归并并支持主动停止
 - 本地结构化 Trace（每轮一个 root，并按实际分支记录有序阶段 Span；固定成功案例为
   12 个阶段 Span、JSONL）与可选脱敏 exporter
 - 默认零费用离线 CI、真实 Workflow Compose E2E，以及显式保护的 LLM + 只读 Tushare Live E2E
@@ -740,7 +744,7 @@ Finance-agent-Skills/
 - 架构图 / 时序图
 - 生产环境部署说明
 - 历史黄金集重建与面试指标复测
-- 前端受控过程事件和确认卡
+- 受控过程状态的刷新恢复、事件重放与重复提交保护
 - Redis 分布式韧性与完整 Langfuse 评测回流
 - 更完整的 FAQ
 

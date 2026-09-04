@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
+from typing import Literal, TypeAlias
 
 from src.conversation.contracts import (
     ControllerDecision,
@@ -117,6 +118,11 @@ class ChatStreamEventKind(StrEnum):
     """Application 流式输出的有限生命周期类型。"""
 
     STARTED = "STARTED"
+    TRACE_SUMMARY = "TRACE_SUMMARY"
+    PLAN_PREVIEW = "PLAN_PREVIEW"
+    STEP_STATUS = "STEP_STATUS"
+    TOOL_STATUS = "TOOL_STATUS"
+    VERIFICATION_SUMMARY = "VERIFICATION_SUMMARY"
     CONTENT_DELTA = "CONTENT_DELTA"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
@@ -128,6 +134,36 @@ class ChatStreamFailureCode(StrEnum):
     STREAM_FAILED = "CHAT_STREAM_FAILED"
 
 
+class ChatStepLifecycleStatus(StrEnum):
+    """客户端可消费的步骤有限生命周期。"""
+
+    PLANNED = "PLANNED"
+    RUNNING = "RUNNING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    SKIPPED = "SKIPPED"
+    REPLANNED = "REPLANNED"
+    CANCELLED = "CANCELLED"
+
+
+class ChatToolLifecycleStatus(StrEnum):
+    """客户端可消费的单次工具调用有限生命周期。"""
+
+    STARTED = "STARTED"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    SKIPPED = "SKIPPED"
+    CANCELLED = "CANCELLED"
+
+
+class ChatEvidenceSufficiency(StrEnum):
+    """Verifier 权威结果对应的公开证据充分性。"""
+
+    SUFFICIENT = "SUFFICIENT"
+    PARTIAL = "PARTIAL"
+    INSUFFICIENT = "INSUFFICIENT"
+
+
 @dataclass(frozen=True, slots=True)
 class ChatStreamStarted:
     """表示会话已在同一事务中完成准备，可以开始发送公开事件。"""
@@ -135,6 +171,104 @@ class ChatStreamStarted:
     session_id: str
     request_id: str
     kind: ChatStreamEventKind = field(default=ChatStreamEventKind.STARTED, init=False)
+
+
+@dataclass(frozen=True, slots=True)
+class ChatTraceSummary:
+    """表示不含内部 attributes 的阶段执行摘要。"""
+
+    session_id: str
+    request_id: str
+    stage: str
+    status: str
+    elapsed_ms: float
+    summary: str
+    error_code: str | None = None
+    kind: ChatStreamEventKind = field(default=ChatStreamEventKind.TRACE_SUMMARY, init=False)
+
+
+@dataclass(frozen=True, slots=True)
+class ChatPlanStepPreview:
+    """表示已校验计划中的一个用户安全步骤摘要。"""
+
+    step_id: str
+    title: str
+    purpose: str
+    required: bool
+    status: Literal[ChatStepLifecycleStatus.PLANNED]
+    depends_on: tuple[str, ...]
+    subject_summary: str
+
+
+@dataclass(frozen=True, slots=True)
+class ChatPlanPreview:
+    """表示 Validator 已接受的一个计划版本。"""
+
+    session_id: str
+    request_id: str
+    plan_id: str
+    revision: int
+    validated: Literal[True]
+    steps: tuple[ChatPlanStepPreview, ...]
+    replan_reason: str | None = None
+    replaced_step_ids: tuple[str, ...] = ()
+    kind: ChatStreamEventKind = field(default=ChatStreamEventKind.PLAN_PREVIEW, init=False)
+
+
+@dataclass(frozen=True, slots=True)
+class ChatStepStatus:
+    """表示一个稳定步骤 ID 的公开状态变化。"""
+
+    session_id: str
+    request_id: str
+    plan_id: str
+    revision: int
+    step_id: str
+    status: ChatStepLifecycleStatus
+    elapsed_ms: float | None = None
+    error_code: str | None = None
+    kind: ChatStreamEventKind = field(default=ChatStreamEventKind.STEP_STATUS, init=False)
+
+
+@dataclass(frozen=True, slots=True)
+class ChatToolStatus:
+    """表示一次工具尝试经过白名单裁剪后的公开状态。"""
+
+    session_id: str
+    request_id: str
+    plan_id: str
+    revision: int
+    tool_call_id: str
+    step_id: str
+    display_name: str
+    status: ChatToolLifecycleStatus
+    attempt: int
+    parameter_summary: tuple[str, ...]
+    elapsed_ms: float | None = None
+    result_summary: str | None = None
+    error_code: str | None = None
+    kind: ChatStreamEventKind = field(default=ChatStreamEventKind.TOOL_STATUS, init=False)
+
+
+@dataclass(frozen=True, slots=True)
+class ChatVerificationSummary:
+    """表示 Verifier 结论的用户安全摘要。"""
+
+    session_id: str
+    request_id: str
+    plan_id: str
+    revision: int
+    sufficiency: ChatEvidenceSufficiency
+    claim_level: Literal["ANALYTICAL", "DESCRIPTIVE", "REFUSE"]
+    accepted_count: int
+    rejected_count: int
+    covered_dimensions: tuple[str, ...]
+    missing_dimensions: tuple[str, ...]
+    limitation: str
+    kind: ChatStreamEventKind = field(
+        default=ChatStreamEventKind.VERIFICATION_SUMMARY,
+        init=False,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,7 +315,17 @@ class ChatStreamFailed:
     kind: ChatStreamEventKind = field(default=ChatStreamEventKind.FAILED, init=False)
 
 
-type ChatStreamEvent = ChatStreamStarted | ChatContentDelta | ChatStreamCompleted | ChatStreamFailed
+ChatStreamEvent: TypeAlias = (
+    ChatStreamStarted
+    | ChatTraceSummary
+    | ChatPlanPreview
+    | ChatStepStatus
+    | ChatToolStatus
+    | ChatVerificationSummary
+    | ChatContentDelta
+    | ChatStreamCompleted
+    | ChatStreamFailed
+)
 
 
 @dataclass(frozen=True, slots=True)
