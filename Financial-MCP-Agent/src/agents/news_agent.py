@@ -3,8 +3,6 @@ NewsAnalysis Agent: Performs news analysis with sentiment and risk assessment us
 新闻分析 Agent：使用ReAct Agent框架进行新闻分析，包含情感分析和风险评估
 """
 import os
-import json
-from typing import Dict, Any, List, Optional
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 import time
@@ -144,7 +142,8 @@ async def news_agent(state: AgentState) -> AgentState:
 
 请使用可用的工具获取实际新闻数据进行分析，确保情感分析和风险评估的准确性。如果某些新闻无法获取，请基于可用信息提供尽可能全面的分析。"""
 
-            logger.info(f"Agent input: {agent_input}")
+            # Prompt 与模型正文只进入受控执行产物，普通终端日志仅保留低敏元数据。
+            logger.debug("Agent input prepared, length=%d", len(agent_input))
 
             # 5. 调用ReAct Agent - 使用正确的messages格式
             logger.info(
@@ -170,7 +169,6 @@ async def news_agent(state: AgentState) -> AgentState:
 
             logger.info(
                 f"Final extracted analysis length: {len(final_output)} characters")
-            print(f"NEWSAGENT: {final_output}")
             # 7. 记录LLM交互，用于后续分析和优化
             model_config = {
                 "model": model_name,
@@ -216,17 +214,20 @@ async def news_agent(state: AgentState) -> AgentState:
                 "metadata": current_metadata
             }
 
-        except Exception as e:
+        except Exception as exc:
+            safe_error = "News analysis failed."
             logger.error(
-                f"{ERROR_ICON} NewsAgent: Error in MCP or agent execution: {e}", exc_info=True)
-            current_data[
-                "news_analysis_error"] = f"Error in MCP or agent execution: {e}"
-            current_data["news_analysis"] = f"新闻分析过程中出现错误: {str(e)}"
-            current_metadata["news_agent_error"] = str(e)
+                "%s NewsAgent: MCP or agent execution failed; error_type=%s",
+                ERROR_ICON,
+                type(exc).__name__,
+            )
+            current_data["news_analysis_error"] = safe_error
+            current_data["news_analysis"] = "新闻分析暂时不可用。"
+            current_metadata["news_agent_error_type"] = type(exc).__name__
 
             # 记录 Agent执行失败
             execution_logger.log_agent_complete(
-                agent_name, current_data, time.time() - agent_start_time, False, str(e))
+                agent_name, current_data, time.time() - agent_start_time, False, safe_error)
 
             return {
                 "data": current_data,
@@ -234,15 +235,19 @@ async def news_agent(state: AgentState) -> AgentState:
                 "metadata": current_metadata
             }
 
-    except Exception as e:
+    except Exception as exc:
+        safe_error = "News analysis failed."
         logger.error(
-            f"{ERROR_ICON} NewsAgent: Error during execution: {e}", exc_info=True)
-        current_data["news_analysis_error"] = f"Error during execution: {e}"
-        current_metadata["news_agent_error"] = str(e)
+            "%s NewsAgent: execution failed; error_type=%s",
+            ERROR_ICON,
+            type(exc).__name__,
+        )
+        current_data["news_analysis_error"] = safe_error
+        current_metadata["news_agent_error_type"] = type(exc).__name__
 
         # 记录 Agent执行失败
         execution_logger.log_agent_complete(
-            agent_name, current_data, time.time() - agent_start_time, False, str(e))
+            agent_name, current_data, time.time() - agent_start_time, False, safe_error)
 
         return {
             "data": current_data,

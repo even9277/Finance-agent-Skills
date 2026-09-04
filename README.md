@@ -644,7 +644,7 @@ python src/main.py --command "帮我看看贵州茅台值不值得长期持有"
 - 长期记忆：候选抽取 → 确定性治理评分 → 高影响画像用户确认 → PostgreSQL 权威记录 → pgvector/Mem0 派生语义索引 → 混合召回 + 权威后过滤。
 - 自然语言命令：在对话中直接说“查看我的记忆”“以后回答简短一点”“删除记忆 <id>”“忘掉我的文本记忆”“确认”“取消”；高影响删除先返回预览并要求一次性确认，支持 TTL、版本校验并拒绝重放/跨用户/跨会话使用。
 - 可观测性：`/api/health` 返回 `components.memory_observability` 指标；记忆阶段、状态、错误码均为低基数且脱敏；后台摘要/治理/索引 worker 的 `RETRY`/`DEAD_LETTER`/`DEGRADED` 状态可在 JSONL Trace 中复现。
-- 验收矩阵：默认测试全部离线；完整离线 Docker Compose E2E 通过 `docker compose -f docker/docker-compose.offline.yml up --build --abort-on-container-exit --exit-code-from offline-e2e` 运行；受保护真实 LLM + 只读 Tushare 验收通过 `RUN_PROTECTED_LIVE_E2E=true uv run --locked pytest tests/e2e/test_live_controlled_chat_chain.py -q -m live` 显式运行（需要真实凭证，默认不执行）。
+- 验收矩阵：默认测试全部离线；完整离线 Docker Compose E2E 通过 `docker compose -f docker/docker-compose.offline.yml up --build --abort-on-container-exit --exit-code-from offline-e2e` 运行。受保护真实 LLM + 只读 Tushare 对话验收使用 `RUN_PROTECTED_LIVE_E2E=true uv run --locked --with socksio python -m pytest tests/e2e/test_live_controlled_chat_chain.py -q -m live`；报告阶段/SSE 验收使用 `RUN_PROTECTED_LIVE_REPORT_E2E=true uv run --locked --with socksio python -m pytest tests/e2e/test_live_report_progress.py -q -m live`（均需真实凭证，默认不执行）。
 ## 日志与排查
 
 日志主要在：

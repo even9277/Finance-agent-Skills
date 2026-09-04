@@ -23,11 +23,14 @@
 
 Live E2E 使用独立测试账号、固定少量只读问题和预算上限。真实写只允许测试租户；生产写、下单、持仓修改、报告发布永远禁止。
 
-当前受控主链的本地 Live 入口只运行一个固定案例。Windows 本机使用 SOCKS 代理时，必须通过 Python 模块入口让 uv 的临时依赖生效：
+当前受控对话与报告主链的本地 Live 入口各只运行一个固定案例。报告案例使用隔离 SQLite、临时执行目录和只读 Tushare toolkit，断言真实阶段、单调进度、数据库/SSE 终态、正文 hash 与脱敏 artifact；不会发布报告或修改外部数据。Windows 本机使用 SOCKS 代理时，必须通过 Python 模块入口让 uv 的临时依赖生效：
 
 ```powershell
 $env:RUN_PROTECTED_LIVE_E2E="true"
 uv run --with socksio -- python -m pytest tests/e2e/test_live_controlled_chat_chain.py -q -m live
+
+$env:RUN_PROTECTED_LIVE_REPORT_E2E="true"
+uv run --locked --with socksio python -m pytest tests/e2e/test_live_report_progress.py -q -m live
 ```
 
 GitHub 端只允许手工触发 `.github/workflows/live-e2e.yml`，并由 `protected-live-e2e` Environment 提供 secrets。显式触发但配置缺失时测试必须失败，不能以 skip 伪装通过。

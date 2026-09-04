@@ -8,6 +8,8 @@ import axios from 'axios'
 export const ACCESS_TOKEN_KEY = 'finance_access_token'
 export const AUTH_USER_KEY = 'finance_auth_user'
 
+export * from './reportProgress'
+
 // ─────────────────────────────────────────────────────────────
 // Axios 实例
 // ─────────────────────────────────────────────────────────────
@@ -49,6 +51,7 @@ export interface ReportStatusResponse {
   progress: number
   report_id?: string
   error_msg?: string
+  error_code?: string
 }
 
 export interface ReportDetail {
@@ -261,8 +264,8 @@ export const reportApi = {
   generate: (command: string, userId: string) =>
     http.post<ReportTaskResponse>('/report/generate', { command, user_id: userId }),
 
-  getStatus: (taskId: string) =>
-    http.get<ReportStatusResponse>(`/report/status/${taskId}`),
+  getStatus: (taskId: string, signal?: AbortSignal) =>
+    http.get<ReportStatusResponse>(`/report/status/${taskId}`, { signal }),
 
   getReport: (reportId: string) =>
     http.get<ReportDetail>(`/report/${reportId}`),

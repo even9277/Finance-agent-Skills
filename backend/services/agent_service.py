@@ -10,15 +10,25 @@ Agent 服务层
 - 工作流编译一次后复用（_COMPILED_WORKFLOW），线程安全（StateGraph.compile() 返回不可变图）。
 """
 
-import os
 import re
 import sys
-import uuid
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy.ext.asyncio import AsyncSession
+from backend.application.report_progress.contracts import (
+    ReportProgressNotification,
+    ReportProgressPublisher,
+    ReportTaskStatus,
+    ReportTerminalNotification,
+)
+from backend.application.report_progress.hub import report_progress_hub
+from backend.application.report_progress.snapshot import (
+    REPORT_GENERATION_FAILED_CODE,
+    REPORT_GENERATION_FAILED_MESSAGE,
+)
+from backend.application.report_progress.tracker import ReportProgressTracker
 
 # ─────────────────────────────────────────────────────────────
 # sys.path 注入：让 Financial-MCP-Agent/src.* 可导入
@@ -58,11 +68,11 @@ logger = setup_logger("agent_service", log_dir=str(_AGENT_ROOT / "logs"))
 _COMPILED_WORKFLOW = None
 
 
-def _extract_final_state_from_event(event: dict[str, Any]) -> dict[str, Any] | None:
+def _extract_final_state_from_event(event: Mapping[str, Any]) -> dict[str, Any] | None:
     """从 LangGraph 根图结束事件中提取最终状态。
 
     Args:
-        event: ``astream_events`` 返回的单条事件。不同 LangGraph 版本可能把
+        event: ``astream_events(version="v2")`` 返回的单条事件。LangGraph 可能把
             根图命名为 ``LangGraph``、``langgraph`` 或 ``__end__``。
 
     Returns:
@@ -131,7 +141,6 @@ def _get_workflow():
             wf.add_edge("maybe_summarize_state", "memory_write_node")
             wf.add_edge("memory_write_node", END)
             logger.info("Financial analysis workflow compiled [STM + LTM].")
-            print("[Workflow] 已启用 STM + LTM 模式")
 
         elif enable_stm:
             # ── 模式 2：仅 STM ──
@@ -145,7 +154,6 @@ def _get_workflow():
             wf.add_edge("summarizer", "maybe_summarize_state")
             wf.add_edge("maybe_summarize_state", END)
             logger.info("Financial analysis workflow compiled [STM only].")
-            print("[Workflow] 已启用仅 STM 模式")
 
         elif enable_memory:
             # ── 模式 3：仅 LTM ──
@@ -159,7 +167,6 @@ def _get_workflow():
             wf.add_edge("summarizer", "memory_write_node")
             wf.add_edge("memory_write_node", END)
             logger.info("Financial analysis workflow compiled [LTM only].")
-            print("[Workflow] 已启用仅 LTM 模式")
 
         else:
             # ── 模式 1：原始模式 ──
@@ -175,10 +182,10 @@ def _get_workflow():
 
 
 # ─────────────────────────────────────────────────────────────
-# P1 修复：引入 stock_resolver 三层解析（正则 → BaoStock → LLM）
+# P1 修复：统一复用 stock_resolver 股票解析入口
 # ─────────────────────────────────────────────────────────────
 # 注意：保留旧的 extract_stock_info() 作为向后兼容的同步接口（仅走 L1 正则）
-# 新增 resolve_stock 异步接口（完整三层解析）
+# 新增 resolve_stock 异步接口；具体解析策略由 stock_resolver 统一维护
 from backend.services.stock_resolver import resolve_stock  # noqa: E402
 
 
@@ -187,7 +194,7 @@ def extract_stock_info(query: str) -> tuple[str | None, str | None]:
     【已废弃】仅保留用于向后兼容。
     从自然语言查询中提取公司名称和股票代码（仅正则，不做 BaoStock 反查/LLM 兜底）。
     
-    新代码请使用 resolve_stock(query) 异步接口，提供更强大的三层解析。
+    新代码请使用 resolve_stock(query) 异步接口，避免复制解析策略。
     """
     company_name = None
     stock_code = None
@@ -239,10 +246,10 @@ async def _build_initial_state(user_query: str, user_id: str = "") -> AgentState
     """
     构造 LangGraph 初始状态，与 main.py 的状态结构保持一致。
     
-    P1 修复：改为 async，使用 resolve_stock() 三层解析（正则 → BaoStock → LLM）。
+    P1 修复：改为 async，使用统一的 resolve_stock() 解析入口。
     P2 修复：接受 user_id 参数并写入 memory_user_id，确保 LTM 节点能正确读取用户画像。
     """
-    # P1: 使用三层解析替代纯正则
+    # P1: 复用统一解析服务，具体策略由 stock_resolver 所有。
     company_name, stock_code = await resolve_stock(user_query)
     now = datetime.now()
 
@@ -278,10 +285,20 @@ async def run_report_task(
     report_id: str,
     command: str,
     user_id: str,
+    publisher: ReportProgressPublisher | None = None,
 ) -> None:
-    """
-    后台任务：运行完整多 Agent 分析工作流，结果写入数据库。
-    由 report router 的 BackgroundTasks 调用，不直接返回给 HTTP 请求。
+    """运行完整多 Agent 报告工作流并提交权威状态与低延迟通知。
+
+    Args:
+        task_id: 数据库报告任务标识。
+        report_id: 最终报告标识。
+        command: 用户报告指令，只传给既有 Agent 工作流。
+        user_id: 报告所属用户，用于既有记忆读取。
+        publisher: 可替换的非阻塞进度发布端口；默认使用当前进程 Hub。
+
+    Notes:
+        数据库始终是恢复权威。阶段通知在对应 progress 提交后发送，任务终态
+        在 ``completed``/``failed`` 提交后发送；发布器故障不得改变报告结果。
     """
     from sqlalchemy import select
 
@@ -298,36 +315,80 @@ async def run_report_task(
         f"log_dir={exec_logger.execution_dir}"
     )
 
-    async def _update_report(**kwargs):
+    active_publisher = publisher or report_progress_hub
+    personalization_completion_node = (
+        "prepare_summary_context" if settings.enable_stm else "memory_read_node"
+    )
+    tracker = ReportProgressTracker(
+        task_id=task_id,
+        report_id=report_id,
+        personalization_completion_nodes={personalization_completion_node},
+    )
+    persisted_progress = 0
+
+    def _publish(message: ReportProgressNotification | ReportTerminalNotification) -> None:
+        """以 best-effort 方式发布通知，不让观察层决定报告成败。"""
+        try:
+            active_publisher.publish(message)
+        except Exception as exc:
+            logger.warning(
+                "report_progress_publish_failed stage=%s task_id=%s report_id=%s "
+                "status=%s error_code=%s error_type=%s",
+                "report_progress",
+                task_id,
+                report_id,
+                "DEGRADED",
+                "REPORT_PROGRESS_PUBLISH_FAILED",
+                type(exc).__name__,
+            )
+
+    async def _update_report(**kwargs: object) -> None:
+        """短事务更新报告，并在数据库边界强制 progress 单调。"""
         async with AsyncSessionFactory() as db:
             result = await db.execute(select(Report).where(Report.task_id == task_id))
             rpt = result.scalar_one_or_none()
             if rpt:
                 for k, v in kwargs.items():
+                    if k == "progress":
+                        if not isinstance(v, int):
+                            raise TypeError("progress 更新值必须为 int")
+                        v = max(int(rpt.progress or 0), v)
                     setattr(rpt, k, v)
                 await db.commit()
 
+    async def _record_stage(notification: ReportProgressNotification) -> None:
+        """先持久化单调百分比，再发布真实阶段状态。"""
+        nonlocal persisted_progress
+        if notification.progress > persisted_progress:
+            await _update_report(progress=notification.progress)
+            persisted_progress = notification.progress
+        _publish(notification)
+
     try:
         await _update_report(status="running", progress=10)
+        persisted_progress = 10
+        _publish(tracker.begin_preparing())
 
         # P1+P2: _build_initial_state 改为 async，传入 user_id
         initial_state = await _build_initial_state(command, user_id=user_id)
         company_name = initial_state["data"].get("company_name")
         stock_code = initial_state["data"].get("stock_code")
 
-        # P1: 解析结果日志（便于调试）
+        # 只记录解析状态和任务标识，避免把用户指令或公司名写入日志。
         if not stock_code:
             logger.warning(
-                f"[task:{task_id}] ⚠️ 未能解析股票代码！原始指令: '{command}', "
-                f"识别到名称: '{company_name}'. 各 Agent 将使用原始 query 调用 MCP 工具。"
-            )
-            print(
-                f"[Report] ⚠️ 股票代码未解析到，各 Agent 将尝试用名称 '{company_name}' "
-                f"直接调用 MCP 工具（可能需要 Agent 自行查询代码）"
+                "report_stock_unresolved stage=%s task_id=%s status=%s error_code=%s",
+                "report.prepare",
+                task_id,
+                "DEGRADED",
+                "REPORT_STOCK_CODE_UNRESOLVED",
             )
         else:
             logger.info(
-                f"[task:{task_id}] ✅ 股票信息解析成功: {company_name} ({stock_code})"
+                "report_stock_resolved stage=%s task_id=%s status=%s",
+                "report.prepare",
+                task_id,
+                "SUCCEEDED",
             )
 
         await _update_report(
@@ -335,33 +396,34 @@ async def run_report_task(
             company_name=company_name,
             progress=20,
         )
+        persisted_progress = 20
+        _publish(tracker.complete_preparing())
 
         # ── 执行多 Agent 工作流（使用事件流做进度更新） ─────
         app = _get_workflow()
-        node_progress = {
-            "fundamental_analyst": 35,
-            "technical_analyst": 50,
-            "value_analyst": 65,
-            "news_analyst": 80,
-            "memory_read_node": 85,
-            "summarizer": 95,
-            "memory_write_node": 98,
-        }
-        finished_nodes: set[str] = set()
+        personalization_skipped = False
 
         final_state = None
         if hasattr(app, "astream_events"):
-            async for event in app.astream_events(initial_state, version="v1"):
-                # 兼容不同事件结构：优先取 name，其次取 metadata.langgraph_node
-                event_name = event.get("name")
+            # v2 根结束事件返回完整 state；v1 在当前 LangGraph 中只返回按节点分块，
+            # 会被误判为缺少 final_report，且该协议已进入弃用路径。
+            async for event in app.astream_events(initial_state, version="v2"):
                 md = event.get("metadata") or {}
-                node = event_name or md.get("langgraph_node") or md.get("node")
+                node = md.get("langgraph_node") or md.get("node") or event.get("name")
 
-                # 以“链/节点结束”为信号更新进度（避免频繁写 DB）
-                if event.get("event") in {"on_chain_end", "on_chain_complete"} and node in node_progress:
-                    if node not in finished_nodes:
-                        finished_nodes.add(node)
-                        await _update_report(progress=node_progress[node])
+                # 无 STM/LTM 时，在真实 summarizer 启动前显式关闭可选阶段。
+                if (
+                    node == "summarizer"
+                    and not settings.enable_stm
+                    and not settings.enable_memory
+                    and not personalization_skipped
+                ):
+                    await _record_stage(tracker.skip_optional_personalization())
+                    personalization_skipped = True
+
+                notification = tracker.observe_langgraph_event(event)
+                if notification is not None:
+                    await _record_stage(notification)
 
                 # 最终结果：on_chain_end 时 output 里会带最终 state（不同版本字段名略有差异）
                 root_state = _extract_final_state_from_event(event)
@@ -395,11 +457,46 @@ async def run_report_task(
             status="completed",
             progress=100,
             content=report_content,
+            error_msg=None,
+        )
+        persisted_progress = 100
+        _publish(
+            ReportTerminalNotification(
+                task_id=task_id,
+                report_id=report_id,
+                status=ReportTaskStatus.COMPLETED,
+                progress=100,
+            )
         )
         logger.info(f"[task:{task_id}] 报告生成成功，长度={len(report_content)}")
 
     except Exception as exc:
-        error_msg = str(exc)
-        logger.error(f"[task:{task_id}] 报告生成失败: {error_msg}", exc_info=True)
-        finalize_execution_logger(success=False, error=error_msg)
-        await _update_report(status="failed", progress=0, error_msg=error_msg)
+        for failed_stage in tracker.fail_active_stages():
+            _publish(failed_stage)
+        logger.error(
+            "report_generation_failed stage=%s task_id=%s report_id=%s status=%s "
+            "error_code=%s error_type=%s",
+            "report.generate",
+            task_id,
+            report_id,
+            "FAILED",
+            REPORT_GENERATION_FAILED_CODE,
+            type(exc).__name__,
+        )
+        finalize_execution_logger(success=False, error=REPORT_GENERATION_FAILED_MESSAGE)
+        failed_progress = max(persisted_progress, tracker.current_progress)
+        await _update_report(
+            status="failed",
+            progress=failed_progress,
+            error_msg=REPORT_GENERATION_FAILED_MESSAGE,
+        )
+        _publish(
+            ReportTerminalNotification(
+                task_id=task_id,
+                report_id=report_id,
+                status=ReportTaskStatus.FAILED,
+                progress=failed_progress,
+                error_code=REPORT_GENERATION_FAILED_CODE,
+                message=REPORT_GENERATION_FAILED_MESSAGE,
+            )
+        )
