@@ -1,12 +1,91 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
-import type { ChatContextWindow, ChatMessage, ChatSession, SkillConfirmation } from '@/api'
+import type {
+  ChatContextWindow,
+  ChatControlledFrame,
+  ChatMessage,
+  ChatPlanStepPreview,
+  ChatStepLifecycleStatus,
+  ChatTerminalStatus,
+  ChatToolLifecycleStatus,
+  ChatSession,
+  SkillConfirmation,
+} from '@/api'
 
 export interface PendingSkillConfirmation {
   originalMessage: string
   sessionId: string
   confirmation: SkillConfirmation
 }
+
+export interface ControlledPlanRevision {
+  plan_id: string
+  revision: number
+  validated: true
+  replan_reason?: string
+  replaced_step_ids?: string[]
+}
+
+export interface ControlledExecutionStep extends Omit<ChatPlanStepPreview, 'status'> {
+  plan_id: string
+  revision: number
+  status: ChatStepLifecycleStatus
+  elapsed_ms?: number
+  error_code?: string
+}
+
+export interface ControlledExecutionTool {
+  plan_id: string
+  revision: number
+  tool_call_id: string
+  step_id: string
+  display_name: string
+  status: ChatToolLifecycleStatus
+  attempt: number
+  elapsed_ms?: number
+  parameter_summary: string[]
+  result_summary?: string
+  error_code?: string
+}
+
+export interface ControlledVerification {
+  plan_id: string
+  revision: number
+  sufficiency: 'SUFFICIENT' | 'PARTIAL' | 'INSUFFICIENT'
+  claim_level: 'ANALYTICAL' | 'DESCRIPTIVE' | 'REFUSE'
+  accepted_count: number
+  rejected_count: number
+  covered_dimensions: string[]
+  missing_dimensions: string[]
+  limitation: string
+}
+
+export interface ControlledTraceSummary {
+  stage: string
+  status: 'STARTED' | 'SUCCEEDED' | 'FAILED' | 'SKIPPED' | 'PARTIAL'
+  elapsed_ms: number
+  summary: string
+  error_code?: string
+}
+
+export interface ControlledExecutionState {
+  requestId: string
+  sessionId: string
+  status: 'RUNNING' | 'UNAVAILABLE' | ChatTerminalStatus
+  activeRevision: number
+  traces: ControlledTraceSummary[]
+  planHistory: ControlledPlanRevision[]
+  steps: ControlledExecutionStep[]
+  tools: ControlledExecutionTool[]
+  verification: ControlledVerification | null
+}
+
+const STEP_TERMINAL_STATUSES = new Set<ChatStepLifecycleStatus>([
+  'SUCCEEDED', 'FAILED', 'SKIPPED', 'REPLANNED', 'CANCELLED',
+])
+const TOOL_TERMINAL_STATUSES = new Set<ChatToolLifecycleStatus>([
+  'SUCCEEDED', 'FAILED', 'SKIPPED', 'CANCELLED',
+])
 
 export const useChatStore = defineStore('chat', () => {
   const sessions = ref<ChatSession[]>([])
@@ -15,6 +94,7 @@ export const useChatStore = defineStore('chat', () => {
   const isLoading = ref(false)
   const isSending = ref(false)
   const pendingSkillConfirmation = ref<PendingSkillConfirmation | null>(null)
+  const controlledExecution = ref<ControlledExecutionState | null>(null)
 
   // Phase 2 新增：流式输出状态
   const isStreaming = ref(false)
@@ -37,6 +117,9 @@ export const useChatStore = defineStore('chat', () => {
     ) {
       pendingSkillConfirmation.value = null
     }
+    if (controlledExecution.value?.sessionId !== sessionId) {
+      controlledExecution.value = null
+    }
     currentSessionId.value = sessionId
     if (!sessionId) {
       messages.value = []
@@ -52,6 +135,7 @@ export const useChatStore = defineStore('chat', () => {
   function setMessages(list: ChatMessage[]) {
     messages.value = list
     pendingSkillConfirmation.value = null
+    controlledExecution.value = null
   }
 
   function appendMessage(msg: ChatMessage) {
@@ -124,6 +208,156 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
+  function abortStreamingMessage() {
+    const targetId = streamingMessageId.value
+    if (targetId !== null) {
+      messages.value = messages.value.filter((item) => item.id !== targetId)
+    }
+    finishStreamingMessage()
+  }
+
+  function beginControlledExecution(input: { requestId: string; sessionId: string }) {
+    controlledExecution.value = {
+      requestId: input.requestId,
+      sessionId: input.sessionId,
+      status: 'RUNNING',
+      activeRevision: 0,
+      traces: [],
+      planHistory: [],
+      steps: [],
+      tools: [],
+      verification: null,
+    }
+  }
+
+  function bindControlledExecutionSession(requestId: string, sessionId: string) {
+    if (controlledExecution.value?.requestId === requestId) {
+      controlledExecution.value.sessionId = sessionId
+    }
+  }
+
+  function applyControlledFrame(frame: ChatControlledFrame) {
+    const execution = controlledExecution.value
+    if (!execution
+      || execution.requestId !== frame.request_id
+      || execution.sessionId !== frame.session_id
+      || execution.status !== 'RUNNING') return
+
+    if (frame.type === 'trace_summary') {
+      execution.traces.push({
+        stage: frame.stage,
+        status: frame.status,
+        elapsed_ms: frame.elapsed_ms,
+        summary: frame.summary,
+        error_code: frame.error_code,
+      })
+      return
+    }
+
+    if (frame.type === 'plan_preview') {
+      if (!frame.validated || frame.revision < execution.activeRevision) return
+      if (!execution.planHistory.some((item) => item.revision === frame.revision)) {
+        execution.planHistory.push({
+          plan_id: frame.plan_id,
+          revision: frame.revision,
+          validated: true,
+          replan_reason: frame.replan_reason,
+          replaced_step_ids: frame.replaced_step_ids,
+        })
+        execution.planHistory.sort((left, right) => left.revision - right.revision)
+      }
+      execution.activeRevision = Math.max(execution.activeRevision, frame.revision)
+      for (const step of frame.steps) {
+        if (execution.steps.some((item) => item.step_id === step.step_id)) continue
+        execution.steps.push({
+          ...step,
+          plan_id: frame.plan_id,
+          revision: frame.revision,
+        })
+      }
+      return
+    }
+
+    if (frame.type === 'step_status') {
+      const step = execution.steps.find((item) => item.step_id === frame.step_id)
+      if (!step || frame.revision < step.revision) return
+      if (STEP_TERMINAL_STATUSES.has(step.status) && frame.status !== step.status) return
+      if (step.status === 'RUNNING' && frame.status === 'PLANNED') return
+      step.status = frame.status
+      step.elapsed_ms = frame.elapsed_ms
+      step.error_code = frame.error_code
+      return
+    }
+
+    if (frame.type === 'tool_status') {
+      const current = execution.tools.find((item) => item.tool_call_id === frame.tool_call_id)
+      if (current) {
+        if (TOOL_TERMINAL_STATUSES.has(current.status) && frame.status !== current.status) return
+        current.status = frame.status
+        current.elapsed_ms = frame.elapsed_ms
+        current.result_summary = frame.result_summary
+        current.error_code = frame.error_code
+      } else {
+        execution.tools.push({
+          plan_id: frame.plan_id,
+          revision: frame.revision,
+          tool_call_id: frame.tool_call_id,
+          step_id: frame.step_id,
+          display_name: frame.display_name,
+          status: frame.status,
+          attempt: frame.attempt,
+          elapsed_ms: frame.elapsed_ms,
+          parameter_summary: [...frame.parameter_summary],
+          result_summary: frame.result_summary,
+          error_code: frame.error_code,
+        })
+      }
+      return
+    }
+
+    if (frame.type === 'verification_summary'
+      && (!execution.verification || frame.revision >= execution.verification.revision)) {
+      execution.verification = {
+        plan_id: frame.plan_id,
+        revision: frame.revision,
+        sufficiency: frame.sufficiency,
+        claim_level: frame.claim_level,
+        accepted_count: frame.accepted_count,
+        rejected_count: frame.rejected_count,
+        covered_dimensions: [...frame.covered_dimensions],
+        missing_dimensions: [...frame.missing_dimensions],
+        limitation: frame.limitation,
+      }
+    }
+  }
+
+  function finishControlledExecution(status: ChatTerminalStatus) {
+    if (controlledExecution.value?.status === 'RUNNING') {
+      controlledExecution.value.status = status
+    }
+  }
+
+  function cancelControlledExecution() {
+    const execution = controlledExecution.value
+    if (!execution || execution.status !== 'RUNNING') return
+    execution.status = 'CANCELLED'
+    for (const step of execution.steps) {
+      if (step.status === 'RUNNING') step.status = 'CANCELLED'
+      else if (step.status === 'PLANNED') step.status = 'SKIPPED'
+    }
+    for (const tool of execution.tools) {
+      if (tool.status === 'STARTED') tool.status = 'CANCELLED'
+    }
+  }
+
+  function markControlledExecutionUnavailable() {
+    if (controlledExecution.value?.status === 'RUNNING') {
+      controlledExecution.value.status = 'UNAVAILABLE'
+      controlledExecution.value.steps = []
+      controlledExecution.value.tools = []
+    }
+  }
+
   function setSkillConfirmation(value: PendingSkillConfirmation) {
     pendingSkillConfirmation.value = value
   }
@@ -139,6 +373,7 @@ export const useChatStore = defineStore('chat', () => {
       messages.value = []
       currentRunningSummary.value = null
       currentContextWindow.value = null
+      controlledExecution.value = null
     }
   }
 
@@ -179,6 +414,7 @@ export const useChatStore = defineStore('chat', () => {
     compressEtaSeconds.value = null
     lastCompressPercent.value = null
     pendingSkillConfirmation.value = null
+    controlledExecution.value = null
   }
 
   return {
@@ -188,6 +424,7 @@ export const useChatStore = defineStore('chat', () => {
     isLoading,
     isSending,
     pendingSkillConfirmation,
+    controlledExecution,
     isStreaming,
     currentRunningSummary,
     currentContextWindow,
@@ -204,6 +441,13 @@ export const useChatStore = defineStore('chat', () => {
     startStreamingMessage,
     setStreamingSessionId,
     finishStreamingMessage,
+    abortStreamingMessage,
+    beginControlledExecution,
+    bindControlledExecutionSession,
+    applyControlledFrame,
+    finishControlledExecution,
+    cancelControlledExecution,
+    markControlledExecutionUnavailable,
     setSkillConfirmation,
     clearSkillConfirmation,
     startCompress,

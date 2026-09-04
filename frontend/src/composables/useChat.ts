@@ -21,6 +21,7 @@ export function useChat() {
   let compressTimer: number | null = null
   let contextRefreshTimer: number | null = null
   let activeStreamSocket: WebSocket | null = null
+  let activeStreamStop: (() => void) | null = null
 
   const closeActiveStream = () => {
     const socket = activeStreamSocket
@@ -188,11 +189,13 @@ export function useChat() {
     const currentSid = chatStore.currentSessionId || `temp_${Date.now()}`
     chatStore.startStreamingMessage(currentSid)
     const requestId = createStreamRequestId()
+    chatStore.beginControlledExecution({ requestId, sessionId: currentSid })
 
-    return new Promise<void>((resolve) => {
+    return new Promise<void>((resolve, reject) => {
       let ws: WebSocket | null = null
       let settled = false
       let started = false
+      let userCancelled = false
       let streamSessionId: string | null = null
       let expectedSequence = 1
       let receivedChunkCount = 0
@@ -210,6 +213,7 @@ export function useChat() {
         settled = true
         window.removeEventListener('beforeunload', closeOnPageExit)
         if (activeStreamSocket === ws) activeStreamSocket = null
+        activeStreamStop = null
         if (errorMessage) chatStore.appendStreamDelta(`\n\n[${errorMessage}]`)
         clearCompressTimer()
         chatStore.finishStreamingMessage()
@@ -222,8 +226,22 @@ export function useChat() {
         resolve()
       }
 
+      const rejectBeforeStart = () => {
+        if (settled) return
+        settled = true
+        window.removeEventListener('beforeunload', closeOnPageExit)
+        if (activeStreamSocket === ws) activeStreamSocket = null
+        activeStreamStop = null
+        clearCompressTimer()
+        chatStore.abortStreamingMessage()
+        chatStore.isSending = false
+        chatStore.markControlledExecutionUnavailable()
+        reject(new Error('WebSocket unavailable'))
+      }
+
       const failProtocol = () => {
         console.error('[WS] chat-stream-v2 协议错误')
+        chatStore.finishControlledExecution('FAILED')
         finish('协议错误，请重试')
         try {
           ws?.close(1002, 'chat-stream-v2 protocol error')
@@ -238,8 +256,19 @@ export function useChat() {
         window.addEventListener('beforeunload', closeOnPageExit, { once: true })
       } catch (err) {
         console.error('[WS] 连接失败:', err)
-        finish('连接失败，请重试')
+        rejectBeforeStart()
         return
+      }
+
+      activeStreamStop = () => {
+        if (settled) return
+        userCancelled = true
+        chatStore.cancelControlledExecution()
+        try {
+          ws?.close(1000, 'user cancelled')
+        } finally {
+          finish()
+        }
       }
 
       ws.onopen = () => {
@@ -276,6 +305,7 @@ export function useChat() {
             return
           }
           console.error('[WS] 服务端错误:', frame.code)
+          chatStore.finishControlledExecution('FAILED')
           finish(`错误：${frame.message}`)
           return
         }
@@ -288,6 +318,7 @@ export function useChat() {
           }
           started = true
           streamSessionId = frame.session_id
+          chatStore.bindControlledExecutionSession(requestId, frame.session_id)
           if (!chatStore.currentSessionId) chatStore.setCurrentSession(frame.session_id)
           chatStore.setStreamingSessionId(frame.session_id)
           return
@@ -298,7 +329,13 @@ export function useChat() {
           return
         }
 
-        if (frame.type === 'content_delta') {
+        if (frame.type === 'trace_summary'
+          || frame.type === 'plan_preview'
+          || frame.type === 'step_status'
+          || frame.type === 'tool_status'
+          || frame.type === 'verification_summary') {
+          chatStore.applyControlledFrame(frame)
+        } else if (frame.type === 'content_delta') {
           if (frame.chunk_index !== receivedChunkCount + 1) {
             failProtocol()
             return
@@ -352,6 +389,7 @@ export function useChat() {
             failProtocol()
             return
           }
+          chatStore.finishControlledExecution(frame.status)
           finish()
         }
       }
@@ -359,11 +397,24 @@ export function useChat() {
       ws.onerror = (event) => {
         if (settled) return
         console.error('[WS] 连接错误:', event)
+        if (!started) {
+          rejectBeforeStart()
+          return
+        }
+        chatStore.finishControlledExecution('FAILED')
         finish('连接错误，请重试')
       }
 
       ws.onclose = () => {
-        if (!settled) finish('连接已中断，请重试')
+        if (settled) return
+        if (userCancelled) {
+          finish()
+        } else if (!started) {
+          rejectBeforeStart()
+        } else {
+          chatStore.finishControlledExecution('FAILED')
+          finish('连接已中断，请重试')
+        }
       }
     })
   }
@@ -385,6 +436,10 @@ export function useChat() {
 
   function cancelSkillConfirmation() {
     chatStore.clearSkillConfirmation()
+  }
+
+  function stopStreaming() {
+    activeStreamStop?.()
   }
 
   async function deleteSession(sessionId: string) {
@@ -409,6 +464,7 @@ export function useChat() {
     loadMessages,
     sendMessage,
     sendMessageStream,
+    stopStreaming,
     confirmSkill,
     cancelSkillConfirmation,
     newSession,

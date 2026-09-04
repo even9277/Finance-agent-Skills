@@ -208,4 +208,164 @@ describe('useChat chat-stream-v2 consumption', () => {
     expect(store.isStreaming).toBe(false)
     expect(store.isSending).toBe(false)
   })
+
+  it('dispatches D04 control frames and closes the execution on stream_end', async () => {
+    const userStore = useUserStore()
+    userStore.userId = 'user-v2'
+    const store = useChatStore()
+    const { sendMessageStream } = useChat()
+
+    const completion = sendMessageStream('验证受控执行事件')
+    const websocket = FakeWebSocket.instances[0]
+    websocket.emitOpen()
+    const requestId = String(JSON.parse(websocket.sent[0]).request_id)
+
+    websocket.emitMessage(envelope('stream_start', 1, {}, requestId))
+    websocket.emitMessage(envelope('plan_preview', 2, {
+      plan_id: 'plan-d04',
+      revision: 1,
+      validated: true,
+      steps: [{
+        step_id: 'market-step',
+        title: '获取行情数据',
+        purpose: '补充行情证据',
+        required: true,
+        status: 'PLANNED',
+        depends_on: [],
+        subject_summary: '贵州茅台（600519.SH）',
+      }],
+    }, requestId))
+    websocket.emitMessage(envelope('step_status', 3, {
+      plan_id: 'plan-d04',
+      revision: 1,
+      step_id: 'market-step',
+      status: 'RUNNING',
+    }, requestId))
+    websocket.emitMessage(envelope('tool_status', 4, {
+      plan_id: 'plan-d04',
+      revision: 1,
+      tool_call_id: 'call-d04',
+      step_id: 'market-step',
+      display_name: '行情数据工具',
+      status: 'SUCCEEDED',
+      attempt: 1,
+      elapsed_ms: 12.5,
+      parameter_summary: ['标的：600519.SH'],
+      result_summary: '已返回 1 条可校验证据',
+    }, requestId))
+    websocket.emitMessage(envelope('step_status', 5, {
+      plan_id: 'plan-d04',
+      revision: 1,
+      step_id: 'market-step',
+      status: 'SUCCEEDED',
+      elapsed_ms: 13,
+    }, requestId))
+    websocket.emitMessage(envelope('verification_summary', 6, {
+      plan_id: 'plan-d04',
+      revision: 1,
+      sufficiency: 'SUFFICIENT',
+      claim_level: 'ANALYTICAL',
+      accepted_count: 1,
+      rejected_count: 0,
+      covered_dimensions: ['market_snapshot'],
+      missing_dimensions: [],
+      limitation: '证据满足当前分析要求。',
+    }, requestId))
+    websocket.emitMessage(envelope('content_delta', 7, {
+      chunk_index: 1,
+      content: '最终回答',
+    }, requestId))
+    websocket.emitMessage(envelope('stream_end', 8, {
+      status: 'SUCCEEDED',
+      chunk_count: 1,
+      content_sha256: 'a'.repeat(64),
+    }, requestId))
+    await completion
+
+    expect(store.controlledExecution?.requestId).toBe(requestId)
+    expect(store.controlledExecution?.status).toBe('SUCCEEDED')
+    expect(store.controlledExecution?.steps[0].status).toBe('SUCCEEDED')
+    expect(store.controlledExecution?.tools[0].status).toBe('SUCCEEDED')
+    expect(store.controlledExecution?.verification?.sufficiency).toBe('SUFFICIENT')
+    expect(store.messages.at(-1)?.content).toBe('最终回答')
+  })
+
+  it('stops the active request as a user cancellation without error text', async () => {
+    const userStore = useUserStore()
+    userStore.userId = 'user-v2'
+    const store = useChatStore()
+    const { sendMessageStream, stopStreaming } = useChat()
+
+    const completion = sendMessageStream('验证用户主动停止')
+    const websocket = FakeWebSocket.instances[0]
+    websocket.emitOpen()
+    const requestId = String(JSON.parse(websocket.sent[0]).request_id)
+    websocket.emitMessage(envelope('stream_start', 1, {}, requestId))
+    websocket.emitMessage(envelope('plan_preview', 2, {
+      plan_id: 'plan-d04',
+      revision: 1,
+      validated: true,
+      steps: [{
+        step_id: 'market-step',
+        title: '获取行情数据',
+        purpose: '补充行情证据',
+        required: true,
+        status: 'PLANNED',
+        depends_on: [],
+        subject_summary: '贵州茅台（600519.SH）',
+      }],
+    }, requestId))
+    websocket.emitMessage(envelope('step_status', 3, {
+      plan_id: 'plan-d04',
+      revision: 1,
+      step_id: 'market-step',
+      status: 'RUNNING',
+    }, requestId))
+    websocket.emitMessage(envelope('tool_status', 4, {
+      plan_id: 'plan-d04',
+      revision: 1,
+      tool_call_id: 'call-d04',
+      step_id: 'market-step',
+      display_name: '行情数据工具',
+      status: 'STARTED',
+      attempt: 1,
+      parameter_summary: ['标的：600519.SH'],
+    }, requestId))
+
+    stopStreaming()
+    await completion
+
+    expect(websocket.closed).toBe(true)
+    expect(store.controlledExecution?.status).toBe('CANCELLED')
+    expect(store.controlledExecution?.steps[0].status).toBe('CANCELLED')
+    expect(store.controlledExecution?.tools[0].status).toBe('CANCELLED')
+    expect(store.messages.at(-1)?.content).not.toContain('连接已中断')
+    expect(store.messages.at(-1)?.content).not.toContain('错误')
+    expect(store.isStreaming).toBe(false)
+    expect(store.isSending).toBe(false)
+  })
+
+  it('marks control progress unavailable and rejects before-start socket failure for HTTP fallback', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    const userStore = useUserStore()
+    userStore.userId = 'user-v2'
+    const store = useChatStore()
+    class ThrowingWebSocket {
+      static CLOSING = 2
+
+      constructor() {
+        throw new Error('offline websocket unavailable')
+      }
+    }
+    vi.stubGlobal('WebSocket', ThrowingWebSocket)
+    const { sendMessageStream } = useChat()
+
+    await expect(sendMessageStream('验证同步降级')).rejects.toThrow('WebSocket unavailable')
+
+    expect(store.controlledExecution?.status).toBe('UNAVAILABLE')
+    expect(store.controlledExecution?.steps).toEqual([])
+    expect(store.controlledExecution?.tools).toEqual([])
+    expect(store.isStreaming).toBe(false)
+    expect(store.isSending).toBe(false)
+  })
 })

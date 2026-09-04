@@ -1,5 +1,7 @@
 """离线 Compose 验收专用 FastAPI 应用装配。"""
 
+import os
+
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.application.chat.use_case import ControlledChatUseCase
@@ -22,13 +24,22 @@ from src.skills.skill_registry import SkillRegistry
 __all__ = ["app"]
 
 
+def _model_chunk_delay_seconds() -> float:
+    """读取浏览器停止语义验收专用的确定性模型延迟。"""
+    raw_value = os.getenv("OFFLINE_E2E_MODEL_CHUNK_DELAY_SECONDS", "0")
+    try:
+        return max(0.0, float(raw_value))
+    except ValueError as exc:
+        raise RuntimeError("OFFLINE_E2E_MODEL_CHUNK_DELAY_SECONDS 必须为非负数") from exc
+
+
 def build_offline_chat_use_case(db: AsyncSession) -> ControlledChatUseCase:
     """只替换外部 Model/Tool/Trace Ports，保留真实工作流与数据库 Repository。"""
     registry = SkillRegistry()
     runtime = registry.runtime_snapshot()
     return ControlledChatUseCase(
         workflow=ControlledConversationWorkflow(
-            model=FakeModelProvider(),
+            model=FakeModelProvider(chunk_delay_seconds=_model_chunk_delay_seconds()),
             tool=FakeToolProvider(),
             trace=SkillTraceSink(),
             skill_catalog=registry.conversation_snapshot(runtime),

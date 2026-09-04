@@ -20,10 +20,15 @@ from backend.application.chat.contracts import (
     ChatCommand,
     ChatContentDelta,
     ChatContextWindowData,
+    ChatPlanPreview,
+    ChatStepStatus,
     ChatStreamCompleted,
     ChatStreamEvent,
     ChatStreamFailed,
     ChatStreamStarted,
+    ChatToolStatus,
+    ChatTraceSummary,
+    ChatVerificationSummary,
 )
 from backend.application.chat.factory import build_chat_session_use_case, build_chat_use_case
 from backend.db.database import AsyncSessionFactory, get_db
@@ -44,6 +49,8 @@ from backend.schemas.chat import (
     ChatMessageResponse,
     ChatMemoryCommandFrame,
     MemoryCommandResultResponse,
+    ChatPlanPreviewFrame,
+    ChatPlanStepPreviewFrame,
     ChatSkillConfirmationFrame,
     SkillConfirmationCandidateResponse,
     SkillConfirmationResponse,
@@ -51,6 +58,10 @@ from backend.schemas.chat import (
     ChatStreamEnvelope,
     ChatStreamErrorFrame,
     ChatStreamStartFrame,
+    ChatStepStatusFrame,
+    ChatToolStatusFrame,
+    ChatTraceSummaryFrame,
+    ChatVerificationSummaryFrame,
     ChatSessionListItem,
     ChatSessionMessages,
     ChatSessionRenameRequest,
@@ -181,6 +192,109 @@ async def _present_chat_stream(
                         request_id=event.request_id,
                         session_id=event.session_id,
                         sequence=state.next_sequence(),
+                    ),
+                )
+                continue
+
+            if isinstance(event, ChatTraceSummary):
+                await _send_public_frame(
+                    websocket,
+                    ChatTraceSummaryFrame(
+                        request_id=event.request_id,
+                        session_id=event.session_id,
+                        sequence=state.next_sequence(),
+                        stage=event.stage,
+                        status=event.status,
+                        elapsed_ms=event.elapsed_ms,
+                        summary=event.summary,
+                        error_code=event.error_code,
+                    ),
+                )
+                continue
+
+            if isinstance(event, ChatPlanPreview):
+                await _send_public_frame(
+                    websocket,
+                    ChatPlanPreviewFrame(
+                        request_id=event.request_id,
+                        session_id=event.session_id,
+                        sequence=state.next_sequence(),
+                        plan_id=event.plan_id,
+                        revision=event.revision,
+                        validated=event.validated,
+                        steps=[
+                            ChatPlanStepPreviewFrame(
+                                step_id=step.step_id,
+                                title=step.title,
+                                purpose=step.purpose,
+                                required=step.required,
+                                status=step.status.value,
+                                depends_on=list(step.depends_on),
+                                subject_summary=step.subject_summary,
+                            )
+                            for step in event.steps
+                        ],
+                        replan_reason=event.replan_reason,
+                        replaced_step_ids=list(event.replaced_step_ids),
+                    ),
+                )
+                continue
+
+            if isinstance(event, ChatStepStatus):
+                await _send_public_frame(
+                    websocket,
+                    ChatStepStatusFrame(
+                        request_id=event.request_id,
+                        session_id=event.session_id,
+                        sequence=state.next_sequence(),
+                        plan_id=event.plan_id,
+                        revision=event.revision,
+                        step_id=event.step_id,
+                        status=event.status.value,
+                        elapsed_ms=event.elapsed_ms,
+                        error_code=event.error_code,
+                    ),
+                )
+                continue
+
+            if isinstance(event, ChatToolStatus):
+                await _send_public_frame(
+                    websocket,
+                    ChatToolStatusFrame(
+                        request_id=event.request_id,
+                        session_id=event.session_id,
+                        sequence=state.next_sequence(),
+                        plan_id=event.plan_id,
+                        revision=event.revision,
+                        tool_call_id=event.tool_call_id,
+                        step_id=event.step_id,
+                        display_name=event.display_name,
+                        status=event.status.value,
+                        attempt=event.attempt,
+                        elapsed_ms=event.elapsed_ms,
+                        parameter_summary=list(event.parameter_summary),
+                        result_summary=event.result_summary,
+                        error_code=event.error_code,
+                    ),
+                )
+                continue
+
+            if isinstance(event, ChatVerificationSummary):
+                await _send_public_frame(
+                    websocket,
+                    ChatVerificationSummaryFrame(
+                        request_id=event.request_id,
+                        session_id=event.session_id,
+                        sequence=state.next_sequence(),
+                        plan_id=event.plan_id,
+                        revision=event.revision,
+                        sufficiency=event.sufficiency.value,
+                        claim_level=event.claim_level,
+                        accepted_count=event.accepted_count,
+                        rejected_count=event.rejected_count,
+                        covered_dimensions=list(event.covered_dimensions),
+                        missing_dimensions=list(event.missing_dimensions),
+                        limitation=event.limitation,
                     ),
                 )
                 continue

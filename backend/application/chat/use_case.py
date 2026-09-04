@@ -12,6 +12,7 @@ from contextlib import suppress
 from dataclasses import dataclass, replace
 
 from src.conversation.contracts import ConversationRequest, MemoryContextItem
+from src.conversation.progress import ConversationProgressEvent
 from src.conversation.workflow import ControlledConversationWorkflow
 
 from backend.application.memory.retrieval import MemoryRetrievalRequest, MemoryRetrievalUseCase
@@ -35,6 +36,7 @@ from .contracts import (
     ChatStreamStarted,
 )
 from .ports import TransactionalConversationRepository
+from .progress import project_progress_event
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +108,20 @@ class _ChatStreamObserver:
             )
         )
 
+    async def on_progress(self, event: ConversationProgressEvent) -> None:
+        """白名单投影领域进度，并复用正文事件的同一确认队列。
+
+        Args:
+            event: Workflow 或 Executor 在权威状态转换点产生的领域事件。
+        """
+        await self.emit(
+            project_progress_event(
+                event,
+                request_id=self.request_id,
+                session_id=self.session_id,
+            )
+        )
+
     def validate_reply(self, reply: str) -> None:
         """在持久化前确认公开增量与权威终态正文完全一致。"""
         if self.reply != reply:
@@ -162,7 +178,7 @@ class ControlledChatUseCase:
             command: 由 WebSocket 边界构造的聊天命令；缺少 request_id 时在此补全。
 
         Yields:
-            Started、零到多个 ContentDelta，以及唯一 Completed 或 Failed 终态。
+            Started、零到多个受控进度/ContentDelta，以及唯一 Completed 或 Failed 终态。
 
         Raises:
             asyncio.CancelledError: 消费端中止时取消运行任务，并由执行核心回滚未提交事务。
@@ -383,6 +399,7 @@ class ControlledChatUseCase:
                 workflow_kwargs["memory_context"] = memory_context
             if stream_observer is not None:
                 workflow_kwargs["on_content_delta"] = stream_observer.on_content_delta
+                workflow_kwargs["progress_observer"] = stream_observer
             result = await self._workflow.run(request, **workflow_kwargs)
             if stream_observer is not None:
                 if stream_observer.chunk_count == 0 and result.reply:

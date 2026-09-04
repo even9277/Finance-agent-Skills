@@ -98,6 +98,74 @@ def _read_trace_records(path: Path) -> list[dict[str, Any]]:
     ]
 
 
+def _assert_d04_control_frames(frames: list[dict[str, Any]]) -> dict[str, int]:
+    """校验真实 Provider 主链在正文前公开权威且脱敏的 D04 控制状态。"""
+    frame_types = [str(frame["type"]) for frame in frames]
+    plan_index = frame_types.index("plan_preview")
+    verification_index = frame_types.index("verification_summary")
+    first_delta_index = frame_types.index("content_delta")
+    first_step_running = next(
+        index
+        for index, frame in enumerate(frames)
+        if frame["type"] == "step_status" and frame["status"] == "RUNNING"
+    )
+    first_tool_started = next(
+        index
+        for index, frame in enumerate(frames)
+        if frame["type"] == "tool_status" and frame["status"] == "STARTED"
+    )
+
+    assert plan_index < first_step_running <= first_tool_started
+    assert first_tool_started < verification_index < first_delta_index
+    assert frames[plan_index]["validated"] is True
+    assert frames[plan_index]["steps"]
+    verification = frames[verification_index]
+    assert verification["sufficiency"] in {"SUFFICIENT", "PARTIAL", "INSUFFICIENT"}
+    expected_terminal = (
+        "SUCCEEDED" if verification["sufficiency"] == "SUFFICIENT" else "PARTIAL"
+    )
+    assert frames[-1]["status"] == expected_terminal
+    if verification["sufficiency"] != "SUFFICIENT":
+        assert verification["missing_dimensions"]
+        assert verification["limitation"]
+    assert any(frame_type == "trace_summary" for frame_type in frame_types)
+    assert any(
+        frame["type"] == "step_status" and frame["status"] == "SUCCEEDED"
+        for frame in frames
+    )
+    assert any(
+        frame["type"] == "tool_status" and frame["status"] == "SUCCEEDED"
+        for frame in frames
+    )
+
+    public_controls = [
+        frame
+        for frame in frames
+        if frame["type"]
+        in {
+            "trace_summary",
+            "plan_preview",
+            "step_status",
+            "tool_status",
+            "verification_summary",
+        }
+    ]
+    serialized_controls = json.dumps(public_controls, ensure_ascii=False).lower()
+    for forbidden in ("idempotency_key", "permission_hash", "facts", "arguments"):
+        assert forbidden not in serialized_controls
+
+    return {
+        frame_type: frame_types.count(frame_type)
+        for frame_type in (
+            "trace_summary",
+            "plan_preview",
+            "step_status",
+            "tool_status",
+            "verification_summary",
+        )
+    }
+
+
 def _receive_terminal_frames(
     client: TestClient,
     case: _LiveCase,
@@ -235,6 +303,7 @@ def test_live_websocket_streams_real_model_and_controlled_evidence(
     assert len(model_chunk_times) >= 2
     assert model_chunk_times[0] < model_chunk_times[-1]
     assert received_at[0] < received_at[-1]
+    control_frame_counts = _assert_d04_control_frames(frames)
 
     reply = "".join(str(item["content"]) for item in deltas)
     terminal = frames[-1]
@@ -262,6 +331,7 @@ def test_live_websocket_streams_real_model_and_controlled_evidence(
         "tool_mode": "real-tushare" if case.use_real_tushare else "deterministic-fixture",
         "chunk_count": len(deltas),
         "tool_observation_count": len(observations),
+        "control_frame_counts": control_frame_counts,
         "ttft_ms": round(ttft_ms, 2),
         "elapsed_ms": round(elapsed_ms, 2),
         "status": terminal["status"],
