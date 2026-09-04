@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol
+from typing import Protocol, TypeAlias
 
 from .contracts import (
     ErrorCode,
@@ -104,7 +104,7 @@ class VerificationSummaryProgress:
     verification: VerificationResult
 
 
-type ConversationProgressEvent = (
+ConversationProgressEvent: TypeAlias = (
     TraceSummaryProgress
     | PlanPreviewProgress
     | StepStatusProgress

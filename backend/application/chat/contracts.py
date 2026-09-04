@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
-from typing import Literal
+from typing import Literal, TypeAlias
 
 from src.conversation.contracts import (
     ControllerDecision,
@@ -315,7 +315,7 @@ class ChatStreamFailed:
     kind: ChatStreamEventKind = field(default=ChatStreamEventKind.FAILED, init=False)
 
 
-type ChatStreamEvent = (
+ChatStreamEvent: TypeAlias = (
     ChatStreamStarted
     | ChatTraceSummary
     | ChatPlanPreview
