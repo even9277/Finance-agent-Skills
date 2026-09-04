@@ -3,8 +3,6 @@ ValueAnalysis Agent: Performs valuation analysis of a stock using ReAct Agent fr
 估值分析 Agent：使用ReAct Agent框架对股票进行估值分析
 """
 import os
-import json
-from typing import Dict, Any, List, Optional
 from langchain_openai import ChatOpenAI  # 恢复OpenAI接口调用
 from langchain_core.messages import HumanMessage
 import time
@@ -146,7 +144,8 @@ async def value_agent(state: AgentState) -> AgentState:
 
 请使用可用的工具获取实际数据进行分析，而不是基于假设。如果某些数据无法获取，请尝试使用不同的工具或参数组合，基于可用信息提供尽可能全面的分析。请保持回答简洁，避免冗长的描述性文字"""
 
-            logger.info(f"Agent input: {agent_input}")
+            # Prompt 与模型正文只进入受控执行产物，普通终端日志仅保留低敏元数据。
+            logger.debug("Agent input prepared, length=%d", len(agent_input))
 
             # 5. 调用ReAct Agent - 使用正确的messages格式
             logger.info(f"{WAIT_ICON} ValueAgent: Calling ReAct agent...")
@@ -171,7 +170,6 @@ async def value_agent(state: AgentState) -> AgentState:
 
             logger.info(
                 f"Final extracted analysis length: {len(final_output)} characters")
-            print(f"VALUEAGENT: {final_output}")
             # 7. 记录LLM交互，用于后续分析和优化
             model_config = {
                 "model": model_name,
@@ -217,16 +215,20 @@ async def value_agent(state: AgentState) -> AgentState:
                 "metadata": current_metadata
             }
 
-        except Exception as e:
+        except Exception as exc:
+            safe_error = "Value analysis failed."
             logger.error(
-                f"{ERROR_ICON} ValueAgent: Error in MCP or agent execution: {e}", exc_info=True)
-            current_data["value_analysis_error"] = f"Error in MCP or agent execution: {e}"
-            current_data["value_analysis"] = f"估值分析过程中出现错误: {str(e)}"
-            current_metadata["value_agent_error"] = str(e)
+                "%s ValueAgent: MCP or agent execution failed; error_type=%s",
+                ERROR_ICON,
+                type(exc).__name__,
+            )
+            current_data["value_analysis_error"] = safe_error
+            current_data["value_analysis"] = "估值分析暂时不可用。"
+            current_metadata["value_agent_error_type"] = type(exc).__name__
 
             # 记录 Agent执行失败
             execution_logger.log_agent_complete(
-                agent_name, current_data, time.time() - agent_start_time, False, str(e))
+                agent_name, current_data, time.time() - agent_start_time, False, safe_error)
 
             return {
                 "data": current_data,
@@ -234,15 +236,19 @@ async def value_agent(state: AgentState) -> AgentState:
                 "metadata": current_metadata
             }
 
-    except Exception as e:
+    except Exception as exc:
+        safe_error = "Value analysis failed."
         logger.error(
-            f"{ERROR_ICON} ValueAgent: Error during execution: {e}", exc_info=True)
-        current_data["value_analysis_error"] = f"Error during execution: {e}"
-        current_metadata["value_agent_error"] = str(e)
+            "%s ValueAgent: execution failed; error_type=%s",
+            ERROR_ICON,
+            type(exc).__name__,
+        )
+        current_data["value_analysis_error"] = safe_error
+        current_metadata["value_agent_error_type"] = type(exc).__name__
 
         # 记录 Agent执行失败
         execution_logger.log_agent_complete(
-            agent_name, current_data, time.time() - agent_start_time, False, str(e))
+            agent_name, current_data, time.time() - agent_start_time, False, safe_error)
 
         return {
             "data": current_data,

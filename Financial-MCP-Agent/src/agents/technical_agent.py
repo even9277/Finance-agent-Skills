@@ -3,8 +3,6 @@ TechnicalAnalysis Agent: Performs technical analysis of a stock using ReAct Agen
 技术分析 Agent：使用ReAct Agent框架对股票进行技术分析
 """
 import os
-import json
-from typing import Dict, Any, List, Optional
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 import time
@@ -134,7 +132,8 @@ async def technical_agent(state: AgentState) -> AgentState:
 
 请使用可用的工具获取实际数据进行分析，而不是基于假设。"""
 
-            logger.info(f"Agent input: {agent_input}")
+            # Prompt 与模型正文只进入受控执行产物，普通终端日志仅保留低敏元数据。
+            logger.debug("Agent input prepared, length=%d", len(agent_input))
 
             # 5. 调用ReAct Agent - 使用正确的messages格式
             logger.info(f"{WAIT_ICON} TechnicalAgent: Calling ReAct agent...")
@@ -157,7 +156,6 @@ async def technical_agent(state: AgentState) -> AgentState:
             final_output = extract_final_text(response)
 
             logger.info(f"Final extracted analysis length: {len(final_output)} characters")
-            print(f"TECHNICALAGENT: {final_output}")
             # 7. 记录LLM交互，用于后续分析和优化
             model_config = {
                 "model": model_name,
@@ -202,19 +200,41 @@ async def technical_agent(state: AgentState) -> AgentState:
                 "metadata": current_metadata
             }
 
-        except Exception as e:
-            logger.error(f"{ERROR_ICON} TechnicalAgent: Error in MCP or agent execution: {e}", exc_info=True)
-            current_data["technical_analysis_error"] = f"Error in MCP or agent execution: {e}"
-            current_data["technical_analysis"] = f"技术分析过程中出现错误: {str(e)}"
-            current_metadata["technical_agent_error"] = str(e)
-            execution_logger.log_agent_complete(agent_name, current_data, time.time() - agent_start_time, False, str(e))
+        except Exception as exc:
+            safe_error = "Technical analysis failed."
+            logger.error(
+                "%s TechnicalAgent: MCP or agent execution failed; error_type=%s",
+                ERROR_ICON,
+                type(exc).__name__,
+            )
+            current_data["technical_analysis_error"] = safe_error
+            current_data["technical_analysis"] = "技术分析暂时不可用。"
+            current_metadata["technical_agent_error_type"] = type(exc).__name__
+            execution_logger.log_agent_complete(
+                agent_name,
+                current_data,
+                time.time() - agent_start_time,
+                False,
+                safe_error,
+            )
             return {"data": current_data, "messages": current_messages, "metadata": current_metadata}
 
-    except Exception as e:
-        logger.error(f"{ERROR_ICON} TechnicalAgent: Error during execution: {e}", exc_info=True)
-        current_data["technical_analysis_error"] = f"Error during execution: {e}"
-        current_metadata["technical_agent_error"] = str(e)
-        execution_logger.log_agent_complete(agent_name, current_data, time.time() - agent_start_time, False, str(e))
+    except Exception as exc:
+        safe_error = "Technical analysis failed."
+        logger.error(
+            "%s TechnicalAgent: execution failed; error_type=%s",
+            ERROR_ICON,
+            type(exc).__name__,
+        )
+        current_data["technical_analysis_error"] = safe_error
+        current_metadata["technical_agent_error_type"] = type(exc).__name__
+        execution_logger.log_agent_complete(
+            agent_name,
+            current_data,
+            time.time() - agent_start_time,
+            False,
+            safe_error,
+        )
         return {"data": current_data, "messages": current_messages, "metadata": current_metadata}
 
 

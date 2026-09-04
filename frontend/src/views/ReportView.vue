@@ -12,7 +12,7 @@ import { useReport } from '@/composables/useReport'
 
 const route = useRoute()
 const {
-  status, progress, report, errorMsg, isGenerating,
+  status, progress, stages, transportStatus, report, errorMsg, isGenerating,
   history, previewOpen,
   generateReport, loadHistory, loadReport,
   downloadMarkdown, openPreview, closePreview, deleteReport,
@@ -105,10 +105,24 @@ async function handleSelectHistory(id: string) {
       <div class="flex-1 overflow-y-auto">
         <!-- 生成中：进度条 -->
         <div v-if="isGenerating" class="px-6 pt-6 pb-2">
-          <ReportProgress :progress="progress" :status="status" />
+          <ReportProgress
+            :progress="progress"
+            :status="status"
+            :transport-status="transportStatus"
+            :stages="stages"
+          />
           <div class="mt-4 text-center text-xs text-slate-500 animate-pulse">
             正在调用多智能体分析工作流，通常需要 2-5 分钟...
           </div>
+        </div>
+
+        <!-- transport 观察失败不等于报告任务失败，用户仍可稍后从历史记录查看。 -->
+        <div
+          v-else-if="transportStatus === 'OBSERVATION_FAILED'"
+          class="m-6 p-4 bg-amber-950/40 border border-amber-800 rounded-xl"
+        >
+          <p class="text-sm text-amber-300 font-medium mb-1">暂时无法继续跟踪进度</p>
+          <p class="text-xs text-amber-400/80">{{ errorMsg }}</p>
         </div>
 
         <!-- 失败状态 -->
