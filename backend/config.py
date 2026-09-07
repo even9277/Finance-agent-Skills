@@ -45,6 +45,8 @@ class Settings(BaseSettings):
     enable_stm: bool = False  # Phase 2 激活
     enable_memory: bool = False  # Phase 3 激活
     enable_redis_cache: bool = False  # 可丢弃的记忆热缓存；PostgreSQL 始终权威
+    enable_report_task_governance: bool = True  # 报告创建由数据库唯一约束收敛
+    enable_report_task_redis: bool = False  # 报告快照派生镜像；关闭时仍可由数据库恢复
     enable_chat_skills: bool = False  # Phase 1 skill-first chat
     enable_tushare_skills: bool = False  # Phase 1 tushare skill bundle
     enable_tushare_planner: bool = False
@@ -100,6 +102,11 @@ class Settings(BaseSettings):
     redis_connect_timeout_sec: float = 0.25
     redis_socket_timeout_sec: float = 0.50
     redis_max_connections: int = 20
+    # 同命令旧客户端与显式请求键的默认幂等窗口，单位为秒。
+    report_idempotency_ttl_sec: int = 600
+    report_task_redis_namespace: str = "finance-agent-report"
+    report_task_snapshot_ttl_sec: int = 900
+    report_task_reconcile_sec: float = 15.0
 
     # ── Mem0 / pgvector 配置（Phase 3）────────────────────
     # PostgreSQL 连接（Mem0 向量库使用，SQLite 环境下这些配置被忽略）
@@ -260,6 +267,8 @@ class Settings(BaseSettings):
         "redis_cache_lease_sec",
         "redis_singleflight_wait_ms",
         "redis_max_connections",
+        "report_idempotency_ttl_sec",
+        "report_task_snapshot_ttl_sec",
         "embed_dims",
         "memory_semantic_timeout_sec",
         "memory_semantic_top_k",
@@ -318,7 +327,11 @@ class Settings(BaseSettings):
                 normalized.append(domain)
         return normalized
 
-    @field_validator("redis_connect_timeout_sec", "redis_socket_timeout_sec")
+    @field_validator(
+        "redis_connect_timeout_sec",
+        "redis_socket_timeout_sec",
+        "report_task_reconcile_sec",
+    )
     @classmethod
     def _validate_positive_redis_timeout(cls, value: float) -> float:
         """拒绝让缓存连接无限等待或立即无效的超时配置。"""
@@ -335,13 +348,13 @@ class Settings(BaseSettings):
             raise ValueError("redis_url must use redis:// or rediss://")
         return normalized
 
-    @field_validator("redis_cache_namespace")
+    @field_validator("redis_cache_namespace", "report_task_redis_namespace")
     @classmethod
     def _validate_redis_namespace(cls, value: str) -> str:
         """限制键空间前缀为可读且无空白的稳定标识。"""
         normalized = value.strip()
         if not normalized or any(character.isspace() for character in normalized):
-            raise ValueError("redis_cache_namespace must not be blank or contain spaces")
+            raise ValueError("Redis namespace must not be blank or contain spaces")
         return normalized
 
     @model_validator(mode="after")

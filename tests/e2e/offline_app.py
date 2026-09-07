@@ -3,8 +3,11 @@
 import asyncio
 import os
 from itertools import pairwise
+from pathlib import Path
+from collections.abc import Awaitable, Callable
 from typing import Any, TypedDict
 
+from fastapi import Request, Response
 from langgraph.graph import END, StateGraph
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -27,6 +30,20 @@ from src.conversation.workflow import ControlledConversationWorkflow
 from src.skills.skill_registry import SkillRegistry
 
 __all__ = ["app"]
+
+
+@app.middleware("http")
+async def annotate_offline_backend_instance(
+    request: Request,
+    call_next: Callable[[Request], Awaitable[Response]],
+) -> Response:
+    """给隔离 E2E 响应标记实际服务实例，不暴露到生产应用装配。"""
+    response = await call_next(request)
+    response.headers["X-Offline-Backend-Instance"] = os.getenv(
+        "OFFLINE_BACKEND_INSTANCE",
+        "unknown",
+    )
+    return response
 
 
 class OfflineReportState(TypedDict):
@@ -124,6 +141,14 @@ def build_offline_report_workflow() -> Any:
         支持 ``astream_events``/``ainvoke`` 的已编译 LangGraph；节点事件由
         LangGraph 真实产生，外部模型、行情和新闻 Provider 均不会被调用。
     """
+    invocation_path = os.getenv("OFFLINE_REPORT_INVOCATION_PATH", "")
+    if invocation_path:
+        # 只写低敏调用计数行；E2E 以运行前后增量证明唯一工作流执行。
+        path = Path(invocation_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as artifact:
+            artifact.write("invoked\n")
+
     workflow = StateGraph(OfflineReportState)
     analyst_nodes = (
         "fundamental_analyst",

@@ -311,6 +311,7 @@ class StmCompactionTask(Base):
 # 下列表由 Alembic 管理；应用启动的 legacy create_all 不直接创建它们。
 ALEMBIC_MANAGED_TABLE_NAMES = frozenset(
     {
+        "report_task_governance",
         "memory_working_states",
         "memory_state_events",
         "memory_summary_metadata",
@@ -324,6 +325,53 @@ ALEMBIC_MANAGED_TABLE_NAMES = frozenset(
         "memory_pending_commands",
     }
 )
+
+
+class ReportTaskGovernanceRow(Base):
+    """锚定报告幂等映射与最新阶段快照的 PostgreSQL 权威记录。
+
+    每个 ``(user_id, key_digest)`` 只保留一个稳定治理行；终态过期后通过
+    ``generation`` 原子换代并改指向新的 Report，避免删除再插入产生并发空窗。
+    原始命令和显式幂等键不得写入此表。
+    """
+
+    __tablename__ = "report_task_governance"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    key_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    task_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    report_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("reports.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    generation: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    snapshot_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    stage_states: Mapped[list[dict[str, str]]] = mapped_column(JSON, nullable=False, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=_now,
+        onupdate=_now,
+        nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "key_digest",
+            name="uq_report_task_governance_user_key",
+        ),
+    )
 
 
 class MemoryWorkingStateRow(Base):

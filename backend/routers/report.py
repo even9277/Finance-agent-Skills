@@ -5,11 +5,13 @@ import logging
 import time
 import uuid
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Optional
 from urllib.parse import quote
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query
 from fastapi.sse import EventSourceResponse, ServerSentEvent
 from fastapi.responses import Response
 from sqlalchemy import select
@@ -18,6 +20,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.application.report_progress.contracts import (
     REPORT_PROGRESS_PROTOCOL_VERSION,
     ReportProgressNotification,
+    ReportProgressMessage,
+    ReportStageSnapshot,
     ReportTaskStatus,
     ReportTerminalNotification,
 )
@@ -26,10 +30,22 @@ from backend.application.report_progress.snapshot import (
     ReportProgressSnapshot,
     project_report_snapshot,
 )
+from backend.application.report_tasks.contracts import (
+    ReportIdempotencyConflictError,
+    ReportIdempotencyValidationError,
+    ReportTaskSnapshotRecord,
+)
+from backend.application.report_tasks.service import ReportTaskCreationService
 from backend.config import settings
 from backend.db.database import AsyncSessionFactory, get_db
 from backend.db.models import Report, User
 from backend.middleware.auth import AuthContext, ensure_user_access, require_auth
+from backend.infrastructure.report_tasks.redis_store import ReportTaskVersionNotification
+from backend.infrastructure.report_tasks.repository import (
+    SqlAlchemyReportTaskClaimRepository,
+    SqlAlchemyReportTaskSnapshotRepository,
+)
+from backend.infrastructure.report_tasks.runtime import get_report_task_runtime
 from backend.schemas.report import (
     ReportDeleteResponse,
     ReportDetail,
@@ -46,9 +62,6 @@ from backend.services.agent_service import run_report_task
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
-
-_REPORT_RECONCILE_SECONDS = 15.0
-
 
 def _build_content_disposition(filename: str) -> str:
     """构造兼容中文文件名且可安全写入 HTTP 响应头的下载声明。
@@ -92,18 +105,75 @@ async def _ensure_user(db: AsyncSession, user_id: str) -> User:
 async def generate_report(
     body: ReportGenerateRequest,
     background_tasks: BackgroundTasks,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     db: AsyncSession = Depends(get_db),
     auth: AuthContext = Depends(require_auth),
 ):
-    """
-    异步触发完整多 Agent 工作流：
-    1. 先插入 reports 行（status=pending）
-    2. 启动后台任务
-    3. 立即返回 task_id（前端轮询 /status/{task_id}）
+    """原子创建或复用报告任务，并仅由数据库获胜请求注册后台执行。
+
+    Args:
+        body: 已校验的报告命令与请求用户。
+        background_tasks: FastAPI 当前响应完成后执行的进程内任务容器。
+        idempotency_key: 可选显式请求键；缺省时使用规范化命令哈希。
+        db: 当前请求的异步数据库会话。
+        auth: 已验证的请求身份。
+
+    Returns:
+        保持旧字段兼容并附带幂等结果、期限的任务响应。
+
+    Raises:
+        HTTPException: 用户越权、显式键非法或同键绑定不同请求时抛出。
     """
     effective_user_id = ensure_user_access(body.user_id, auth)
     await _ensure_user(db, effective_user_id)
 
+    if settings.enable_report_task_governance:
+        service = ReportTaskCreationService(
+            SqlAlchemyReportTaskClaimRepository(db),
+            digest_secret=settings.jwt_secret_key,
+            ttl_seconds=settings.report_idempotency_ttl_sec,
+        )
+        try:
+            result = await service.create_or_reuse(
+                user_id=effective_user_id,
+                command=body.command,
+                client_key=idempotency_key,
+            )
+        except ReportIdempotencyValidationError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"error_code": exc.error_code, "message": str(exc)},
+            ) from None
+        except ReportIdempotencyConflictError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"error_code": exc.error_code, "message": str(exc)},
+            ) from None
+
+        if result.should_dispatch:
+            background_tasks.add_task(
+                run_report_task,
+                task_id=result.task_id,
+                report_id=result.report_id,
+                command=body.command,
+                user_id=effective_user_id,
+            )
+        logger.info(
+            "report_task_claim stage=CREATE status=%s task_id=%s report_id=%s generation=%d",
+            result.idempotency_status.value,
+            result.task_id,
+            result.report_id,
+            result.generation,
+        )
+        return ReportTaskResponse(
+            task_id=result.task_id,
+            report_id=result.report_id,
+            status=result.status.value,
+            idempotency_status=result.idempotency_status,
+            expires_at=result.expires_at,
+        )
+
+    # 紧急回滚开关保留既有单请求创建语义；默认路径始终使用数据库治理。
     task_id = str(uuid.uuid4())
     report_id = str(uuid.uuid4())
 
@@ -182,6 +252,9 @@ async def _load_sse_snapshot(
     report = result.scalar_one_or_none()
     if report is None or (settings.auth_enabled and report.user_id != auth.user_id):
         raise HTTPException(status_code=404, detail="任务不存在")
+    record = await SqlAlchemyReportTaskSnapshotRepository(db).load_latest(task_id)
+    if record is not None:
+        return _project_persisted_snapshot(record)
     return project_report_snapshot(
         task_id=report.task_id,
         report_id=report.id,
@@ -213,8 +286,15 @@ async def _require_sse_snapshot(
 
 
 async def _reload_sse_snapshot(task_id: str) -> ReportProgressSnapshot | None:
-    """使用独立短会话重新读取长连接期间的数据库权威状态。"""
+    """使用独立短会话读取治理快照，并 best-effort 重建 Redis 镜像。"""
     async with AsyncSessionFactory() as db:
+        record = await SqlAlchemyReportTaskSnapshotRepository(db).load_latest(task_id)
+        if record is not None:
+            runtime = get_report_task_runtime()
+            if runtime is not None:
+                runtime.mark_reconcile()
+                await runtime.store_record(record)
+            return _project_persisted_snapshot(record)
         result = await db.execute(select(Report).where(Report.task_id == task_id))
         report = result.scalar_one_or_none()
         if report is None:
@@ -228,12 +308,32 @@ async def _reload_sse_snapshot(task_id: str) -> ReportProgressSnapshot | None:
         )
 
 
+def _project_persisted_snapshot(record: ReportTaskSnapshotRecord) -> ReportProgressSnapshot:
+    """把治理层 Pydantic 快照转换为 SSE 使用的内部只读投影。"""
+    snapshot = record.snapshot
+    return ReportProgressSnapshot(
+        task_id=snapshot.task_id,
+        report_id=snapshot.report_id,
+        user_id=record.user_id,
+        status=snapshot.status,
+        progress=snapshot.progress,
+        error_code=snapshot.error_code,
+        message=snapshot.message,
+        snapshot_version=snapshot.snapshot_version,
+        stages=tuple(
+            ReportStageSnapshot(stage=item.stage, stage_status=item.status)
+            for item in snapshot.stages
+        ),
+    )
+
+
 def _ready_frame(
     snapshot: ReportProgressSnapshot,
     *,
     sequence: int,
 ) -> ReportStreamReadyFrame:
-    """把数据库快照和当前进程阶段状态投影为首帧。"""
+    """把持久化阶段快照投影为首帧，历史任务才回退进程内状态。"""
+    stages = snapshot.stages or report_progress_hub.stage_snapshots(snapshot.task_id)
     return ReportStreamReadyFrame(
         protocol_version=REPORT_PROGRESS_PROTOCOL_VERSION,
         task_id=snapshot.task_id,
@@ -244,9 +344,60 @@ def _ready_frame(
         progress=snapshot.progress,
         stages=[
             ReportStageFrameState(stage=item.stage, status=item.stage_status)
-            for item in report_progress_hub.stage_snapshots(snapshot.task_id)
+            for item in stages
         ],
     )
+
+
+class _ReportUpdateSubscription:
+    """合并进程内通知与 Redis 版本唤醒，并确保等待任务可取消。"""
+
+    def __init__(self, local: object, remote: object | None) -> None:
+        self._local = local
+        self._remote = remote
+
+    async def receive(self) -> ReportProgressMessage | ReportTaskVersionNotification:
+        """返回任一观察通道最先到达的消息，并取消另一等待。"""
+        local_receive = getattr(self._local, "receive")
+        local_task = asyncio.create_task(local_receive())
+        tasks = {local_task}
+        remote_task: asyncio.Task[object] | None = None
+        if self._remote is not None:
+            remote_receive = getattr(self._remote, "receive")
+            remote_task = asyncio.create_task(remote_receive())
+            tasks.add(remote_task)
+        try:
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            # 同时到达时优先消费已提交的本地完整事件；仍读取另一 task 的结果，
+            # 避免遗留未观察异常。Redis 摘要只负责后续数据库对账。
+            selected = local_task if local_task in done else remote_task
+            for task in done:
+                if task is not selected:
+                    task.result()
+            if selected is None:  # pragma: no cover - 构造时始终存在 local task
+                raise RuntimeError("报告观察订阅没有可用任务")
+            return selected.result()  # type: ignore[return-value]
+        finally:
+            # ``wait_for`` 可在 FIRST_COMPLETED 前取消本协程；始终清理全部未完成
+            # 子任务并观察结果，避免 SSE 周期对账遗留 pending receive。
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@asynccontextmanager
+async def _subscribe_report_updates(
+    task_id: str,
+) -> AsyncIterator[_ReportUpdateSubscription]:
+    """先注册本地和可选 Redis 观察通道，再允许调用方读取最新快照。"""
+    async with report_progress_hub.subscribe(task_id) as local:
+        runtime = get_report_task_runtime()
+        if runtime is None:
+            yield _ReportUpdateSubscription(local, None)
+            return
+        async with runtime.subscribe(task_id) as remote:
+            yield _ReportUpdateSubscription(local, remote)
 
 
 def _stage_frame(
@@ -294,13 +445,59 @@ def _sse_event(
     return ServerSentEvent(data=frame, event=frame.type, id=str(frame.sequence))
 
 
+def _apply_stage_notification(
+    snapshot: ReportProgressSnapshot,
+    notification: ReportProgressNotification,
+    *,
+    snapshot_version: int,
+) -> ReportProgressSnapshot:
+    """把已提交的本地阶段通知合并到当前连接快照，用于跨通道去重。"""
+    stages = {item.stage: item for item in snapshot.stages}
+    stages[notification.stage] = ReportStageSnapshot(
+        stage=notification.stage,
+        stage_status=notification.stage_status,
+    )
+    return replace(
+        snapshot,
+        status=ReportTaskStatus.RUNNING,
+        progress=max(snapshot.progress, notification.progress),
+        snapshot_version=max(snapshot.snapshot_version, snapshot_version),
+        stages=tuple(stages[stage] for stage in stages),
+    )
+
+
+def _latest_changed_stage(
+    previous: ReportProgressSnapshot,
+    latest: ReportProgressSnapshot,
+) -> ReportProgressNotification | None:
+    """从两个持久快照中提取最后一次单阶段变化。"""
+    previous_status = {item.stage: item.stage_status for item in previous.stages}
+    changed = [
+        item
+        for item in latest.stages
+        if previous_status.get(item.stage) is not item.stage_status
+    ]
+    if not changed:
+        return None
+    item = changed[-1]
+    return ReportProgressNotification(
+        task_id=latest.task_id,
+        report_id=latest.report_id,
+        stage=item.stage,
+        stage_status=item.stage_status,
+        progress=latest.progress,
+        snapshot_version=latest.snapshot_version,
+    )
+
+
 async def _report_event_stream(
     initial: ReportProgressSnapshot,
 ) -> AsyncIterator[ServerSentEvent]:
-    """发送数据库首帧、进程内低延迟事件和周期权威终态检查。"""
-    sequence = 1
-    last_progress = initial.progress
-    last_status = initial.status
+    """订阅后读取最新快照，再合并本地/Redis 唤醒与周期数据库对账。"""
+    sequence = initial.snapshot_version
+    current = initial
+    last_progress = current.progress
+    last_status = current.status
     started_at = time.perf_counter()
     logger.info(
         "report_progress_stream_open stage=%s task_id=%s report_id=%s status=%s transport=%s",
@@ -311,16 +508,15 @@ async def _report_event_stream(
         "sse",
     )
     try:
-        # 先注册再发数据库快照，避免任务在首帧期间完成而无人接收终态通知。
-        async with report_progress_hub.subscribe(initial.task_id) as subscription:
-            yield _sse_event(_ready_frame(initial, sequence=sequence))
-            if initial.is_terminal:
+        # 鉴权阶段已读取持久快照；先注册观察通道再发首帧，随后立即复查数据库，
+        # 既保留 D05 的首帧语义，又关闭鉴权快照到订阅之间的竞态。
+        async with _subscribe_report_updates(initial.task_id) as subscription:
+            yield _sse_event(_ready_frame(current, sequence=sequence))
+            if current.is_terminal:
                 sequence += 1
-                yield _sse_event(_terminal_frame(initial, sequence=sequence))
+                yield _sse_event(_terminal_frame(current, sequence=sequence))
                 return
 
-            # 首次查询与 Hub 注册之间可能已经提交终态；订阅后立即核对一次，
-            # 避免等到周期 reconcile 才把这一竞态收敛给客户端。
             try:
                 latest = await _reload_sse_snapshot(initial.task_id)
             except Exception as exc:
@@ -337,30 +533,37 @@ async def _report_event_stream(
             else:
                 if latest is None:
                     return
-                last_progress = max(last_progress, latest.progress)
-                last_status = latest.status
-                if latest.is_terminal:
-                    sequence += 1
-                    terminal = ReportProgressSnapshot(
-                        task_id=latest.task_id,
-                        report_id=latest.report_id,
-                        user_id=latest.user_id,
-                        status=latest.status,
-                        progress=last_progress,
-                        error_code=latest.error_code,
-                        message=latest.message,
-                    )
-                    yield _sse_event(_terminal_frame(terminal, sequence=sequence))
-                    return
+                if (
+                    latest.snapshot_version > current.snapshot_version
+                    or latest.status is not current.status
+                    or latest.progress > current.progress
+                ):
+                    previous = current
+                    current = latest
+                    last_progress = max(last_progress, current.progress)
+                    last_status = current.status
+                    sequence = max(sequence + 1, current.snapshot_version)
+                    if current.is_terminal:
+                        yield _sse_event(_terminal_frame(current, sequence=sequence))
+                        return
+                    changed_stage = _latest_changed_stage(previous, current)
+                    if changed_stage is not None:
+                        yield _sse_event(
+                            _stage_frame(
+                                changed_stage,
+                                sequence=sequence,
+                                progress_floor=last_progress,
+                            )
+                        )
 
             while True:
+                latest = None
                 try:
                     message = await asyncio.wait_for(
                         subscription.receive(),
-                        timeout=_REPORT_RECONCILE_SECONDS,
+                        timeout=settings.report_task_reconcile_sec,
                     )
                 except TimeoutError:
-                    # Hub 可丢且不跨进程；idle 时只用短会话核对数据库终态。
                     try:
                         latest = await _reload_sse_snapshot(initial.task_id)
                     except Exception as exc:
@@ -377,48 +580,86 @@ async def _report_event_stream(
                         return
                     if latest is None:
                         return
-                    last_progress = max(last_progress, latest.progress)
-                    last_status = latest.status
-                    if latest.is_terminal:
-                        sequence += 1
-                        terminal = ReportProgressSnapshot(
-                            task_id=latest.task_id,
-                            report_id=latest.report_id,
-                            user_id=latest.user_id,
-                            status=latest.status,
-                            progress=last_progress,
-                            error_code=latest.error_code,
-                            message=latest.message,
-                        )
-                        yield _sse_event(_terminal_frame(terminal, sequence=sequence))
-                        return
-                    continue
+                else:
+                    if isinstance(message, ReportTaskVersionNotification):
+                        if message.task_id != initial.task_id:
+                            continue
+                        if message.snapshot_version <= current.snapshot_version:
+                            continue
+                        try:
+                            latest = await _reload_sse_snapshot(initial.task_id)
+                        except Exception as exc:
+                            logger.warning(
+                                "report_progress_notification_reconcile_failed stage=%s "
+                                "task_id=%s status=%s transport=%s error_code=%s error_type=%s",
+                                "report_progress",
+                                initial.task_id,
+                                "DEGRADED",
+                                "redis_pubsub",
+                                "REPORT_SNAPSHOT_UNAVAILABLE",
+                                type(exc).__name__,
+                            )
+                            continue
+                        if latest is None:
+                            return
+                    else:
+                        if (
+                            message.task_id != initial.task_id
+                            or message.report_id != initial.report_id
+                        ):
+                            continue
+                        message_version = message.snapshot_version
+                        if (
+                            message_version is not None
+                            and message_version <= current.snapshot_version
+                        ):
+                            continue
+                        sequence = message_version or sequence + 1
+                        last_progress = max(last_progress, message.progress)
+                        if isinstance(message, ReportProgressNotification):
+                            current = _apply_stage_notification(
+                                current,
+                                message,
+                                snapshot_version=message_version or current.snapshot_version,
+                            )
+                            frame = _stage_frame(
+                                message,
+                                sequence=sequence,
+                                progress_floor=last_progress,
+                            )
+                            yield _sse_event(frame)
+                            continue
 
-                if message.task_id != initial.task_id or message.report_id != initial.report_id:
+                        last_status = message.status
+                        yield _sse_event(
+                            _terminal_frame(message, sequence=sequence)
+                        )
+                        return
+
+                if latest is None:
                     continue
-                sequence += 1
-                if isinstance(message, ReportProgressNotification):
+                if (
+                    latest.snapshot_version <= current.snapshot_version
+                    and latest.status is current.status
+                    and latest.progress <= current.progress
+                ):
+                    continue
+                previous = current
+                current = latest
+                last_progress = max(last_progress, current.progress)
+                last_status = current.status
+                sequence = max(sequence + 1, current.snapshot_version)
+                if current.is_terminal:
+                    yield _sse_event(_terminal_frame(current, sequence=sequence))
+                    return
+                changed_stage = _latest_changed_stage(previous, current)
+                if changed_stage is not None:
                     frame = _stage_frame(
-                        message,
+                        changed_stage,
                         sequence=sequence,
                         progress_floor=last_progress,
                     )
-                    last_progress = frame.progress
                     yield _sse_event(frame)
-                    continue
-
-                last_progress = max(last_progress, message.progress)
-                last_status = message.status
-                terminal = ReportTerminalNotification(
-                    task_id=message.task_id,
-                    report_id=message.report_id,
-                    status=last_status,
-                    progress=last_progress,
-                    error_code=message.error_code,
-                    message=message.message,
-                )
-                yield _sse_event(_terminal_frame(terminal, sequence=sequence))
-                return
     finally:
         logger.info(
             "report_progress_stream_close stage=%s task_id=%s report_id=%s status=%s "

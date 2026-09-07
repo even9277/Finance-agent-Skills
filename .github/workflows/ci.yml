@@ -41,10 +41,14 @@ jobs:
           uv run --locked ruff check
           backend/application/chat backend/infrastructure/chat
           backend/application/memory backend/infrastructure/memory
+          backend/application/report_progress backend/application/report_tasks
+          backend/infrastructure/report_tasks
           backend/config.py backend/main.py
           backend/db/database.py backend/db/migration_runner.py
           backend/db/models.py backend/migrations
-          backend/routers/chat.py backend/schemas/chat.py
+          backend/routers/chat.py backend/routers/report.py
+          backend/schemas/chat.py backend/schemas/report.py
+          backend/services/agent_service.py
           backend/services/memory_service.py
           backend/services/semantic_index_worker.py
           backend/services/stm_compaction_worker.py
@@ -62,10 +66,14 @@ jobs:
           uv run --locked pyright
           backend/application/chat backend/infrastructure/chat
           backend/application/memory backend/infrastructure/memory
+          backend/application/report_progress backend/application/report_tasks
+          backend/infrastructure/report_tasks
           backend/config.py backend/main.py
           backend/db/database.py backend/db/migration_runner.py
           backend/db/models.py backend/migrations
-          backend/routers/chat.py backend/schemas/chat.py
+          backend/routers/chat.py backend/routers/report.py
+          backend/schemas/chat.py backend/schemas/report.py
+          backend/services/agent_service.py
           backend/services/memory_service.py
           backend/services/semantic_index_worker.py
           backend/services/stm_compaction_worker.py
@@ -127,6 +135,7 @@ jobs:
       - name: Verify Redis cache rollback override
         env:
           ENABLE_REDIS_CACHE: "false"
+          ENABLE_REPORT_TASK_REDIS: "false"
         run: |
           docker compose -f docker/docker-compose.yml config --format json > /tmp/compose.json
           python - <<'PY'
@@ -136,6 +145,7 @@ jobs:
           config = json.loads(Path("/tmp/compose.json").read_text())
           backend = config["services"]["backend"]
           assert backend["environment"]["ENABLE_REDIS_CACHE"] == "false"
+          assert backend["environment"]["ENABLE_REPORT_TASK_REDIS"] == "false"
           assert "redis" not in backend.get("depends_on", {})
           PY
       - name: Build production backend image

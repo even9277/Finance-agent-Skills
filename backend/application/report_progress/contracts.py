@@ -57,6 +57,7 @@ class ReportProgressNotification:
         stage: 当前公开业务阶段。
         stage_status: 阶段生命周期状态。
         progress: 任务级单调百分比，范围为 0～100。
+        snapshot_version: PostgreSQL 已提交的任务级版本；历史进程内通知可为空。
 
     Raises:
         ValueError: 标识为空或进度越界时抛出。
@@ -67,12 +68,15 @@ class ReportProgressNotification:
     stage: ReportStage
     stage_status: ReportStageStatus
     progress: int
+    snapshot_version: int | None = None
 
     def __post_init__(self) -> None:
         if not self.task_id or not self.report_id:
             raise ValueError("task_id 和 report_id 不能为空")
         if not 0 <= self.progress <= 100:
             raise ValueError("progress 必须位于 0～100")
+        if self.snapshot_version is not None and self.snapshot_version < 1:
+            raise ValueError("snapshot_version 必须为正整数")
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +90,7 @@ class ReportTerminalNotification:
         progress: 数据库最终单调进度。
         error_code: 失败时的稳定低敏错误码。
         message: 面向用户的安全错误提示，不得包含原始异常。
+        snapshot_version: PostgreSQL 已提交的任务级版本；历史进程内通知可为空。
 
     Raises:
         ValueError: 状态不是终态或进度越界时抛出。
@@ -97,12 +102,15 @@ class ReportTerminalNotification:
     progress: int
     error_code: str | None = None
     message: str | None = None
+    snapshot_version: int | None = None
 
     def __post_init__(self) -> None:
         if self.status not in {ReportTaskStatus.COMPLETED, ReportTaskStatus.FAILED}:
             raise ValueError("terminal notification 只接受 completed 或 failed")
         if not 0 <= self.progress <= 100:
             raise ValueError("progress 必须位于 0～100")
+        if self.snapshot_version is not None and self.snapshot_version < 1:
+            raise ValueError("snapshot_version 必须为正整数")
 
 
 ReportProgressMessage: TypeAlias = ReportProgressNotification | ReportTerminalNotification

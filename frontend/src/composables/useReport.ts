@@ -3,12 +3,20 @@ import { storeToRefs } from 'pinia'
 import { saveAs } from 'file-saver'
 import {
   ACCESS_TOKEN_KEY,
+  ApiRequestError,
   createReportSseParser,
   reportApi,
   type ReportDetail,
   type ReportListItem,
   type ReportProgressFrame,
 } from '@/api'
+import {
+  clearActiveReportTask,
+  createReportIdempotencyKey,
+  loadActiveReportTask,
+  reportRequestFingerprint,
+  saveActiveReportTask,
+} from '@/composables/reportTaskRecovery'
 import { useAuthStore } from '@/stores/authStore'
 import { useReportProgressStore } from '@/stores/reportProgressStore'
 import { useUserStore } from '@/stores/userStore'
@@ -19,6 +27,7 @@ const POLL_ERROR_BACKOFF_MS = [2_000, 4_000, 8_000, 15_000] as const
 const MAX_CONSECUTIVE_POLL_ERRORS = 5
 const OBSERVATION_BUDGET_MS = 15 * 60 * 1_000
 const OBSERVATION_FAILED_MESSAGE = '进度查询暂时不可用，请稍后在历史报告中查看结果'
+const MAX_CREATE_ATTEMPTS = 2
 
 /** 管理报告创建后的唯一 SSE 观察器及有界 polling 降级链。 */
 export function useReport() {
@@ -46,6 +55,7 @@ export function useReport() {
   let firstFrameTimer: ReturnType<typeof setTimeout> | null = null
   let delayTimer: ReturnType<typeof setTimeout> | null = null
   let unloadRegistered = false
+  let activeStorageKey: string | null = null
 
   const isCompleted = computed(() => status.value === 'completed')
   const isFailed = computed(() => status.value === 'failed')
@@ -114,6 +124,53 @@ export function useReport() {
     return controller
   }
 
+  function clearActiveReference(): void {
+    clearActiveReportTask(activeStorageKey)
+    activeStorageKey = null
+  }
+
+  function isRetryableCreateError(error: unknown): boolean {
+    if (!(error instanceof ApiRequestError) || error.status === undefined) return true
+    return error.status === 408
+      || error.status === 425
+      || error.status === 429
+      || error.status >= 500
+  }
+
+  async function createWithOneRetry(
+    command: string,
+    userId: string,
+    idempotencyKey: string,
+  ) {
+    let lastError: unknown
+    for (let attempt = 1; attempt <= MAX_CREATE_ATTEMPTS; attempt += 1) {
+      try {
+        return await reportApi.generate(command, userId, idempotencyKey)
+      } catch (error: unknown) {
+        lastError = error
+        if (attempt === MAX_CREATE_ATTEMPTS || !isRetryableCreateError(error)) throw error
+      }
+    }
+    throw lastError
+  }
+
+  async function persistActiveReference(
+    userId: string,
+    command: string,
+    idempotencyKey: string,
+    nextTaskId: string,
+    nextReportId: string,
+  ): Promise<void> {
+    const requestFingerprint = await reportRequestFingerprint(command)
+    if (!requestFingerprint) return
+    activeStorageKey = await saveActiveReportTask(userId, {
+      task_id: nextTaskId,
+      report_id: nextReportId,
+      idempotency_key: idempotencyKey,
+      request_fingerprint: requestFingerprint,
+    })
+  }
+
   function waitFor(ms: number, signal: AbortSignal): Promise<boolean> {
     return new Promise((resolve) => {
       if (signal.aborted) {
@@ -141,6 +198,7 @@ export function useReport() {
   async function finishTerminal(epoch: number, frame: ReportProgressFrame): Promise<void> {
     if (frame.type !== 'task_terminal' || !isCurrent(epoch, frame.task_id)) return
     releaseTransport()
+    clearActiveReference()
     errorMsg.value = frame.message
     if (frame.status === 'completed') {
       try {
@@ -159,6 +217,7 @@ export function useReport() {
   ): Promise<void> {
     if (!isCurrent(epoch, expectedTaskId)) return
     releaseTransport()
+    clearActiveReference()
     errorMsg.value = progressStore.errorMessage
     if (status.value === 'completed') {
       try {
@@ -333,23 +392,94 @@ export function useReport() {
   async function generateReport(command: string): Promise<void> {
     if (isGenerating.value) return
     stopObservation()
+    clearActiveReference()
     report.value = null
     errorMsg.value = null
     progressStore.reset()
     isGenerating.value = true
     const requestEpoch = observationEpoch
+    const requestUserId = userStore.userId
 
     try {
-      const { data } = await reportApi.generate(command, userStore.userId)
+      const idempotencyKey = createReportIdempotencyKey()
+      const { data } = await createWithOneRetry(command, requestUserId, idempotencyKey)
       // 用户退出、切换历史报告或启动了更新任务后，丢弃迟到的创建响应。
       if (observationEpoch !== requestEpoch) return
       progressStore.begin(data.task_id, data.report_id)
+      await persistActiveReference(
+        requestUserId,
+        command,
+        idempotencyKey,
+        data.task_id,
+        data.report_id,
+      )
+      if (observationEpoch !== requestEpoch) {
+        clearActiveReference()
+        return
+      }
       registerBeforeUnload()
       void observeTask(requestEpoch, data.task_id, data.report_id)
     } catch (error: unknown) {
       if (observationEpoch !== requestEpoch) return
       errorMsg.value = error instanceof Error ? error.message : '触发失败'
       isGenerating.value = false
+    }
+  }
+
+  /** 从当前用户的最小标签页记录恢复同一任务，恢复过程绝不重新 POST。 */
+  async function restoreActiveTask(): Promise<boolean> {
+    if (isGenerating.value || !userStore.userId) return false
+    const ownerUserId = userStore.userId
+    const lookupEpoch = observationEpoch
+    const stored = await loadActiveReportTask(ownerUserId)
+    if (!stored) return false
+    // Web Crypto/Storage 读取期间可能已经启动新任务；旧恢复不得接管新 epoch。
+    if (isGenerating.value
+      || observationEpoch !== lookupEpoch
+      || userStore.userId !== ownerUserId) return false
+
+    stopObservation()
+    report.value = null
+    errorMsg.value = null
+    progressStore.reset()
+    activeStorageKey = stored.storageKey
+    isGenerating.value = true
+    const restoreEpoch = observationEpoch
+    const { reference } = stored
+
+    try {
+      // 状态接口先完成认证与所有权校验，浏览器记录本身不授予任务访问权。
+      const { data } = await reportApi.getStatus(reference.task_id)
+      if (observationEpoch !== restoreEpoch) return false
+      if (data.task_id !== reference.task_id
+        || (data.report_id && data.report_id !== reference.report_id)) {
+        clearActiveReference()
+        progressStore.reset()
+        isGenerating.value = false
+        return false
+      }
+
+      progressStore.begin(reference.task_id, reference.report_id)
+      progressStore.applyPollingSnapshot(data)
+      if (data.status === 'completed' || data.status === 'failed') {
+        await finishPollingTerminal(
+          restoreEpoch,
+          reference.task_id,
+          data.report_id || reference.report_id,
+        )
+        return true
+      }
+
+      registerBeforeUnload()
+      void observeTask(restoreEpoch, reference.task_id, reference.report_id)
+      return true
+    } catch (error: unknown) {
+      if (error instanceof ApiRequestError
+        && (error.status === 401 || error.status === 404)) clearActiveReference()
+      progressStore.reset()
+      isGenerating.value = false
+      errorMsg.value = error instanceof Error ? error.message : '恢复报告任务失败'
+      return false
     }
   }
 
@@ -360,6 +490,7 @@ export function useReport() {
 
   async function loadReport(id: string): Promise<void> {
     stopObservation()
+    clearActiveReference()
     errorMsg.value = null
     await fetchReport(id)
     if (report.value) progressStore.selectCompleted(report.value.task_id, id)
@@ -388,6 +519,7 @@ export function useReport() {
     history.value = history.value.filter((item) => item.report_id !== id)
     if (reportId.value === id) {
       stopObservation()
+      clearActiveReference()
       report.value = null
       progressStore.reset()
     }
@@ -397,7 +529,10 @@ export function useReport() {
     const stopAuthWatch = watch(
       () => authStore.accessToken,
       (token, previous) => {
-        if (previous && !token) stopObservation()
+        if (previous && !token) {
+          stopObservation()
+          clearActiveReference()
+        }
       },
     )
     onScopeDispose(() => {
@@ -421,6 +556,7 @@ export function useReport() {
     history,
     previewOpen,
     generateReport,
+    restoreActiveTask,
     stopObservation,
     loadHistory,
     loadReport,

@@ -310,3 +310,144 @@ def test_report_service_does_not_log_raw_command_when_stock_resolution_degrades(
     assert "PRIVATE_COMPANY" not in rendered_calls
     assert "PRIVATE_COMMAND" not in terminal_output
     assert "PRIVATE_COMPANY" not in terminal_output
+
+
+@pytest.mark.unit
+def test_report_service_commits_persistent_versions_before_redis_failure(
+    tmp_path: Path,
+) -> None:
+    """D06-T04：Redis 镜像异常不能回滚 Report/治理终态或污染日志。"""
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from backend.db.database import Base
+    from backend.db.models import Report, ReportTaskGovernanceRow, User
+    from backend.infrastructure.report_tasks import runtime as runtime_module
+
+    class _BrokenRuntime:
+        async def store_and_publish(self, **_kwargs: object) -> None:
+            raise RuntimeError("Authorization=Bearer REDIS_MUST_NOT_LEAK")
+
+    async def scenario() -> tuple[Report, ReportTaskGovernanceRow, _Recorder, str]:
+        engine = create_async_engine(
+            f"sqlite+aiosqlite:///{(tmp_path / 'runner-snapshot.db').as_posix()}"
+        )
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        report = _report()
+        governance = ReportTaskGovernanceRow(
+            id="governance-service-d06",
+            user_id=report.user_id,
+            key_digest="a" * 64,
+            request_fingerprint="b" * 64,
+            task_id=report.task_id,
+            report_id=report.id,
+            generation=1,
+            expires_at=datetime.now(UTC) + timedelta(minutes=10),
+            snapshot_version=1,
+            stage_states=[],
+        )
+        try:
+            async with engine.begin() as connection:
+                await connection.run_sync(Base.metadata.create_all)
+            async with sessions() as session:
+                session.add(User(id=report.user_id))
+                session.add(
+                    Report(
+                        id=report.id,
+                        task_id=report.task_id,
+                        user_id=report.user_id,
+                        status=report.status,
+                        progress=report.progress,
+                    )
+                )
+                session.add(governance)
+                await session.commit()
+
+            workflow = _Workflow(
+                [
+                    {
+                        "event": "on_chain_end",
+                        "name": "LangGraph",
+                        "metadata": {},
+                        "data": {"output": {"data": {"final_report": "# 持久化报告"}}},
+                    }
+                ]
+            )
+            recorder = _Recorder(report)
+            execution = SimpleNamespace(
+                execution_id="execution-d06",
+                execution_dir=Path("artifacts/test/report-d06"),
+            )
+            with (
+                patch.object(database_module, "AsyncSessionFactory", new=sessions),
+                patch.object(
+                    agent_service,
+                    "_build_initial_state",
+                    new=AsyncMock(
+                        return_value={
+                            "data": {"company_name": "贵州茅台", "stock_code": "sh.600519"}
+                        }
+                    ),
+                ),
+                patch.object(agent_service, "_get_workflow", return_value=workflow),
+                patch.object(
+                    agent_service,
+                    "initialize_execution_logger",
+                    return_value=execution,
+                ),
+                patch.object(
+                    agent_service,
+                    "get_execution_logger",
+                    return_value=SimpleNamespace(log_final_report=Mock()),
+                ),
+                patch.object(agent_service, "finalize_execution_logger"),
+                patch.object(settings, "enable_stm", False),
+                patch.object(settings, "enable_memory", False),
+                patch.object(
+                    runtime_module,
+                    "get_report_task_runtime",
+                    return_value=_BrokenRuntime(),
+                ),
+                patch.object(agent_service.logger, "warning") as warning,
+            ):
+                await agent_service.run_report_task(
+                    task_id=report.task_id,
+                    report_id=report.id,
+                    command="不会进入日志的命令",
+                    user_id=report.user_id,
+                    publisher=recorder,
+                )
+
+            async with sessions() as session:
+                stored_report = (
+                    await session.execute(select(Report).where(Report.id == report.id))
+                ).scalar_one()
+                stored_governance = (
+                    await session.execute(
+                        select(ReportTaskGovernanceRow).where(
+                            ReportTaskGovernanceRow.id == governance.id
+                        )
+                    )
+                ).scalar_one()
+                return stored_report, stored_governance, recorder, repr(warning.call_args_list)
+        finally:
+            await engine.dispose()
+
+    stored_report, stored_governance, recorder, warning_calls = asyncio.run(scenario())
+    assert (stored_report.status, stored_report.progress, stored_report.content) == (
+        "completed",
+        100,
+        "# 持久化报告",
+    )
+    versions = [item.snapshot_version for item, _, _ in recorder.items]
+    assert all(version is not None for version in versions)
+    persisted_versions = [version for version in versions if version is not None]
+    assert len(persisted_versions) == len(versions)
+    assert persisted_versions == sorted(persisted_versions)
+    assert stored_governance.snapshot_version == persisted_versions[-1]
+    assert stored_governance.stage_states == [
+        {"stage": "PREPARING", "status": "SUCCEEDED"}
+    ]
+    assert "REDIS_MUST_NOT_LEAK" not in warning_calls
