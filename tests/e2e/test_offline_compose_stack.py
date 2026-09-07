@@ -74,6 +74,29 @@ def _send_chat_request(
         return json.loads(response.read().decode("utf-8"))
 
 
+def _load_backend_health_snapshots() -> list[dict[str, Any]]:
+    """读取 Compose 中所有后端实例的健康快照。
+
+    Returns:
+        两个后端实例各自的健康响应；进程内指标需由调用方聚合判断。
+
+    Raises:
+        AssertionError: 任一实例地址缺失、响应失败或健康状态异常。
+    """
+    backend_urls = (
+        os.getenv("OFFLINE_PRIMARY_BACKEND_URL", "").rstrip("/"),
+        os.getenv("OFFLINE_SECONDARY_BACKEND_URL", "").rstrip("/"),
+    )
+    assert all(backend_urls), "Compose 必须暴露两个后端实例的直连地址"
+
+    snapshots: list[dict[str, Any]] = []
+    for backend_url in backend_urls:
+        with urlopen(f"{backend_url}/api/health", timeout=10) as response:  # noqa: S310
+            assert response.status == 200
+            snapshots.append(json.loads(response.read().decode("utf-8")))
+    return snapshots
+
+
 async def _load_memory_transaction_evidence(
     session_id: str,
 ) -> tuple[dict[str, object], dict[str, object]]:
@@ -627,15 +650,29 @@ def test_frontend_proxy_reaches_backend_and_fake_chat_chain() -> None:
         message="继续说明它的风险点",
     )
     assert follow_up["session_id"] == cache_seed["session_id"]
-    with urlopen(f"{base_url}/api/health", timeout=10) as response:  # noqa: S310
-        health = json.loads(response.read().decode("utf-8"))
-        cache_health = health["components"]["memory_cache"]
-        observability_health = health["components"]["memory_observability"]
-    assert cache_health["status"] == "UP"
-    assert cache_health["metrics"]["hits"] >= 1
-    assert observability_health["status"] == "UP"
-    assert observability_health["metrics"]["events_total"] >= 1
-    assert observability_health["metrics"]["stage.memory.retrieve"] >= 1
+    # 缓存与内存可观测计数是进程内指标；Nginx 会把请求分配到两个实例，
+    # 因此必须读取全部实例后聚合，不能把任一代理健康响应误当作全局指标。
+    health_snapshots = _load_backend_health_snapshots()
+    cache_health_snapshots = [
+        item["components"]["memory_cache"] for item in health_snapshots
+    ]
+    observability_health_snapshots = [
+        item["components"]["memory_observability"] for item in health_snapshots
+    ]
+    assert all(item["status"] == "UP" for item in cache_health_snapshots)
+    assert sum(item["metrics"]["hits"] for item in cache_health_snapshots) >= 1
+    assert all(item["status"] == "UP" for item in observability_health_snapshots)
+    assert (
+        sum(item["metrics"]["events_total"] for item in observability_health_snapshots)
+        >= 1
+    )
+    assert (
+        sum(
+            item["metrics"]["stage.memory.retrieve"]
+            for item in observability_health_snapshots
+        )
+        >= 1
+    )
 
     # M7 真实 HTTP 旅程：先通过兼容 API 写入合成文本记忆，再由聊天命令预览、确认并软删除。
     memory_add_request = Request(

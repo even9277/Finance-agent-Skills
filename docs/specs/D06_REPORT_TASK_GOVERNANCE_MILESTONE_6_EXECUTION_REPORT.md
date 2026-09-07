@@ -42,10 +42,11 @@
 
 审查覆盖架构所有权、PostgreSQL 竞争/换代、迁移 up/down、Redis 污染/失联、鉴权隔离、SSE 竞态/取消、前端恢复/重试、隐私/日志/Live 资源清理和 Claim 准确性。
 
-发现并修复两个可操作问题：
+发现并修复三个可操作问题：
 
 1. `restoreActiveTask()` 在异步 Web Crypto/Storage lookup 期间可能与用户新建报告竞争，旧恢复随后接管新 observation epoch。修复在 await 前后校验 epoch、`isGenerating` 和用户，新增“delayed refresh recovery cannot replace newly created task”测试。
 2. 既有 CI 的 Ruff/Pyright 白名单未覆盖新增报告 application/infrastructure、router/schema/service。现已纳入相同质量门禁，并让 Compose 回滚检查同时验证 `ENABLE_REPORT_TASK_REDIS=false` 且 Redis 不成为 backend 启动依赖。
+3. PR 的第二轮 Offline Compose E2E 暴露出历史缓存命中断言的多实例波动：聊天请求命中某一后端，但代理 `/api/health` 可能落到另一个后端，而计数器本身是进程内指标。测试现改为直读两个已知后端健康端点、逐实例验证 `UP` 并聚合命中/事件计数；不改变生产指标语义。独立 Compose 项目完整复核通过 `335 passed, 4 skipped, 48 deselected, 3 xfailed`。
 
 修复后专项测试 10/10；D06 CI 静态边界 Ruff/Pyright 通过，Compose 回滚断言和 workflow YAML 解析通过。其余审查项没有发现阻断交付的问题。
 
@@ -58,6 +59,7 @@
 | Frontend lint / type / build | passed / passed / passed；仅既有大 chunk warning |
 | D06 CI Ruff / Pyright boundary | passed / 0 errors |
 | Workflow YAML / Compose rollback override | passed / passed |
+| True two-backend Offline Compose after CI fix | `335 passed, 4 skipped, 48 deselected, 3 xfailed` |
 | Protected Live | 1 passed；未重跑 |
 
 ## 7. Known Boundaries
@@ -74,7 +76,7 @@
 - Implementation commit: `0a03b42482800a09eef0020d7f15e1b8aede5c90`
 - PR: [#53](https://github.com/even9277/Finance-agent-Skills/pull/53)
 - Independent review evidence: [PR comment](https://github.com/even9277/Finance-agent-Skills/pull/53#issuecomment-5573416228)
-- Required checks: Python quality/offline tests、Frontend lint/type/build、Docker packaging/Compose config、Offline Compose E2E 全部通过。
-- Merge policy: 用户已授权 squash merge；release-evidence 文档推送后再次等待同一组检查全绿，最终 merge/Issue 状态由 GitHub 记录。分支有实现与 release-evidence 两个提交，squash 后 `main` 只保留一个 D06 提交。
+- Required checks: 实现提交的 Python quality/offline tests、Frontend lint/type/build、Docker packaging/Compose config、Offline Compose E2E 全部通过；release-evidence 提交的 Offline Compose E2E 暴露并修复上述进程内指标聚合问题，最终检查状态以 GitHub PR 记录为准。
+- Merge policy: 用户已授权 squash merge；修复推送后等待同一组检查全绿，最终 merge/Issue 状态由 GitHub 记录。分支保留可审查的小步提交，squash 后 `main` 只保留一个 D06 提交。
 
 保护文件 `docs/specs/D01_STATIC_FALLBACK_REQUIREMENT_SPEC.md` 的 Git blob hash 仍为 `cc21919a88d19453f47f58d895ff2759462f5425`，保持 untracked、unstaged。
