@@ -466,9 +466,9 @@ Before implementation, rollback is simply discarding the unexecuted plan. During
 - [x] Milestone 5: Full Offline Verification and Narrow Fixes
   - Completed: 2026-09-07
   - Evidence: 全量本机 `441 passed, 14 skipped, 9 deselected, 3 xfailed`；前端 `53 passed` 且 lint/type-check/build 通过；Python 3.11 只读编译通过；真实 Nginx 双后端 + PostgreSQL + Redis runner 两次通过 `335 passed, 4 protected-live skipped, 48 deselected, 3 xfailed`，D06 基础设施定向矩阵 `27 passed, 0 skipped`。M4 发现的复合订阅取消泄漏由专项红测复现并修复，关闭日志不再出现 pending receive；Ruff 与触达范围 Pyright 通过，仓库全量 Pyright 的 4 个错误精确归属于未触达的历史 provider 代码。详情见 `D06_REPORT_TASK_GOVERNANCE_MILESTONE_5_EXECUTION_REPORT.md`。
-- [ ] Milestone 6: Protected Live, Documentation, Independent Review and GitHub Delivery
-  - In progress: 2026-09-08
-  - Local evidence: exactly one protected real report passed with 20 requests split 10/10 across two ASGI applications, `1 CREATED + 19 REPLAYED + 1 workflow`, 17 model runs, 46 read-only Tushare calls, terminal `completed`, snapshot version 15 and redaction pass. Claim docs are aligned; independent review found and fixed one frontend restore-vs-new-create epoch race. GitHub commit/PR/checks/merge remain pending.
+- [x] Milestone 6: Protected Live, Documentation, Independent Review and GitHub Delivery
+  - Completed: 2026-09-08
+  - Evidence: exactly one protected real report passed with 20 requests split 10/10 across two ASGI applications, `1 CREATED + 19 REPLAYED + 1 workflow`, 17 model runs, 46 read-only Tushare calls, terminal `completed`, snapshot version 15 and redaction pass. Claim docs are aligned; independent review fixed the frontend restore-vs-new-create epoch race and CI ownership gap. PR #53 references/closes #52; Python, frontend, Docker packaging and true Compose checks are green; authorized squash merge is the final remote operation and its result is recorded on GitHub.
 
 ## 16. Decision Log
 
@@ -538,8 +538,8 @@ Before implementation, rollback is simply discarding the unexecuted plan. During
 
 - What changed: M0 froze the safety baseline; M1 added D06 behavior contracts; M2 added the independent PostgreSQL governance authority and atomic create/reuse path; M3 added atomic stage snapshots, task-persistent versions, a strict disposable Redis cache/PubSub adapter, database rebuild/reconcile, cross-instance SSE observation and safe database/Redis health components；M4 added browser-scoped explicit key/retry/refresh recovery and a real Nginx two-backend acceptance topology；M5 closed the composite-subscription cancellation leak；M6 added the single protected real-governance harness, evidence-backed Claim documentation and a reviewed frontend epoch guard.
 - What was verified: M2 proved one creation/dispatch under contention; M3 proved monotonic stage/terminal protection, Report content plus terminal snapshot atomicity, cache TTL/corruption/outage/restart behavior, remote-runtime notification and database-authoritative recovery；M4 proved 20 proxy requests split across both instances return one task/report and one invocation, a non-creator instance reaches terminal after report-cache deletion；M5 reran the complete host/frontend/Python 3.11/Compose matrix and a zero-skip D06 infrastructure submatrix；M6's only protected Live proved 20 same-key API requests result in one real workflow with matching DB/REST/SSE terminal state and redacted evidence.
-- What remains risky: BackgroundTasks still has a process-crash window; Redis provides latest-state wake-up rather than complete replay；仓库全量 Pyright 仍有 4 个未触达 provider 历史错误；GitHub PR/checks/squash merge are still pending.
-- What should be improved next: Complete GitHub review/checks and squash merge. Evaluate a durable outbox/worker only if production reliability requires it; do not pre-commit to a platform.
+- What remains risky: BackgroundTasks still has a process-crash window; Redis provides latest-state wake-up rather than complete replay；仓库全量 Pyright 仍有 4 个未触达 provider 历史错误。
+- What should be improved next: Evaluate a durable outbox/worker only if production reliability requires it; do not pre-commit to a platform. Treat full event replay, rate limiting and production SLA as separate scoped tasks.
 
 ## 19. Deferred Work
 

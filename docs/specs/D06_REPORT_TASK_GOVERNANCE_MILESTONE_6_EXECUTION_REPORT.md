@@ -3,7 +3,7 @@
 ## 1. Milestone Executed
 
 - Milestone: 6 — Protected Live, Documentation, Independent Review and GitHub Delivery
-- Status: In progress（本地验收/文档/review 完成，GitHub delivery 待完成）
+- Status: Complete
 - Date: 2026-09-08
 
 ## 2. Frozen Contract
@@ -70,6 +70,11 @@
 
 ## 8. GitHub Delivery
 
-Issue #52 已存在。commit、PR、checks、review 和 squash merge 将在最终门禁后补充；完成前本报告保持 `In progress`，不得宣称 M6 完成。
+- Issue: [#52](https://github.com/even9277/Finance-agent-Skills/issues/52)
+- Implementation commit: `0a03b42482800a09eef0020d7f15e1b8aede5c90`
+- PR: [#53](https://github.com/even9277/Finance-agent-Skills/pull/53)
+- Independent review evidence: [PR comment](https://github.com/even9277/Finance-agent-Skills/pull/53#issuecomment-5573416228)
+- Required checks: Python quality/offline tests、Frontend lint/type/build、Docker packaging/Compose config、Offline Compose E2E 全部通过。
+- Merge policy: 用户已授权 squash merge；release-evidence 文档推送后再次等待同一组检查全绿，最终 merge/Issue 状态由 GitHub 记录。分支有实现与 release-evidence 两个提交，squash 后 `main` 只保留一个 D06 提交。
 
 保护文件 `docs/specs/D01_STATIC_FALLBACK_REQUIREMENT_SPEC.md` 的 Git blob hash 仍为 `cc21919a88d19453f47f58d895ff2759462f5425`，保持 untracked、unstaged。
