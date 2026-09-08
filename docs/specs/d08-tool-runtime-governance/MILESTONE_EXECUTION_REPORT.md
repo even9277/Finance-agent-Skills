@@ -3,7 +3,7 @@
 ## 里程碑
 
 - M5 Protected Live 与 Review
-- 状态：In Progress（实现与本地验收完成，等待 PR/CI）
+- 状态：Complete
 - 日期：2026-09-08
 
 ## 验证证据
@@ -54,6 +54,15 @@
 
 ## 剩余
 
-- 创建 PR、等待 CI、完成 PR Review，并记录合并证据。
+- 无实现或验收剩余项；PR #55 四项 CI 均通过，等待执行 squash merge。
+
+## PR 与 CI
+
+- PR：`https://github.com/even9277/Finance-agent-Skills/pull/55`
+- Python quality and offline tests：passed（1m17s）
+- Frontend lint, type-check and build：passed（39s）
+- Docker packaging and Compose configuration：passed（37s）
+- Offline Compose E2E：passed（1m31s）
+- 提交前 Review：两个阻塞级并发问题已修复；复核后无遗留 P0/P1。
 
 建议提交信息：`feat(chat): add D08 tool runtime governance`

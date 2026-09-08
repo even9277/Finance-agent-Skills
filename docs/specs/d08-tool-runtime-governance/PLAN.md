@@ -4,7 +4,7 @@
 
 - Issue: #54
 - Branch: `feat/54-tool-runtime-governance`
-- Status: Implemented; delivery pending
+- Status: Complete
 - Repository: `D:/FinanceProject/Finance-agent-Skills`
 
 ## 2. 统一方向
@@ -81,7 +81,7 @@
 - [x] M2 核心本地治理（接口族、最小间隔、有界退避和本地三态熔断已实现；18 个 focused tests 通过）
 - [x] M3 Redis 与装配（Executor、Provider、共享 Redis、Settings、lifespan 与 health 已接入；22 个 focused tests 通过）
 - [x] M4 验证与窄修复（真 Redis 2 passed；全量非 Live 449 passed；Ruff/Pyright/diff 通过）
-- [ ] M5 Protected Live 与 Review（实现、Live 与本地 Review 已通过；等待 PR/CI 证据）
+- [x] M5 Protected Live 与 Review（PR #55；四项 CI 通过；本地 Review 无遗留 P0/P1）
 
 ## 10. Decision Log
 
@@ -111,4 +111,4 @@
 - 本地接口族调度、最小启动间隔、有界退避和三态熔断均有确定性单测。
 - Redis 共享状态使用原子 Lua、哈希工具键和 TTL；不可达时降级到本地治理。
 - 两条 protected live 均从真实 WebSocket Chat 入口通过；未保存 Prompt、回答正文或凭证。
-- 最终 PR、CI 和合并证据在 M5 交付完成后补录。
+- PR #55 已覆盖本轮全部预期文件，四项必需 CI 均通过；合并采用 squash，可单提交回滚。
