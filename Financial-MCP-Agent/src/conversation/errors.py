@@ -19,6 +19,18 @@ class ToolTransientError(ConversationError, RuntimeError):
     """只读 Provider 的限流、连接抖动等可重试瞬时错误。"""
 
 
+class ToolRateLimitError(ToolTransientError):
+    """Provider 或本地配额拒绝调用，并可携带安全 Retry-After。"""
+
+    def __init__(self, message: str, *, retry_after_ms: int | None = None) -> None:
+        super().__init__(message)
+        self.retry_after_ms = retry_after_ms
+
+
+class ToolCircuitOpenError(ToolTransientError):
+    """工具熔断器拒绝调用；Executor 不得继续撞击下游。"""
+
+
 class ToolPermanentError(ConversationError, RuntimeError):
     """参数、权限或稳定下游拒绝等不可重试工具错误。"""
 

@@ -10,6 +10,7 @@ from backend.infrastructure.chat.providers import (
 )
 from backend.infrastructure.chat.repository import SqlAlchemyConversationRepository
 from backend.infrastructure.chat.trace import SkillTraceSink
+from backend.infrastructure.chat.tool_runtime import get_tool_runtime
 from backend.infrastructure.chat.skill_rerank import build_skill_reranker
 from backend.infrastructure.memory.runtime import get_memory_cache
 from backend.infrastructure.memory.retrieval_repository import SqlAlchemyMemoryRetrievalRepository
@@ -40,6 +41,7 @@ def build_chat_use_case(db: AsyncSession) -> ControlledChatUseCase:
         skill_loader=registry.get_loader(registry_snapshot),
         skill_reranker=build_skill_reranker(),
         skill_rerank_top_k=settings.skill_rerank_top_k,
+        tool_runtime=get_tool_runtime(),
     )
     retrieval = None
     if settings.enable_memory:

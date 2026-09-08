@@ -142,6 +142,20 @@ async def lifespan(app: FastAPI):
             type(exc).__name__,
         )
 
+    # 工具 Runtime 始终启用本地治理；Redis 仅扩展跨实例熔断状态。
+    try:
+        from backend.infrastructure.chat.tool_runtime import initialize_tool_runtime
+
+        await initialize_tool_runtime()
+    except Exception as exc:
+        logger.warning(
+            "tool_runtime_bootstrap_failed stage=%s status=%s error_code=%s error_type=%s",
+            "tool.runtime.bootstrap",
+            "DEGRADED",
+            "TOOL_RUNTIME_BOOTSTRAP_FAILED",
+            type(exc).__name__,
+        )
+
     try:
         initialize_trace_runtime()
         print("[backend] trace runtime 初始化完成 ✓")
@@ -326,6 +340,18 @@ async def lifespan(app: FastAPI):
             type(exc).__name__,
         )
     try:
+        from backend.infrastructure.chat.tool_runtime import close_tool_runtime
+
+        await close_tool_runtime()
+    except Exception as exc:
+        logger.warning(
+            "tool_runtime_close_failed stage=%s status=%s error_code=%s error_type=%s",
+            "tool.runtime.close",
+            "DEGRADED",
+            "TOOL_RUNTIME_CLOSE_FAILED",
+            type(exc).__name__,
+        )
+    try:
         flush_trace_exporters()
     except Exception as exc:
         logger.warning(f"[backend] flush trace exporters 失败: {exc}")
@@ -362,6 +388,7 @@ async def health_check():
     """返回应用、记忆缓存与报告观察运行时的安全健康摘要。"""
     from backend.infrastructure.memory.runtime import get_memory_cache
     from backend.infrastructure.report_tasks.runtime import get_report_task_runtime
+    from backend.infrastructure.chat.tool_runtime import get_tool_runtime
     from backend.application.memory.observability import memory_metrics
 
     cache = get_memory_cache()
@@ -377,6 +404,7 @@ async def health_check():
         else {"enabled": False, "status": "DISABLED", "error_code": None, "metrics": {}}
     )
     report_database_health = await _report_task_database_health()
+    tool_runtime_health = await get_tool_runtime().health()
     return {
         "status": "ok",
         "version": settings.app_version,
@@ -385,5 +413,6 @@ async def health_check():
             "memory_observability": {"status": "UP", "metrics": memory_metrics.snapshot()},
             "report_task_database": report_database_health,
             "report_task_redis": report_runtime_health,
+            "tool_runtime": tool_runtime_health,
         },
     }

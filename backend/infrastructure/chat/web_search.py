@@ -23,7 +23,12 @@ from src.conversation.contracts import (
     ToolCall,
     ToolObservation,
 )
-from src.conversation.errors import ToolPermanentError, ToolTimeoutError, ToolTransientError
+from src.conversation.errors import (
+    ToolPermanentError,
+    ToolRateLimitError,
+    ToolTimeoutError,
+    ToolTransientError,
+)
 
 _TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 _TRACKING_QUERY_NAMES = frozenset(
@@ -59,6 +64,7 @@ class WebSearchHttpResponse:
 
     status_code: int
     payload: dict[str, Any]
+    retry_after_ms: int | None = None
 
 
 class WebSearchTransport(Protocol):
@@ -118,10 +124,15 @@ class UrllibWebSearchTransport:
                     return WebSearchHttpResponse(
                         status_code=int(response.status),
                         payload=body,
+                        retry_after_ms=_retry_after_ms(response.headers.get("Retry-After")),
                     )
             except HTTPError as exc:
                 # 不读取错误正文，避免第三方回显查询、密钥或不可控内容。
-                return WebSearchHttpResponse(status_code=int(exc.code), payload={})
+                return WebSearchHttpResponse(
+                    status_code=int(exc.code),
+                    payload={},
+                    retry_after_ms=_retry_after_ms(exc.headers.get("Retry-After")),
+                )
             except (TimeoutError, socket.timeout) as exc:
                 raise ToolTimeoutError("web news request timed out") from exc
             except URLError as exc:
@@ -165,9 +176,9 @@ class WebNewsQuotaGuard:
                 timestamp for timestamp in self._minute_timestamps if timestamp >= threshold
             ]
             if len(self._minute_timestamps) >= rate_limit_per_min:
-                raise ToolTransientError("web news minute quota is exhausted")
+                raise ToolRateLimitError("web news minute quota is exhausted")
             if self._daily_count >= daily_quota:
-                raise ToolTransientError("web news daily quota is exhausted")
+                raise ToolRateLimitError("web news daily quota is exhausted")
             self._minute_timestamps.append(now)
             self._daily_count += 1
 
@@ -271,7 +282,7 @@ class TavilyWebNewsProvider:
             payload=payload,
             timeout_sec=self._settings.web_news_timeout_sec,
         )
-        self._raise_for_status(response.status_code)
+        self._raise_for_status(response.status_code, response.retry_after_ms)
         items = self._normalize_results(
             response.payload.get("results"),
             max_results=max_results,
@@ -302,8 +313,13 @@ class TavilyWebNewsProvider:
             raise ToolPermanentError("web news call contract mismatch")
 
     @staticmethod
-    def _raise_for_status(status_code: int) -> None:
-        if status_code == 429 or status_code >= 500:
+    def _raise_for_status(status_code: int, retry_after_ms: int | None = None) -> None:
+        if status_code == 429:
+            raise ToolRateLimitError(
+                "web news provider rate limited the request",
+                retry_after_ms=retry_after_ms,
+            )
+        if status_code >= 500:
             raise ToolTransientError("web news provider is temporarily unavailable")
         if not 200 <= status_code < 300:
             raise ToolPermanentError("web news provider rejected the request")
@@ -479,6 +495,19 @@ def _parse_date(value: str) -> date | None:
         except ValueError:
             continue
     return None
+
+
+def _retry_after_ms(value: str | None) -> int | None:
+    """只接受 Retry-After 的非负整数秒格式，并限制异常大等待。"""
+    if value is None:
+        return None
+    try:
+        seconds = int(value.strip())
+    except ValueError:
+        return None
+    if seconds < 0:
+        return None
+    return min(seconds * 1000, 60_000)
 
 
 __all__ = [

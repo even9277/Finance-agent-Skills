@@ -28,10 +28,24 @@ def test_health_contract_is_public_and_versioned() -> None:
         "status": "DISABLED",
         "error_code": None,
     }
-    with patch.object(
-        backend_main,
-        "_report_task_database_health",
-        AsyncMock(return_value=database_health),
+    tool_runtime_health = {
+        "enabled": True,
+        "status": "READY",
+        "error_code": None,
+        "metrics": {"admitted": 0, "circuit_rejected": 0},
+    }
+    tool_runtime = Mock()
+    tool_runtime.health = AsyncMock(return_value=tool_runtime_health)
+    with (
+        patch.object(
+            backend_main,
+            "_report_task_database_health",
+            AsyncMock(return_value=database_health),
+        ),
+        patch(
+            "backend.infrastructure.chat.tool_runtime.get_tool_runtime",
+            return_value=tool_runtime,
+        ),
     ):
         response = TestClient(app).get("/api/health")
 
@@ -54,8 +68,10 @@ def test_health_contract_is_public_and_versioned() -> None:
                 "error_code": None,
                 "metrics": {},
             },
+            "tool_runtime": tool_runtime_health,
         },
     }
+    tool_runtime.health.assert_awaited_once()
 
 
 @pytest.mark.contract

@@ -93,6 +93,8 @@ class ErrorCode(StrEnum):
     REWRITE_CLARIFICATION_REQUIRED = "REWRITE_CLARIFICATION_REQUIRED"
     TOOL_TIMEOUT = "TOOL_TIMEOUT"
     TOOL_TRANSIENT_FAILURE = "TOOL_TRANSIENT_FAILURE"
+    TOOL_RATE_LIMITED = "TOOL_RATE_LIMITED"
+    TOOL_CIRCUIT_OPEN = "TOOL_CIRCUIT_OPEN"
     TOOL_EXECUTION_FAILED = "TOOL_EXECUTION_FAILED"
     TOOL_INVALID_RESULT = "TOOL_INVALID_RESULT"
     TOOL_DEPENDENCY_FAILED = "TOOL_DEPENDENCY_FAILED"
@@ -204,6 +206,34 @@ class StepStatus(StrEnum):
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
     SKIPPED = "SKIPPED"
+
+
+class CircuitState(StrEnum):
+    """工具级熔断器允许公开和持久化的有限状态。"""
+
+    CLOSED = "CLOSED"
+    OPEN = "OPEN"
+    HALF_OPEN = "HALF_OPEN"
+
+
+class ToolRuntimeOutcome(StrEnum):
+    """一次工具许可释放时用于更新治理状态的结果类别。"""
+
+    SUCCESS = "SUCCESS"
+    TRANSIENT_FAILURE = "TRANSIENT_FAILURE"
+    PERMANENT_FAILURE = "PERMANENT_FAILURE"
+    CANCELLED = "CANCELLED"
+
+
+@dataclass(frozen=True, slots=True)
+class ToolRuntimeLease:
+    """表示一次已通过熔断与接口族调度检查的工具许可。"""
+
+    tool_name: str
+    api_family: str
+    circuit_state: CircuitState
+    waited_ms: float
+    half_open_probe: bool = False
 
 
 class ToolArgumentKind(StrEnum):
@@ -849,6 +879,15 @@ class ToolPolicy:
     api_family: str
     retryable: bool
     side_effect: ToolSideEffect = ToolSideEffect.READ
+    family_max_concurrency: int = 1
+    min_interval_ms: int = 0
+
+    def __post_init__(self) -> None:
+        """拒绝无法形成有效接口族调度边界的工具政策。"""
+        if not self.api_family.strip():
+            raise ContractViolationError("tool api_family must not be blank")
+        if self.family_max_concurrency < 1 or self.min_interval_ms < 0:
+            raise ContractViolationError("tool runtime policy values are outside range")
 
 
 @dataclass(frozen=True, slots=True)
