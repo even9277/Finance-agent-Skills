@@ -28,6 +28,20 @@ services:
       timeout: 3s
       retries: 15
 
+  postgres-migration-e2e:
+    image: pgvector/pgvector:0.8.0-pg16
+    environment:
+      POSTGRES_USER: e2e
+      POSTGRES_PASSWORD: e2e
+      POSTGRES_DB: e2e_migration
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U e2e -d e2e_migration"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
   backend:
     <<: *e2e-python-image
     command:
@@ -178,6 +192,7 @@ services:
     environment:
       RUN_D06_ISOLATED_INFRA_TESTS: "true"
       TEST_DATABASE_URL: postgresql+asyncpg://e2e:e2e@postgres-e2e:5432/e2e
+      TEST_MIGRATION_DATABASE_URL: postgresql+asyncpg://e2e:e2e@postgres-migration-e2e:5432/e2e_migration
       TEST_REDIS_URL: redis://redis-e2e:6379/15
       TEST_REPORT_REDIS_URL: redis://redis-e2e:6379/0
       OFFLINE_STACK_BASE_URL: http://frontend
@@ -205,6 +220,8 @@ services:
       - trace-e2e:/test-artifacts:ro
     depends_on:
       postgres-e2e:
+        condition: service_healthy
+      postgres-migration-e2e:
         condition: service_healthy
       redis-e2e:
         condition: service_healthy
