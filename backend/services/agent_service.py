@@ -13,6 +13,7 @@ Agent 服务层
 import re
 import sys
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,11 @@ from backend.application.report_progress.snapshot import (
     REPORT_GENERATION_FAILED_MESSAGE,
 )
 from backend.application.report_progress.tracker import ReportProgressTracker
+from backend.application.report_tasks.contracts import (
+    ReportStageSnapshot as PersistedReportStageSnapshot,
+    ReportTaskSnapshotRecord,
+    ReportTaskSnapshotUpdate,
+)
 
 # ─────────────────────────────────────────────────────────────
 # sys.path 注入：让 Financial-MCP-Agent/src.* 可导入
@@ -300,10 +306,12 @@ async def run_report_task(
         数据库始终是恢复权威。阶段通知在对应 progress 提交后发送，任务终态
         在 ``completed``/``failed`` 提交后发送；发布器故障不得改变报告结果。
     """
-    from sqlalchemy import select
-
     from backend.db.database import AsyncSessionFactory
     from backend.db.models import Report
+    from backend.infrastructure.report_tasks.repository import (
+        SqlAlchemyReportTaskSnapshotRepository,
+    )
+    from backend.infrastructure.report_tasks.runtime import get_report_task_runtime
 
     # 关键：复用 Financial-MCP-Agent 的全局 ExecutionLogger（与各 agent 的落盘日志同一个 execution_id）
     # 这样 final_report.md 会出现在 /root/Finance/logs/<execution_id>/reports/ 下，而不是另起目录。
@@ -342,32 +350,85 @@ async def run_report_task(
                 type(exc).__name__,
             )
 
-    async def _update_report(**kwargs: object) -> None:
-        """短事务更新报告，并在数据库边界强制 progress 单调。"""
+    async def _update_report_metadata(**kwargs: object) -> None:
+        """在阶段事务之外更新不进入观察快照的报告展示字段。"""
+        from sqlalchemy import select
+
         async with AsyncSessionFactory() as db:
             result = await db.execute(select(Report).where(Report.task_id == task_id))
             rpt = result.scalar_one_or_none()
             if rpt:
                 for k, v in kwargs.items():
-                    if k == "progress":
-                        if not isinstance(v, int):
-                            raise TypeError("progress 更新值必须为 int")
-                        v = max(int(rpt.progress or 0), v)
                     setattr(rpt, k, v)
                 await db.commit()
 
-    async def _record_stage(notification: ReportProgressNotification) -> None:
-        """先持久化单调百分比，再发布真实阶段状态。"""
+    async def _mirror_snapshot(record: ReportTaskSnapshotRecord) -> None:
+        """在数据库提交后 best-effort 镜像并唤醒其他实例。"""
+        runtime = get_report_task_runtime()
+        if runtime is None:
+            return
+        try:
+            await runtime.store_and_publish(
+                user_id=record.user_id,
+                key_digest=record.key_digest,
+                request_fingerprint=record.request_fingerprint,
+                snapshot=record.snapshot,
+            )
+        except Exception as exc:
+            logger.warning(
+                "report_snapshot_mirror_failed stage=%s task_id=%s report_id=%s "
+                "status=%s snapshot_version=%s error_code=%s error_type=%s",
+                "report.snapshot.mirror",
+                task_id,
+                report_id,
+                "DEGRADED",
+                record.snapshot.snapshot_version,
+                "REPORT_TASK_REDIS_UNAVAILABLE",
+                type(exc).__name__,
+            )
+
+    async def _persist_and_publish(
+        message: ReportProgressNotification | ReportTerminalNotification,
+        *,
+        status: ReportTaskStatus,
+        report_content: str | None = None,
+        report_error_msg: str | None = None,
+    ) -> None:
+        """同事务提交 Report/治理快照，再发送带持久版本的派生通知。"""
         nonlocal persisted_progress
-        if notification.progress > persisted_progress:
-            await _update_report(progress=notification.progress)
-            persisted_progress = notification.progress
-        _publish(notification)
+        update = ReportTaskSnapshotUpdate(
+            task_id=task_id,
+            report_id=report_id,
+            status=status,
+            progress=max(persisted_progress, message.progress),
+            stages=tuple(
+                PersistedReportStageSnapshot(
+                    stage=item.stage,
+                    status=item.stage_status,
+                )
+                for item in tracker.snapshots()
+            ),
+            report_content=report_content,
+            report_error_msg=report_error_msg,
+        )
+        async with AsyncSessionFactory() as db:
+            record = await SqlAlchemyReportTaskSnapshotRepository(db).persist_snapshot(update)
+        persisted_progress = update.progress
+        versioned_message = message
+        if record is not None:
+            versioned_message = replace(
+                message,
+                snapshot_version=record.snapshot.snapshot_version,
+            )
+            await _mirror_snapshot(record)
+        _publish(versioned_message)
+
+    async def _record_stage(notification: ReportProgressNotification) -> None:
+        """提交当前完整阶段快照后发布本次真实阶段变化。"""
+        await _persist_and_publish(notification, status=ReportTaskStatus.RUNNING)
 
     try:
-        await _update_report(status="running", progress=10)
-        persisted_progress = 10
-        _publish(tracker.begin_preparing())
+        await _record_stage(tracker.begin_preparing())
 
         # P1+P2: _build_initial_state 改为 async，传入 user_id
         initial_state = await _build_initial_state(command, user_id=user_id)
@@ -391,13 +452,11 @@ async def run_report_task(
                 "SUCCEEDED",
             )
 
-        await _update_report(
+        await _update_report_metadata(
             stock_code=stock_code,
             company_name=company_name,
-            progress=20,
         )
-        persisted_progress = 20
-        _publish(tracker.complete_preparing())
+        await _record_stage(tracker.complete_preparing())
 
         # ── 执行多 Agent 工作流（使用事件流做进度更新） ─────
         app = _get_workflow()
@@ -453,26 +512,21 @@ async def run_report_task(
         )
         finalize_execution_logger(success=True)
 
-        await _update_report(
-            status="completed",
-            progress=100,
-            content=report_content,
-            error_msg=None,
-        )
-        persisted_progress = 100
-        _publish(
+        await _persist_and_publish(
             ReportTerminalNotification(
                 task_id=task_id,
                 report_id=report_id,
                 status=ReportTaskStatus.COMPLETED,
                 progress=100,
-            )
+            ),
+            status=ReportTaskStatus.COMPLETED,
+            report_content=report_content,
         )
         logger.info(f"[task:{task_id}] 报告生成成功，长度={len(report_content)}")
 
     except Exception as exc:
         for failed_stage in tracker.fail_active_stages():
-            _publish(failed_stage)
+            await _record_stage(failed_stage)
         logger.error(
             "report_generation_failed stage=%s task_id=%s report_id=%s status=%s "
             "error_code=%s error_type=%s",
@@ -485,12 +539,7 @@ async def run_report_task(
         )
         finalize_execution_logger(success=False, error=REPORT_GENERATION_FAILED_MESSAGE)
         failed_progress = max(persisted_progress, tracker.current_progress)
-        await _update_report(
-            status="failed",
-            progress=failed_progress,
-            error_msg=REPORT_GENERATION_FAILED_MESSAGE,
-        )
-        _publish(
+        await _persist_and_publish(
             ReportTerminalNotification(
                 task_id=task_id,
                 report_id=report_id,
@@ -498,5 +547,7 @@ async def run_report_task(
                 progress=failed_progress,
                 error_code=REPORT_GENERATION_FAILED_CODE,
                 message=REPORT_GENERATION_FAILED_MESSAGE,
-            )
+            ),
+            status=ReportTaskStatus.FAILED,
+            report_error_msg=REPORT_GENERATION_FAILED_MESSAGE,
         )

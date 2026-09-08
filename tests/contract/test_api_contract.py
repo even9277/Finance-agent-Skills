@@ -12,6 +12,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from backend.config import settings  # noqa: E402
+from backend import main as backend_main  # noqa: E402
 from backend.main import app  # noqa: E402
 from backend.routers import chat as chat_router  # noqa: E402
 from backend.application.chat.contracts import ChatOutcome  # noqa: E402
@@ -22,7 +23,17 @@ from src.conversation.contracts import TerminalStatus  # noqa: E402
 @pytest.mark.contract
 def test_health_contract_is_public_and_versioned() -> None:
     memory_metrics.reset()
-    response = TestClient(app).get("/api/health")
+    database_health = {
+        "enabled": False,
+        "status": "DISABLED",
+        "error_code": None,
+    }
+    with patch.object(
+        backend_main,
+        "_report_task_database_health",
+        AsyncMock(return_value=database_health),
+    ):
+        response = TestClient(app).get("/api/health")
 
     assert response.status_code == 200
     assert response.json() == {
@@ -36,6 +47,13 @@ def test_health_contract_is_public_and_versioned() -> None:
                 "metrics": {},
             },
             "memory_observability": {"status": "UP", "metrics": {}},
+            "report_task_database": database_health,
+            "report_task_redis": {
+                "enabled": False,
+                "status": "DISABLED",
+                "error_code": None,
+                "metrics": {},
+            },
         },
     }
 

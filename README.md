@@ -278,11 +278,27 @@ Workspace 金融场景扩展与 Trace / Langfuse 配置见下面两节。
 
 ```text
 用户命令
-  -> 后端任务入队
+  -> 前端生成浏览器会话内的显式 Idempotency-Key
+  -> FastAPI 鉴权并规范化命令
+  -> PostgreSQL (user_id, key_digest) 唯一约束原子创建/复用任务
+  -> 仅创建获胜请求注册一次 BackgroundTasks
   -> LangGraph 多 Agent 并行分析
+  -> 每个阶段先提交 PostgreSQL 单调快照/version
+  -> Redis best-effort 镜像最新快照并通过 Pub/Sub 唤醒其他实例
+  -> SSE 先发权威最新快照、持续对账；异常时轮询 PostgreSQL
   -> 汇总 Agent 生成最终报告
-  -> 存库 / 前端轮询展示 / 下载 Markdown
+  -> PostgreSQL 同事务保存终态与报告正文
+  -> 前端按 report_id 读取 / 下载 Markdown
 ```
+
+未传显式键的旧客户端仍按“认证用户 + 规范化命令哈希”获得 600 秒幂等保护；
+显式键允许前端把网络重试绑定到同一次用户意图。同键同请求返回原 task/report，
+同键不同请求返回 409。PostgreSQL 是任务、所有权、快照版本和正文的唯一权威，
+Redis 只保存不含原始用户、命令、Token 或正文的可过期投影；Redis 失效时回源数据库，
+不会退化为重复执行。恢复语义是“最新快照 + 后续事件”，不是完整历史事件回放。
+
+当前执行器仍是 FastAPI `BackgroundTasks`：已覆盖并发创建、双后端观察和刷新恢复，
+但不承诺 Web 进程在任务执行中崩溃后的自动续跑；可靠队列/outbox/独立 Worker 属于后续生产化工作。
 
 ## 快速开始
 
@@ -644,7 +660,7 @@ python src/main.py --command "帮我看看贵州茅台值不值得长期持有"
 - 长期记忆：候选抽取 → 确定性治理评分 → 高影响画像用户确认 → PostgreSQL 权威记录 → pgvector/Mem0 派生语义索引 → 混合召回 + 权威后过滤。
 - 自然语言命令：在对话中直接说“查看我的记忆”“以后回答简短一点”“删除记忆 <id>”“忘掉我的文本记忆”“确认”“取消”；高影响删除先返回预览并要求一次性确认，支持 TTL、版本校验并拒绝重放/跨用户/跨会话使用。
 - 可观测性：`/api/health` 返回 `components.memory_observability` 指标；记忆阶段、状态、错误码均为低基数且脱敏；后台摘要/治理/索引 worker 的 `RETRY`/`DEAD_LETTER`/`DEGRADED` 状态可在 JSONL Trace 中复现。
-- 验收矩阵：默认测试全部离线；完整离线 Docker Compose E2E 通过 `docker compose -f docker/docker-compose.offline.yml up --build --abort-on-container-exit --exit-code-from offline-e2e` 运行。受保护真实 LLM + 只读 Tushare 对话验收使用 `RUN_PROTECTED_LIVE_E2E=true uv run --locked --with socksio python -m pytest tests/e2e/test_live_controlled_chat_chain.py -q -m live`；报告阶段/SSE 验收使用 `RUN_PROTECTED_LIVE_REPORT_E2E=true uv run --locked --with socksio python -m pytest tests/e2e/test_live_report_progress.py -q -m live`（均需真实凭证，默认不执行）。
+- 验收矩阵：默认测试全部离线；完整离线 Docker Compose E2E 通过 `docker compose -f docker/docker-compose.offline.yml up --build --abort-on-container-exit --exit-code-from offline-e2e` 运行。受保护真实 LLM + 只读 Tushare 对话验收使用 `RUN_PROTECTED_LIVE_E2E=true uv run --locked --with socksio python -m pytest tests/e2e/test_live_controlled_chat_chain.py -q -m live`；报告阶段/SSE 验收使用 `RUN_PROTECTED_LIVE_REPORT_E2E=true uv run --locked --with socksio python -m pytest tests/e2e/test_live_report_progress.py -q -m live`；D06 双应用并发幂等真实验收使用隔离 PostgreSQL，并通过 `RUN_PROTECTED_LIVE_REPORT_GOVERNANCE_E2E=true`、`D06_LIVE_INFRA_ACK=disposable` 和 `D06_LIVE_DATABASE_URL` 三重门禁运行 `tests/e2e/test_live_report_task_governance.py`（均需真实凭证，默认不执行且整份报告禁止自动重跑）。
 ## 日志与排查
 
 日志主要在：
@@ -721,6 +737,7 @@ Finance-agent-Skills/
 ## 当前已实现的关键工程点
 
 - 报告模式多 Agent 协作
+- 报告任务治理：PostgreSQL 唯一约束保证同用户同键原子创建/复用，Redis 只做可重建快照与跨实例唤醒，SSE/轮询按最新权威快照恢复，前端刷新不重复 POST
 - 受控记忆主链已闭环：Preflight 预算筛查、Working State 维护、rolling summary 质量门控与 last-good 保护、Redis 热缓存、LTM 候选治理与混合召回、自然语言记忆命令与一次性确认、统一记忆可观测性（阶段/状态/指标均脱敏）
 - 用户画像读取和跨会话记忆基础设施
 - 登录、切换账号、JWT 鉴权
@@ -744,8 +761,9 @@ Finance-agent-Skills/
 - 架构图 / 时序图
 - 生产环境部署说明
 - 历史黄金集重建与面试指标复测
-- 受控过程状态的刷新恢复、事件重放与重复提交保护
-- Redis 分布式韧性与完整 Langfuse 评测回流
+- 对话受控过程状态的刷新恢复、事件重放与重复提交保护
+- 报告持久任务队列/outbox、进程崩溃续跑与完整事件回放
+- 更完整的 Redis 故障演练与 Langfuse 评测回流
 - 更完整的 FAQ
 
 ## 鸣谢
@@ -760,6 +778,6 @@ Finance-agent-Skills/
 
 ## 说明
 
-- 当前仓库已经具备 CI、分层测试、Compose E2E 和保护性 Live E2E；尚未提供生产 CD、SLA、
-  Redis 分布式韧性或真实 Langfuse 在线闭环。
+- 当前仓库已经具备 CI、分层测试、真实双后端 Compose E2E 和保护性 Live E2E；尚未提供生产 CD、SLA、
+  报告进程崩溃续跑、完整事件回放或真实 Langfuse 在线闭环。
 - 根目录中的部分训练脚本、数据处理脚本和实验文件保留为历史能力与扩展入口，并不是最小启动链路的必需项。

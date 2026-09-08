@@ -89,7 +89,10 @@ def test_offline_proxy_streams_real_report_stages_and_persists_terminal_report()
     assert frames[0]["type"] == "stream_ready"
     assert frames[-1]["type"] == "task_terminal"
     assert frames[-1]["status"] == "completed"
-    assert [frame["sequence"] for frame in frames] == list(range(1, len(frames) + 1))
+    # D06 后 sequence 是持久快照版本；跨实例通知可合并中间版本，但不得倒退或重复。
+    sequences = [int(frame["sequence"]) for frame in frames]
+    assert all(sequence >= 1 for sequence in sequences)
+    assert sequences == sorted(set(sequences))
     progress = [int(frame["progress"]) for frame in frames]
     assert progress == sorted(progress)
     stages = {

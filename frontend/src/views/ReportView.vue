@@ -14,13 +14,14 @@ const route = useRoute()
 const {
   status, progress, stages, transportStatus, report, errorMsg, isGenerating,
   history, previewOpen,
-  generateReport, loadHistory, loadReport,
+  generateReport, restoreActiveTask, loadHistory, loadReport,
   downloadMarkdown, openPreview, closePreview, deleteReport,
 } = useReport()
 
 const command = ref('')
 
 onMounted(async () => {
+  await restoreActiveTask()
   await loadHistory()
   // 支持从自选股快捷跳转：?q=600519
   const q = route.query.q as string

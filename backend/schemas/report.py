@@ -11,6 +11,7 @@ from backend.application.report_progress.contracts import (
     ReportStageStatus,
     ReportTaskStatus,
 )
+from backend.application.report_tasks.contracts import ReportIdempotencyStatus
 
 
 class ReportGenerateRequest(BaseModel):
@@ -22,6 +23,8 @@ class ReportTaskResponse(BaseModel):
     task_id: str
     report_id: str
     status: str = "pending"
+    idempotency_status: ReportIdempotencyStatus | None = None
+    expires_at: datetime | None = None
 
 
 class ReportStatusResponse(BaseModel):

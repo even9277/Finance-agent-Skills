@@ -58,6 +58,9 @@ services:
       - FINANCE_MCP_SERVER_DIR=/app/a-share-mcp-is-just-i-need
       - ENABLE_REDIS_CACHE=${ENABLE_REDIS_CACHE:-true}
       - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      - ENABLE_REPORT_TASK_GOVERNANCE=${ENABLE_REPORT_TASK_GOVERNANCE:-true}
+      - ENABLE_REPORT_TASK_REDIS=${ENABLE_REPORT_TASK_REDIS:-true}
+      - REPORT_TASK_REDIS_NAMESPACE=${REPORT_TASK_REDIS_NAMESPACE:-finance-agent-report}
     volumes:
       - ../Financial-MCP-Agent/logs:/app/Financial-MCP-Agent/logs
       - ../Financial-MCP-Agent/reports:/app/Financial-MCP-Agent/reports

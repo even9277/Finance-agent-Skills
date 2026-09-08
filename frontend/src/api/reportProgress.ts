@@ -39,7 +39,7 @@ interface ReportProgressEnvelope {
   protocol_version: typeof REPORT_PROGRESS_PROTOCOL_VERSION
   task_id: string
   report_id: string
-  /** 当前 SSE 连接内从 1 开始递增，不用于跨连接重放。 */
+  /** PostgreSQL 持久快照版本；旧任务可回退为当前连接内的递增序号。 */
   sequence: number
   emitted_at: string
 }

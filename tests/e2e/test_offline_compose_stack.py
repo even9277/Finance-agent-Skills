@@ -74,6 +74,29 @@ def _send_chat_request(
         return json.loads(response.read().decode("utf-8"))
 
 
+def _load_backend_health_snapshots() -> list[dict[str, Any]]:
+    """读取 Compose 中所有后端实例的健康快照。
+
+    Returns:
+        两个后端实例各自的健康响应；进程内指标需由调用方聚合判断。
+
+    Raises:
+        AssertionError: 任一实例地址缺失、响应失败或健康状态异常。
+    """
+    backend_urls = (
+        os.getenv("OFFLINE_PRIMARY_BACKEND_URL", "").rstrip("/"),
+        os.getenv("OFFLINE_SECONDARY_BACKEND_URL", "").rstrip("/"),
+    )
+    assert all(backend_urls), "Compose 必须暴露两个后端实例的直连地址"
+
+    snapshots: list[dict[str, Any]] = []
+    for backend_url in backend_urls:
+        with urlopen(f"{backend_url}/api/health", timeout=10) as response:  # noqa: S310
+            assert response.status == 200
+            snapshots.append(json.loads(response.read().decode("utf-8")))
+    return snapshots
+
+
 async def _load_memory_transaction_evidence(
     session_id: str,
 ) -> tuple[dict[str, object], dict[str, object]]:
@@ -251,9 +274,9 @@ def _assert_schema_matches_orm(sync_connection) -> None:
         assert all(columns[name]["default"] is not None for name in column_names)
 
 
-async def _assert_postgres_schema_contract() -> None:
-    """在真实 PostgreSQL 连接上核对 M2 核心 Schema 结构。"""
-    engine = create_async_engine(os.environ["TEST_DATABASE_URL"])
+async def _assert_postgres_schema_contract(database_url: str) -> None:
+    """在指定真实 PostgreSQL 连接上核对 M2 核心 Schema 结构。"""
+    engine = create_async_engine(database_url)
     try:
         async with engine.connect() as connection:
             await connection.run_sync(_assert_schema_matches_orm)
@@ -261,9 +284,9 @@ async def _assert_postgres_schema_contract() -> None:
         await engine.dispose()
 
 
-async def _assert_real_pgvector_lifecycle() -> None:
-    """在真实 pgvector 上验证写入、检索、租户过滤、权威过滤和删除。"""
-    engine = create_async_engine(os.environ["TEST_DATABASE_URL"])
+async def _assert_real_pgvector_lifecycle(database_url: str) -> None:
+    """在指定真实 pgvector 上验证写入、检索、租户过滤、权威过滤和删除。"""
+    engine = create_async_engine(database_url)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     record_id = "m6-compose-pgvector-record"
     provider = PgVectorSemanticProvider(session_factory)
@@ -440,9 +463,58 @@ async def _wait_for_summary_evidence(session_id: str) -> dict[str, object]:
         await engine.dispose()
 
 
-async def _assert_legacy_rows_after_downgrade(session_id: str) -> None:
-    """确认降级只移除 M2 表，历史会话和消息仍可读取。"""
-    engine = create_async_engine(os.environ["TEST_DATABASE_URL"])
+async def _initialize_migration_fixture(database_url: str, session_id: str) -> None:
+    """在迁移专用数据库中创建并写入最小历史 Schema 样例。
+
+    Args:
+        database_url: 不被运行中后端访问的一次性 PostgreSQL 数据库。
+        session_id: 用于验证 downgrade 保留历史消息的固定会话标识。
+    """
+    engine = create_async_engine(database_url)
+    legacy_tables = [
+        table
+        for name, table in Base.metadata.tables.items()
+        if name not in ALEMBIC_MANAGED_TABLE_NAMES
+    ]
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all, tables=legacy_tables)
+            await connection.execute(
+                Base.metadata.tables["users"].insert().values(
+                    id="offline-user",
+                    display_name="迁移验收用户",
+                    cold_start_done=True,
+                )
+            )
+            await connection.execute(
+                Base.metadata.tables["sessions"].insert().values(
+                    id=session_id,
+                    user_id="offline-user",
+                    mode="chat",
+                    title="迁移验收会话",
+                )
+            )
+            await connection.execute(
+                Base.metadata.tables["messages"].insert(),
+                [
+                    {
+                        "session_id": session_id,
+                        "role": "user" if index % 2 == 0 else "assistant",
+                        "content": f"迁移验收消息 {index + 1}",
+                    }
+                    for index in range(6)
+                ],
+            )
+    finally:
+        await engine.dispose()
+
+
+async def _assert_legacy_rows_after_downgrade(
+    database_url: str,
+    session_id: str,
+) -> None:
+    """确认降级只移除 Alembic 表，历史会话和消息仍可读取。"""
+    engine = create_async_engine(database_url)
     try:
         async with engine.connect() as connection:
             table_names = await connection.run_sync(
@@ -627,15 +699,29 @@ def test_frontend_proxy_reaches_backend_and_fake_chat_chain() -> None:
         message="继续说明它的风险点",
     )
     assert follow_up["session_id"] == cache_seed["session_id"]
-    with urlopen(f"{base_url}/api/health", timeout=10) as response:  # noqa: S310
-        health = json.loads(response.read().decode("utf-8"))
-        cache_health = health["components"]["memory_cache"]
-        observability_health = health["components"]["memory_observability"]
-    assert cache_health["status"] == "UP"
-    assert cache_health["metrics"]["hits"] >= 1
-    assert observability_health["status"] == "UP"
-    assert observability_health["metrics"]["events_total"] >= 1
-    assert observability_health["metrics"]["stage.memory.retrieve"] >= 1
+    # 缓存与内存可观测计数是进程内指标；Nginx 会把请求分配到两个实例，
+    # 因此必须读取全部实例后聚合，不能把任一代理健康响应误当作全局指标。
+    health_snapshots = _load_backend_health_snapshots()
+    cache_health_snapshots = [
+        item["components"]["memory_cache"] for item in health_snapshots
+    ]
+    observability_health_snapshots = [
+        item["components"]["memory_observability"] for item in health_snapshots
+    ]
+    assert all(item["status"] == "UP" for item in cache_health_snapshots)
+    assert sum(item["metrics"]["hits"] for item in cache_health_snapshots) >= 1
+    assert all(item["status"] == "UP" for item in observability_health_snapshots)
+    assert (
+        sum(item["metrics"]["events_total"] for item in observability_health_snapshots)
+        >= 1
+    )
+    assert (
+        sum(
+            item["metrics"]["stage.memory.retrieve"]
+            for item in observability_health_snapshots
+        )
+        >= 1
+    )
 
     # M7 真实 HTTP 旅程：先通过兼容 API 写入合成文本记忆，再由聊天命令预览、确认并软删除。
     memory_add_request = Request(
@@ -684,11 +770,22 @@ def test_frontend_proxy_reaches_backend_and_fake_chat_chain() -> None:
     assert replay["memory_command"]["status"] == "REJECTED"
     assert replay["memory_command"]["error_code"] == "CONFIRMATION_NOT_FOUND"
 
-    # 在同一个 tmpfs PostgreSQL 上验证核心约束，并做 downgrade/re-upgrade。
-    asyncio.run(_assert_postgres_schema_contract())
-    asyncio.run(_assert_real_pgvector_lifecycle())
-    database_url = os.environ["TEST_DATABASE_URL"]
-    downgrade_database(database_url, allow_isolated=True)
-    asyncio.run(_assert_legacy_rows_after_downgrade(str(chat["session_id"])))
-    upgrade_database(database_url)
-    asyncio.run(_assert_postgres_schema_contract())
+    # 迁移生命周期必须使用没有运行中应用连接的专用数据库；否则后端健康检查
+    # 与多表 DDL 可能形成锁顺序反转，既不代表迁移错误，也会制造 CI 波动。
+    migration_database_url = os.environ["TEST_MIGRATION_DATABASE_URL"]
+    migration_session_id = "offline-migration-session"
+    asyncio.run(
+        _initialize_migration_fixture(migration_database_url, migration_session_id)
+    )
+    upgrade_database(migration_database_url)
+    asyncio.run(_assert_postgres_schema_contract(migration_database_url))
+    asyncio.run(_assert_real_pgvector_lifecycle(migration_database_url))
+    downgrade_database(migration_database_url, allow_isolated=True)
+    asyncio.run(
+        _assert_legacy_rows_after_downgrade(
+            migration_database_url,
+            migration_session_id,
+        )
+    )
+    upgrade_database(migration_database_url)
+    asyncio.run(_assert_postgres_schema_contract(migration_database_url))

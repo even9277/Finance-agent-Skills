@@ -8,6 +8,19 @@ import axios from 'axios'
 export const ACCESS_TOKEN_KEY = 'finance_access_token'
 export const AUTH_USER_KEY = 'finance_auth_user'
 
+/** 保留后端稳定错误码和 HTTP 状态，供有副作用请求决定是否安全重试。 */
+export class ApiRequestError extends Error {
+  readonly status?: number
+  readonly errorCode?: string
+
+  constructor(message: string, status?: number, errorCode?: string) {
+    super(message)
+    this.name = 'ApiRequestError'
+    this.status = status
+    this.errorCode = errorCode
+  }
+}
+
 export * from './reportProgress'
 
 // ─────────────────────────────────────────────────────────────
@@ -30,9 +43,23 @@ http.interceptors.request.use((config) => {
 
 http.interceptors.response.use(
   (res) => res,
-  (err) => {
-    const msg = err.response?.data?.detail || err.message || '请求失败'
-    return Promise.reject(new Error(msg))
+  (error: unknown) => {
+    if (!axios.isAxiosError(error)) {
+      return Promise.reject(error instanceof Error ? error : new Error('请求失败'))
+    }
+    const detail: unknown = error.response?.data?.detail
+    const detailRecord = typeof detail === 'object' && detail !== null
+      ? detail as Record<string, unknown>
+      : null
+    const message = typeof detail === 'string'
+      ? detail
+      : typeof detailRecord?.message === 'string'
+        ? detailRecord.message
+        : error.message || '请求失败'
+    const errorCode = typeof detailRecord?.error_code === 'string'
+      ? detailRecord.error_code
+      : undefined
+    return Promise.reject(new ApiRequestError(message, error.response?.status, errorCode))
   }
 )
 
@@ -43,6 +70,8 @@ export interface ReportTaskResponse {
   task_id: string
   report_id: string
   status: string
+  idempotency_status?: 'CREATED' | 'REPLAYED' | null
+  expires_at?: string | null
 }
 
 export interface ReportStatusResponse {
@@ -261,8 +290,12 @@ export interface MemoryProfileApiResponse {
 // 报告 API
 // ─────────────────────────────────────────────────────────────
 export const reportApi = {
-  generate: (command: string, userId: string) =>
-    http.post<ReportTaskResponse>('/report/generate', { command, user_id: userId }),
+  generate: (command: string, userId: string, idempotencyKey?: string) =>
+    http.post<ReportTaskResponse>(
+      '/report/generate',
+      { command, user_id: userId },
+      idempotencyKey ? { headers: { 'Idempotency-Key': idempotencyKey } } : undefined,
+    ),
 
   getStatus: (taskId: string, signal?: AbortSignal) =>
     http.get<ReportStatusResponse>(`/report/status/${taskId}`, { signal }),

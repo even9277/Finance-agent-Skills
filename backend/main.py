@@ -32,6 +32,39 @@ _semantic_index_worker_task = None
 _semantic_index_worker_stop_event = None
 
 
+async def _report_task_database_health() -> dict[str, object]:
+    """检查报告治理权威表是否可读，并仅返回安全的稳定状态。
+
+    Returns:
+        包含启用状态、就绪状态和稳定错误码的健康摘要；不会返回连接串、
+        SQL 或原始数据库异常。
+    """
+    if not settings.enable_report_task_governance:
+        return {"enabled": False, "status": "DISABLED", "error_code": None}
+
+    try:
+        from sqlalchemy import select
+
+        from backend.db.models import ReportTaskGovernanceRow
+
+        async with AsyncSessionFactory() as db:
+            await db.execute(select(ReportTaskGovernanceRow.id).limit(1))
+        return {"enabled": True, "status": "READY", "error_code": None}
+    except Exception as exc:
+        logger.warning(
+            "report_task_database_health stage=%s status=%s error_code=%s error_type=%s",
+            "report_task_governance.health",
+            "DEGRADED",
+            "REPORT_TASK_DATABASE_UNAVAILABLE",
+            type(exc).__name__,
+        )
+        return {
+            "enabled": True,
+            "status": "DEGRADED",
+            "error_code": "REPORT_TASK_DATABASE_UNAVAILABLE",
+        }
+
+
 def _load_project_env_files() -> None:
     """
     将 agent/backend 两侧 .env 注入到 os.environ。
@@ -83,6 +116,29 @@ async def lifespan(app: FastAPI):
             "memory.cache.bootstrap",
             "DEGRADED",
             "UNAVAILABLE",
+            type(exc).__name__,
+        )
+
+    # 报告 Redis 只承担派生快照和跨实例唤醒；不可达时 PostgreSQL 主链继续启动。
+    try:
+        from backend.infrastructure.report_tasks.runtime import (
+            initialize_report_task_runtime,
+        )
+
+        report_runtime = await initialize_report_task_runtime()
+        if report_runtime is None:
+            logger.info(
+                "report_task_runtime_disabled stage=%s status=%s",
+                "report.redis.bootstrap",
+                "SKIPPED",
+            )
+    except Exception as exc:
+        logger.warning(
+            "report_task_runtime_bootstrap_failed stage=%s status=%s "
+            "error_code=%s error_type=%s",
+            "report.redis.bootstrap",
+            "DEGRADED",
+            "REPORT_TASK_REDIS_UNAVAILABLE",
             type(exc).__name__,
         )
 
@@ -243,6 +299,21 @@ async def lifespan(app: FastAPI):
         print("[backend] semantic_index_worker 已停止")
         logger.info("[backend] semantic_index_worker 已停止")
     try:
+        from backend.infrastructure.report_tasks.runtime import (
+            close_report_task_runtime,
+        )
+
+        await close_report_task_runtime()
+    except Exception as exc:
+        logger.warning(
+            "report_task_runtime_close_failed stage=%s status=%s "
+            "error_code=%s error_type=%s",
+            "report.redis.close",
+            "DEGRADED",
+            "REPORT_TASK_REDIS_UNAVAILABLE",
+            type(exc).__name__,
+        )
+    try:
         from backend.infrastructure.memory.runtime import close_memory_cache
 
         await close_memory_cache()
@@ -288,8 +359,9 @@ app.include_router(portfolio.router, prefix="/api/portfolio", tags=["持仓管�
 
 @app.get("/api/health")
 async def health_check():
-    """返回应用与可选记忆缓存的安全健康摘要。"""
+    """返回应用、记忆缓存与报告观察运行时的安全健康摘要。"""
     from backend.infrastructure.memory.runtime import get_memory_cache
+    from backend.infrastructure.report_tasks.runtime import get_report_task_runtime
     from backend.application.memory.observability import memory_metrics
 
     cache = get_memory_cache()
@@ -298,11 +370,20 @@ async def health_check():
         if cache is not None
         else {"enabled": False, "status": "DISABLED", "error_code": None, "metrics": {}}
     )
+    report_runtime = get_report_task_runtime()
+    report_runtime_health = (
+        await report_runtime.health()
+        if report_runtime is not None
+        else {"enabled": False, "status": "DISABLED", "error_code": None, "metrics": {}}
+    )
+    report_database_health = await _report_task_database_health()
     return {
         "status": "ok",
         "version": settings.app_version,
         "components": {
             "memory_cache": cache_health,
             "memory_observability": {"status": "UP", "metrics": memory_metrics.snapshot()},
+            "report_task_database": report_database_health,
+            "report_task_redis": report_runtime_health,
         },
     }

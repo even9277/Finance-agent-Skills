@@ -23,7 +23,7 @@
 
 Live E2E 使用独立测试账号、固定少量只读问题和预算上限。真实写只允许测试租户；生产写、下单、持仓修改、报告发布永远禁止。
 
-当前受控对话与报告主链的本地 Live 入口各只运行一个固定案例。报告案例使用隔离 SQLite、临时执行目录和只读 Tushare toolkit，断言真实阶段、单调进度、数据库/SSE 终态、正文 hash 与脱敏 artifact；不会发布报告或修改外部数据。Windows 本机使用 SOCKS 代理时，必须通过 Python 模块入口让 uv 的临时依赖生效：
+当前受控对话与报告主链的本地 Live 入口各只运行固定案例。D05 报告阶段案例使用隔离 SQLite、临时执行目录和只读 Tushare toolkit，断言真实阶段、单调进度、数据库/SSE 终态、正文 hash 与脱敏 artifact。D06 报告治理案例使用显式确认的本机一次性 PostgreSQL、两个独立 FastAPI ASGI 应用和 20 个同键并发创建请求，断言一条 task/report、一位创建获胜者、19 次重放、一次真实 workflow、跨应用 REST/SSE 终态和正文 hash 一致。它不把两个 ASGI 应用夸大为两个 OS 进程；真正的 Nginx 双后端 + PostgreSQL + Redis 由默认零费用 Compose E2E 验证。所有 Live 都不会发布报告或修改外部数据，整份真实报告失败后禁止自动重跑。Windows 本机使用 SOCKS 代理时，必须通过 Python 模块入口让 uv 的临时依赖生效：
 
 ```powershell
 $env:RUN_PROTECTED_LIVE_E2E="true"
@@ -31,6 +31,11 @@ uv run --with socksio -- python -m pytest tests/e2e/test_live_controlled_chat_ch
 
 $env:RUN_PROTECTED_LIVE_REPORT_E2E="true"
 uv run --locked --with socksio python -m pytest tests/e2e/test_live_report_progress.py -q -m live
+
+$env:RUN_PROTECTED_LIVE_REPORT_GOVERNANCE_E2E="true"
+$env:D06_LIVE_INFRA_ACK="disposable"
+$env:D06_LIVE_DATABASE_URL="postgresql+asyncpg://d06_live:<password>@127.0.0.1:<port>/d06_live"
+uv run --locked --with socksio python -m pytest tests/e2e/test_live_report_task_governance.py -q -m live
 ```
 
 GitHub 端只允许手工触发 `.github/workflows/live-e2e.yml`，并由 `protected-live-e2e` Environment 提供 secrets。显式触发但配置缺失时测试必须失败，不能以 skip 伪装通过。

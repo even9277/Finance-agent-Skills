@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from backend.application.report_progress.contracts import ReportTaskStatus
+from backend.application.report_progress.contracts import ReportStageSnapshot, ReportTaskStatus
 
 REPORT_GENERATION_FAILED_CODE = "REPORT_GENERATION_FAILED"
 REPORT_GENERATION_FAILED_MESSAGE = "报告生成失败，请稍后重试"
@@ -21,6 +21,8 @@ class ReportProgressSnapshot:
     progress: int
     error_code: str | None
     message: str | None
+    snapshot_version: int = 1
+    stages: tuple[ReportStageSnapshot, ...] = ()
 
     @property
     def is_terminal(self) -> bool:
@@ -35,6 +37,8 @@ def project_report_snapshot(
     user_id: str | None,
     status: str,
     progress: int,
+    snapshot_version: int = 1,
+    stages: tuple[ReportStageSnapshot, ...] = (),
 ) -> ReportProgressSnapshot:
     """将数据库原始字段转换为安全、范围受限的任务快照。
 
@@ -44,6 +48,8 @@ def project_report_snapshot(
         user_id: 报告所属用户；历史未绑定记录允许为 ``None``。
         status: 数据库任务状态。
         progress: 数据库任务进度，输出会限制在 0～100。
+        snapshot_version: 治理表中的任务级单调快照版本；历史任务使用 1。
+        stages: 已持久化的低敏阶段状态。
 
     Returns:
         不包含报告正文或原始异常的权威快照。
@@ -62,4 +68,6 @@ def project_report_snapshot(
         progress=safe_progress,
         error_code=REPORT_GENERATION_FAILED_CODE if failed else None,
         message=REPORT_GENERATION_FAILED_MESSAGE if failed else None,
+        snapshot_version=max(1, snapshot_version),
+        stages=stages,
     )
