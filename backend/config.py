@@ -47,6 +47,7 @@ class Settings(BaseSettings):
     enable_redis_cache: bool = False  # 可丢弃的记忆热缓存；PostgreSQL 始终权威
     enable_report_task_governance: bool = True  # 报告创建由数据库唯一约束收敛
     enable_report_task_redis: bool = False  # 报告快照派生镜像；关闭时仍可由数据库恢复
+    enable_tool_runtime_redis: bool = False  # 对话工具熔断共享；故障时保留本地治理
     enable_chat_skills: bool = False  # Phase 1 skill-first chat
     enable_tushare_skills: bool = False  # Phase 1 tushare skill bundle
     enable_tushare_planner: bool = False
@@ -107,6 +108,15 @@ class Settings(BaseSettings):
     report_task_redis_namespace: str = "finance-agent-report"
     report_task_snapshot_ttl_sec: int = 900
     report_task_reconcile_sec: float = 15.0
+    # 对话工具运行时：限流政策在代码目录，熔断/退避阈值由 typed Settings 注入。
+    tool_runtime_redis_namespace: str = "finance-agent-tool-runtime"
+    tool_runtime_redis_ttl_sec: int = 600
+    tool_circuit_window_size: int = 100
+    tool_circuit_min_samples: int = 10
+    tool_circuit_failure_rate: float = 0.30
+    tool_circuit_open_ms: int = 300_000
+    tool_retry_base_delay_ms: int = 200
+    tool_retry_max_delay_ms: int = 2_000
 
     # ── Mem0 / pgvector 配置（Phase 3）────────────────────
     # PostgreSQL 连接（Mem0 向量库使用，SQLite 环境下这些配置被忽略）
@@ -269,6 +279,12 @@ class Settings(BaseSettings):
         "redis_max_connections",
         "report_idempotency_ttl_sec",
         "report_task_snapshot_ttl_sec",
+        "tool_runtime_redis_ttl_sec",
+        "tool_circuit_window_size",
+        "tool_circuit_min_samples",
+        "tool_circuit_open_ms",
+        "tool_retry_base_delay_ms",
+        "tool_retry_max_delay_ms",
         "embed_dims",
         "memory_semantic_timeout_sec",
         "memory_semantic_top_k",
@@ -348,7 +364,11 @@ class Settings(BaseSettings):
             raise ValueError("redis_url must use redis:// or rediss://")
         return normalized
 
-    @field_validator("redis_cache_namespace", "report_task_redis_namespace")
+    @field_validator(
+        "redis_cache_namespace",
+        "report_task_redis_namespace",
+        "tool_runtime_redis_namespace",
+    )
     @classmethod
     def _validate_redis_namespace(cls, value: str) -> str:
         """限制键空间前缀为可读且无空白的稳定标识。"""
@@ -356,6 +376,14 @@ class Settings(BaseSettings):
         if not normalized or any(character.isspace() for character in normalized):
             raise ValueError("Redis namespace must not be blank or contain spaces")
         return normalized
+
+    @field_validator("tool_circuit_failure_rate")
+    @classmethod
+    def _validate_tool_circuit_failure_rate(cls, value: float) -> float:
+        """限制熔断失败率阈值为有效概率。"""
+        if not 0 < value <= 1:
+            raise ValueError("tool_circuit_failure_rate must be in (0, 1]")
+        return value
 
     @model_validator(mode="after")
     def _validate_stm_worker_timing(self) -> Self:
@@ -386,6 +414,14 @@ class Settings(BaseSettings):
         )
         if overlap:
             raise ValueError("web news include and exclude domains must not overlap")
+        if self.tool_circuit_min_samples > self.tool_circuit_window_size:
+            raise ValueError(
+                "tool_circuit_min_samples must not exceed tool_circuit_window_size"
+            )
+        if self.tool_retry_base_delay_ms > self.tool_retry_max_delay_ms:
+            raise ValueError(
+                "tool_retry_base_delay_ms must not exceed tool_retry_max_delay_ms"
+            )
         return self
 
     model_config = {

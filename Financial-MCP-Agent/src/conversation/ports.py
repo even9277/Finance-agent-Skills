@@ -14,6 +14,9 @@ from .contracts import (
     SkillRerankResult,
     ToolCall,
     ToolObservation,
+    ToolPolicy,
+    ToolRuntimeLease,
+    ToolRuntimeOutcome,
     WorkflowEvent,
 )
 
@@ -34,6 +37,44 @@ class ToolPort(Protocol):
 
     async def execute(self, call: ToolCall) -> ToolObservation:
         """执行一个只读调用；瞬时超时应抛出 `ToolTimeoutError`。"""
+        ...
+
+
+class ToolRuntimePort(Protocol):
+    """隔离 Executor 与进程内/Redis 工具治理实现。"""
+
+    async def acquire(
+        self,
+        policy: ToolPolicy,
+        *,
+        trace_id: str,
+    ) -> ToolRuntimeLease:
+        """在真实 Provider 调用前取得接口族与熔断许可。"""
+        ...
+
+    async def release(
+        self,
+        lease: ToolRuntimeLease,
+        outcome: ToolRuntimeOutcome,
+    ) -> None:
+        """释放许可并按稳定结果类别更新熔断状态。"""
+        ...
+
+    async def wait_before_retry(
+        self,
+        *,
+        attempt: int,
+        retry_after_ms: int | None = None,
+    ) -> int:
+        """执行有界退避并返回实际计划等待毫秒数。"""
+        ...
+
+    async def health(self) -> dict[str, object]:
+        """返回不含请求载荷或外部地址的低敏运行状态。"""
+        ...
+
+    async def close(self) -> None:
+        """关闭可选共享资源；本地实现应为空操作。"""
         ...
 
 

@@ -15,15 +15,19 @@ from .contracts import (
     ToolCall,
     ToolObservation,
     ToolPlanStep,
+    ToolRuntimeLease,
+    ToolRuntimeOutcome,
     ValidatedToolPlan,
 )
 from .errors import (
     ContractViolationError,
+    ToolCircuitOpenError,
     ToolPermanentError,
+    ToolRateLimitError,
     ToolTimeoutError,
     ToolTransientError,
 )
-from .ports import ToolPort
+from .ports import ToolPort, ToolRuntimePort
 from .progress import (
     ConversationProgressObserver,
     ProgressStepStatus,
@@ -37,8 +41,9 @@ from .progress import (
 class ControlledExecutor:
     """按冻结权限和 DAG 层执行只读工具，不接受原始 ToolPlan。"""
 
-    def __init__(self, tool: ToolPort) -> None:
+    def __init__(self, tool: ToolPort, *, runtime: ToolRuntimePort | None = None) -> None:
         self._tool = tool
+        self._runtime = runtime
 
     async def execute(
         self,
@@ -202,69 +207,105 @@ class ControlledExecutor:
         )
         calls = 0
         for attempt in range(1, max_attempts + 1):
-            calls += 1
             tool_call_id = f"{validated.plan.plan_id}:{step.step_id}:attempt-{attempt}"
             tool_started = time.perf_counter()
             failure: ToolObservation | None = None
             retryable_failure = False
+            retry_after_ms: int | None = None
+            lease: ToolRuntimeLease | None = None
+            runtime_outcome = ToolRuntimeOutcome.CANCELLED
 
-            # STARTED 紧贴真实 ToolPort 调用；仅捕获 Provider 调用本身的异常，
-            # 观察器的背压、失败和取消必须越过 Executor 传播到事务边界。
+            # 请求级和接口族级许可都必须在真实调用前取得；熔断拒绝不能伪造 STARTED。
             await semaphore.acquire()
             try:
-                await emit_progress(
-                    progress_observer,
-                    ToolStatusProgress(
-                        plan_id=validated.plan.plan_id,
-                        revision=plan_revision,
-                        tool_call_id=tool_call_id,
-                        step_id=step.step_id,
-                        tool_name=step.tool_name,
-                        symbol=step.symbol,
-                        evidence_dimension=step.evidence_dimension,
-                        arguments=step.arguments,
-                        status=ProgressToolStatus.STARTED,
-                        attempt=attempt,
-                    ),
-                )
                 try:
-                    observation = await asyncio.wait_for(
-                        self._tool.execute(call),
-                        timeout=max(0.001, context.budget.per_tool_timeout_ms / 1000),
-                    )
-                except (ToolTimeoutError, TimeoutError):
+                    if self._runtime is not None:
+                        lease = await self._runtime.acquire(
+                            policy,
+                            trace_id=context.trace_id,
+                        )
+                except ToolCircuitOpenError:
                     failure = self._failure_observation(
                         step,
-                        attempts=attempt,
-                        error_code=ErrorCode.TOOL_TIMEOUT,
-                        message="只读工具在调用预算内超时。",
+                        attempts=calls,
+                        error_code=ErrorCode.TOOL_CIRCUIT_OPEN,
+                        message="只读工具熔断中，本步骤已快速失败。",
                     )
-                    retryable_failure = True
-                except ToolTransientError:
-                    failure = self._failure_observation(
-                        step,
-                        attempts=attempt,
-                        error_code=ErrorCode.TOOL_TRANSIENT_FAILURE,
-                        message="只读工具的瞬时故障在重试预算内未恢复。",
+                if failure is None:
+                    # STARTED 紧贴真实 ToolPort 调用；观察器失败和取消继续越过事务边界。
+                    calls += 1
+                    await emit_progress(
+                        progress_observer,
+                        ToolStatusProgress(
+                            plan_id=validated.plan.plan_id,
+                            revision=plan_revision,
+                            tool_call_id=tool_call_id,
+                            step_id=step.step_id,
+                            tool_name=step.tool_name,
+                            symbol=step.symbol,
+                            evidence_dimension=step.evidence_dimension,
+                            arguments=step.arguments,
+                            status=ProgressToolStatus.STARTED,
+                            attempt=attempt,
+                        ),
                     )
-                    retryable_failure = True
-                except ToolPermanentError:
-                    failure = self._failure_observation(
-                        step,
-                        attempts=attempt,
-                        error_code=ErrorCode.TOOL_EXECUTION_FAILED,
-                        message="只读工具返回不可重试失败。",
-                    )
-                except Exception:
-                    # 未知 Provider 异常只保留稳定错误码，不进入状态或公开进度。
-                    failure = self._failure_observation(
-                        step,
-                        attempts=attempt,
-                        error_code=ErrorCode.TOOL_EXECUTION_FAILED,
-                        message="只读工具执行失败。",
-                    )
+                    try:
+                        observation = await asyncio.wait_for(
+                            self._tool.execute(call),
+                            timeout=max(0.001, context.budget.per_tool_timeout_ms / 1000),
+                        )
+                        runtime_outcome = ToolRuntimeOutcome.SUCCESS
+                    except (ToolTimeoutError, TimeoutError):
+                        runtime_outcome = ToolRuntimeOutcome.TRANSIENT_FAILURE
+                        failure = self._failure_observation(
+                            step,
+                            attempts=attempt,
+                            error_code=ErrorCode.TOOL_TIMEOUT,
+                            message="只读工具在调用预算内超时。",
+                        )
+                        retryable_failure = True
+                    except ToolRateLimitError as exc:
+                        runtime_outcome = ToolRuntimeOutcome.TRANSIENT_FAILURE
+                        retry_after_ms = exc.retry_after_ms
+                        failure = self._failure_observation(
+                            step,
+                            attempts=attempt,
+                            error_code=ErrorCode.TOOL_RATE_LIMITED,
+                            message="只读工具受到接口频率限制。",
+                        )
+                        retryable_failure = True
+                    except ToolTransientError:
+                        runtime_outcome = ToolRuntimeOutcome.TRANSIENT_FAILURE
+                        failure = self._failure_observation(
+                            step,
+                            attempts=attempt,
+                            error_code=ErrorCode.TOOL_TRANSIENT_FAILURE,
+                            message="只读工具的瞬时故障在重试预算内未恢复。",
+                        )
+                        retryable_failure = True
+                    except ToolPermanentError:
+                        runtime_outcome = ToolRuntimeOutcome.PERMANENT_FAILURE
+                        failure = self._failure_observation(
+                            step,
+                            attempts=attempt,
+                            error_code=ErrorCode.TOOL_EXECUTION_FAILED,
+                            message="只读工具返回不可重试失败。",
+                        )
+                    except Exception:
+                        runtime_outcome = ToolRuntimeOutcome.PERMANENT_FAILURE
+                        # 未知 Provider 异常只保留稳定错误码，不进入状态或公开进度。
+                        failure = self._failure_observation(
+                            step,
+                            attempts=attempt,
+                            error_code=ErrorCode.TOOL_EXECUTION_FAILED,
+                            message="只读工具执行失败。",
+                        )
             finally:
-                semaphore.release()
+                try:
+                    if self._runtime is not None and lease is not None:
+                        await self._runtime.release(lease, runtime_outcome)
+                finally:
+                    semaphore.release()
 
             if failure is not None:
                 await self._emit_attempt_failure(
@@ -278,6 +319,11 @@ class ControlledExecutor:
                     plan_revision=plan_revision,
                 )
                 if retryable_failure and attempt < max_attempts:
+                    if self._runtime is not None:
+                        await self._runtime.wait_before_retry(
+                            attempt=attempt,
+                            retry_after_ms=retry_after_ms,
+                        )
                     continue
                 await self._emit_step_failure(
                     validated,

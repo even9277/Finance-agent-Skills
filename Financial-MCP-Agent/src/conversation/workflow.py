@@ -65,7 +65,7 @@ from .errors import ModelSynthesisError, StepBudgetExceededError
 from .execution import ControlledExecutor
 from .permissions import ControlledPermissionResolver
 from .planning import ControlledPlanner
-from .ports import ModelPort, SkillRerankerPort, ToolPort, TraceSink
+from .ports import ModelPort, SkillRerankerPort, ToolPort, ToolRuntimePort, TraceSink
 from .progress import (
     ConversationProgressObserver,
     PlanPreviewProgress,
@@ -292,6 +292,7 @@ class ControlledConversationWorkflow:
         skill_loader: SkillLoader | None = None,
         skill_reranker: SkillRerankerPort | None = None,
         skill_rerank_top_k: int | None = None,
+        tool_runtime: ToolRuntimePort | None = None,
     ) -> None:
         self._trace = trace
         self._budget = budget or RunBudget()
@@ -314,7 +315,7 @@ class ControlledConversationWorkflow:
             ),
             planner=ControlledPlanner(catalog=tool_catalog),
             validator=PlanValidator(),
-            executor=ControlledExecutor(tool),
+            executor=ControlledExecutor(tool, runtime=tool_runtime),
             verifier=EvidenceVerifier(),
             controller=RuleController(),
             replanner=BoundedEvidenceReplanner(catalog=tool_catalog),

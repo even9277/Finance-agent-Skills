@@ -24,6 +24,7 @@ from src.conversation.contracts import (
 from src.conversation.errors import (
     ModelSynthesisError,
     ToolPermanentError,
+    ToolRateLimitError,
     ToolTimeoutError,
     ToolTransientError,
 )
@@ -146,6 +147,8 @@ class TushareToolProvider:
             if "timeout" in error or "timed out" in error:
                 raise ToolTimeoutError("tushare tool timeout")
             if "rate" in error or "tempor" in error or "频率" in error:
+                if "rate" in error or "频率" in error:
+                    raise ToolRateLimitError("tushare tool rate limited")
                 raise ToolTransientError("tushare tool transient failure")
             raise ToolPermanentError("tushare tool execution failed")
 

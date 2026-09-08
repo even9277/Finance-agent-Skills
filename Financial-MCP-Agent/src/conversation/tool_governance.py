@@ -41,8 +41,10 @@ def _policy(
     dimension: EvidenceDimension,
     entity_types: tuple[EntityType, ...],
     *fields: ToolInputSpec,
-    api_family: str = "tushare-read",
+    api_family: str = "tushare-market",
     retryable: bool = True,
+    family_max_concurrency: int = 2,
+    min_interval_ms: int = 150,
 ) -> ToolPolicy:
     """构造显式 API 族和重试语义的只读工具政策。"""
     return ToolPolicy(
@@ -52,6 +54,8 @@ def _policy(
         input_fields=tuple(fields),
         api_family=api_family,
         retryable=retryable,
+        family_max_concurrency=family_max_concurrency,
+        min_interval_ms=min_interval_ms,
     )
 
 
@@ -86,6 +90,9 @@ _DEFAULT_POLICIES = (
         _SYMBOL,
         _QUERY,
         _LIMIT,
+        api_family="tushare-financial",
+        family_max_concurrency=1,
+        min_interval_ms=250,
     ),
     _policy(
         "get_income",
@@ -94,6 +101,9 @@ _DEFAULT_POLICIES = (
         _SYMBOL,
         _QUERY,
         _LIMIT,
+        api_family="tushare-financial",
+        family_max_concurrency=1,
+        min_interval_ms=250,
     ),
     _policy(
         "get_balance_sheet",
@@ -102,6 +112,9 @@ _DEFAULT_POLICIES = (
         _SYMBOL,
         _QUERY,
         _LIMIT,
+        api_family="tushare-financial",
+        family_max_concurrency=1,
+        min_interval_ms=250,
     ),
     _policy(
         "get_cashflow",
@@ -110,6 +123,9 @@ _DEFAULT_POLICIES = (
         _SYMBOL,
         _QUERY,
         _LIMIT,
+        api_family="tushare-financial",
+        family_max_concurrency=1,
+        min_interval_ms=250,
     ),
     _policy(
         "get_index_bars",
@@ -118,6 +134,7 @@ _DEFAULT_POLICIES = (
         _SYMBOL,
         _QUERY,
         _LIMIT,
+        api_family="tushare-index-sector",
     ),
     _policy(
         "get_sector_snapshot",
@@ -125,6 +142,7 @@ _DEFAULT_POLICIES = (
         (EntityType.SECTOR,),
         _QUERY,
         _SECTOR_NAME,
+        api_family="tushare-index-sector",
     ),
     _policy(
         "get_sector_constituents",
@@ -133,6 +151,7 @@ _DEFAULT_POLICIES = (
         _QUERY,
         _SECTOR_NAME,
         _LIMIT,
+        api_family="tushare-index-sector",
     ),
     _policy(
         "get_fund_basic_info",
@@ -141,6 +160,9 @@ _DEFAULT_POLICIES = (
         _SYMBOL,
         _QUERY,
         _LIMIT,
+        api_family="tushare-fund",
+        family_max_concurrency=1,
+        min_interval_ms=200,
     ),
     _policy(
         "get_etf_basic_info",
@@ -149,6 +171,9 @@ _DEFAULT_POLICIES = (
         _SYMBOL,
         _QUERY,
         _LIMIT,
+        api_family="tushare-fund",
+        family_max_concurrency=1,
+        min_interval_ms=200,
     ),
     _policy(
         "get_fund_nav",
@@ -157,6 +182,9 @@ _DEFAULT_POLICIES = (
         _SYMBOL,
         _QUERY,
         _LIMIT,
+        api_family="tushare-fund",
+        family_max_concurrency=1,
+        min_interval_ms=200,
     ),
     _policy(
         "get_fund_market_bars",
@@ -165,6 +193,9 @@ _DEFAULT_POLICIES = (
         _SYMBOL,
         _QUERY,
         _LIMIT,
+        api_family="tushare-fund",
+        family_max_concurrency=1,
+        min_interval_ms=200,
     ),
     _policy(
         "get_fund_share",
@@ -173,6 +204,9 @@ _DEFAULT_POLICIES = (
         _SYMBOL,
         _QUERY,
         _LIMIT,
+        api_family="tushare-fund",
+        family_max_concurrency=1,
+        min_interval_ms=200,
     ),
     _policy(
         "search_web_news",
@@ -182,6 +216,8 @@ _DEFAULT_POLICIES = (
         _MAX_RESULTS,
         _FRESHNESS_DAYS,
         api_family="web-search-read",
+        family_max_concurrency=1,
+        min_interval_ms=1_000,
     ),
 )
 
@@ -191,7 +227,7 @@ class ToolGovernanceCatalog:
     """保存版本化只读工具政策，不持有 SDK、凭证或可执行 handler。"""
 
     policies: tuple[ToolPolicy, ...]
-    version: str = "controlled-read-tools-v2"
+    version: str = "controlled-read-tools-v3"
 
     def __post_init__(self) -> None:
         names = tuple(item.tool_name for item in self.policies)

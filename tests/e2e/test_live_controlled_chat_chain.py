@@ -34,6 +34,9 @@ from backend.infrastructure.chat.providers import (  # noqa: E402
     TushareToolProvider,
 )
 from backend.infrastructure.chat.testing import FakeToolProvider  # noqa: E402
+from backend.infrastructure.chat.tool_runtime import (  # noqa: E402
+    set_tool_runtime_for_testing,
+)
 from backend.routers import chat as chat_router  # noqa: E402
 from src.conversation.contracts import (  # noqa: E402
     ModelSynthesisChunk,
@@ -221,6 +224,9 @@ def test_live_websocket_streams_real_model_and_controlled_evidence(
 ) -> None:
     """验证真实模型流、受控工具证据、协议顺序、落库与脱敏 Trace。"""
     _require_protected_live_configuration()
+    # 参数化案例各自创建 TestClient 事件循环，不能复用上一个案例的异步锁。
+    set_tool_runtime_for_testing(None)
+    request.addfinalizer(lambda: set_tool_runtime_for_testing(None))
 
     database_path = tmp_path / f"{case.test_id}.db"
     trace_path = tmp_path / f"{case.test_id}-trace.jsonl"
