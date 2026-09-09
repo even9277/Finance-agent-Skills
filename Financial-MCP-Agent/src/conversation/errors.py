@@ -47,5 +47,43 @@ class ModelSynthesisError(ConversationError, RuntimeError):
     """模型增量生成失败；该技术异常必须越过业务终态并触发事务回滚。"""
 
 
+class EntityResolutionError(ConversationError, RuntimeError):
+    """实体解析外部边界无法完成受控候选或目录校验。"""
+
+
+class EntityModelUnavailableError(EntityResolutionError):
+    """实体模型超时、限流或不可用，且不得泄露供应商异常原文。"""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        model_calls: int = 0,
+        repair_count: int = 0,
+    ) -> None:
+        super().__init__(message)
+        self.model_calls = model_calls
+        self.repair_count = repair_count
+
+
+class EntityModelContractError(EntityResolutionError):
+    """实体模型在有界语法修复后仍不满足严格输出合同。"""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        model_calls: int = 0,
+        repair_count: int = 0,
+    ) -> None:
+        super().__init__(message)
+        self.model_calls = model_calls
+        self.repair_count = repair_count
+
+
+class EntityCatalogUnavailableError(EntityResolutionError):
+    """权威实体目录不可用，长尾候选不得绕过校验。"""
+
+
 class PersistenceError(ConversationError, RuntimeError):
     """应用层无法原子保存本轮最终结果。"""

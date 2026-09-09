@@ -1,8 +1,8 @@
 """
 Agent 服务层
 封装对 Financial-MCP-Agent 工作流的调用，供 FastAPI 后台任务使用。
-原有 CLI 入口（Financial-MCP-Agent/src/main.py）不作任何改动，
-本模块通过 sys.path 注入后直接 import 复用 agent 代码。
+本模块通过 sys.path 注入后直接 import 复用 agent 代码；报告与 CLI 的实体解析
+统一调用共享 async Resolver，避免入口各自维护规则。
 
 注意事项：
 - ExecutionLogger 内部使用全局单例，并发报告生成时每个任务独立创建实例并单独 finalize，
@@ -10,7 +10,6 @@ Agent 服务层
 - 工作流编译一次后复用（_COMPILED_WORKFLOW），线程安全（StateGraph.compile() 返回不可变图）。
 """
 
-import re
 import sys
 from collections.abc import Mapping
 from dataclasses import replace
@@ -187,65 +186,10 @@ def _get_workflow():
     return _COMPILED_WORKFLOW
 
 
-# ─────────────────────────────────────────────────────────────
-# P1 修复：统一复用 stock_resolver 股票解析入口
-# ─────────────────────────────────────────────────────────────
-# 注意：保留旧的 extract_stock_info() 作为向后兼容的同步接口（仅走 L1 正则）
-# 新增 resolve_stock 异步接口；具体解析策略由 stock_resolver 统一维护
-from backend.services.stock_resolver import resolve_stock  # noqa: E402
-
-
-def extract_stock_info(query: str) -> tuple[str | None, str | None]:
-    """
-    【已废弃】仅保留用于向后兼容。
-    从自然语言查询中提取公司名称和股票代码（仅正则，不做 BaoStock 反查/LLM 兜底）。
-    
-    新代码请使用 resolve_stock(query) 异步接口，避免复制解析策略。
-    """
-    company_name = None
-    stock_code = None
-
-    patterns_with_both = [
-        r'请帮我分析一下\s*([^（(]+?)\s*[（(](\d{5,6})[)）]',
-        r'分析一下\s*([^（(]+?)\s*[（(](\d{5,6})[)）]',
-        r'分析\s*([^（(]+?)\s*[（(](\d{5,6})[)）]',
-        r'我想了解一下\s*([^（(]+?)\s*[（(](\d{5,6})[)）]',
-        r'帮我看看\s*([^（(]+?)\s*[（(](\d{5,6})[)）]',
-        r'^([^（(]+?)\s*[（(](\d{5,6})[)）]',
-    ]
-    for pattern in patterns_with_both:
-        m = re.search(pattern, query)
-        if m:
-            company_name, stock_code = m.group(1).strip(), m.group(2)
-            break
-
-    if not stock_code:
-        m = re.search(r'\b(\d{5,6})\b', query)
-        if m:
-            stock_code = m.group(1)
-
-    if not company_name:
-        for pattern in [
-            r'分析一下\s*([^0-9（）()\s]+?)(?:\s*的|\s|$)',
-            r'分析\s*([^0-9（）()\s]+)',
-            r'([^0-9（）()\s]+)\s*(?:这只|这个|的)?\s*股票',
-            r'了解一下\s*([^0-9（）()\s]+?)(?:\s*的|\s|$)',
-            r'给我分析一下\s*([^0-9（）()\s]+?)(?:\s*的|\s|$)',
-        ]:
-            m = re.search(pattern, query)
-            if m:
-                company_name = m.group(1).strip()
-                break
-
-    if company_name:
-        stop_words = ['的', '这个', '这只', '一下', '看看', '了解', '分析',
-                      '帮我', '我想', '给我', '财务状况', '投资价值', '基本面']
-        for w in stop_words:
-            company_name = company_name.replace(w, '').strip()
-        if len(company_name) < 2:
-            company_name = None
-
-    return company_name, stock_code
+from backend.services.stock_resolver import (  # noqa: E402
+    ReportEntityResolutionError,
+    resolve_stock,
+)
 
 
 async def _build_initial_state(user_query: str, user_id: str = "") -> AgentState:
@@ -257,6 +201,8 @@ async def _build_initial_state(user_query: str, user_id: str = "") -> AgentState
     """
     # P1: 复用统一解析服务，具体策略由 stock_resolver 所有。
     company_name, stock_code = await resolve_stock(user_query)
+    if not company_name or not stock_code:
+        raise ReportEntityResolutionError("report requires one confirmed stock entity")
     now = datetime.now()
 
     data: dict[str, Any] = {

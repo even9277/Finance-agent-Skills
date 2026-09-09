@@ -125,6 +125,11 @@ def test_production_factory_uses_process_registry_for_cross_request_lkg() -> Non
         ),
         patch.object(
             chat_factory,
+            "get_entity_resolver",
+            side_effect=(None, None),
+        ),
+        patch.object(
+            chat_factory,
             "build_read_only_tool_provider",
             side_effect=(FakeToolProvider(), FakeToolProvider()),
         ),

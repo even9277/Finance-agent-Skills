@@ -81,6 +81,16 @@ def test_workflow_events_form_one_trace_with_stable_stage_spans(
         ]
         assert spans[-1]["stage"] == "termination"
         assert all(item["name"].startswith("controlled_chat.") for item in spans)
+        entity_span = next(item for item in spans if item["stage"] == "entity_resolution")
+        entity_attributes = entity_span["data"]["attributes"]
+        assert entity_attributes == {
+            "candidate_count": 1,
+            "confidence": 1.0,
+            "resolver_path": "explicit_code",
+            "model_calls": 0,
+            "repair_count": 0,
+            "catalog_status": "local",
+        }
         assert {item["trace_id"] for item in records} == {outcome.context.trace_id}
         assert {item["run_id"] for item in records} == {outcome.context.run_id}
         assert {item["session_id"] for item in records} == {"session-trace"}

@@ -94,7 +94,7 @@ def test_metadata_retriever_routes_five_skills_with_explainable_candidates(
     """五类代表性请求必须稳定高置信命中，并保留候选解释。"""
     registry = SkillRegistry()
     packet = ContextPacket(current_message=query)
-    entities = AuthoritativeEntityResolver().resolve(packet)
+    entities = asyncio.run(AuthoritativeEntityResolver().resolve(packet))
 
     match = SkillDiscovery(registry.conversation_snapshot()).discover(
         query,
@@ -123,7 +123,7 @@ def test_missing_subject_queries_reach_skill_input_contract(
     """缺槽位请求也应先发现目标 Skill，再由 input contract 给出专属澄清。"""
     registry = SkillRegistry()
     packet = ContextPacket(current_message=query)
-    entities = AuthoritativeEntityResolver().resolve(packet)
+    entities = asyncio.run(AuthoritativeEntityResolver().resolve(packet))
 
     decision = TwoStageRouter(registry.conversation_snapshot()).route(packet, entities)
 

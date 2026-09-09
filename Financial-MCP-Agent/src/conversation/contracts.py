@@ -89,6 +89,11 @@ class ErrorCode(StrEnum):
     INVALID_REQUEST = "INVALID_REQUEST"
     AMBIGUOUS_ENTITY = "AMBIGUOUS_ENTITY"
     ENTITY_REQUIRED = "ENTITY_REQUIRED"
+    ENTITY_NOT_FOUND = "ENTITY_NOT_FOUND"
+    ENTITY_CONFLICT = "ENTITY_CONFLICT"
+    ENTITY_CATALOG_UNAVAILABLE = "ENTITY_CATALOG_UNAVAILABLE"
+    ENTITY_MODEL_UNAVAILABLE = "ENTITY_MODEL_UNAVAILABLE"
+    ENTITY_MODEL_CONTRACT_INVALID = "ENTITY_MODEL_CONTRACT_INVALID"
     ROUTE_CONFIRMATION_REQUIRED = "ROUTE_CONFIRMATION_REQUIRED"
     REWRITE_CLARIFICATION_REQUIRED = "REWRITE_CLARIFICATION_REQUIRED"
     TOOL_TIMEOUT = "TOOL_TIMEOUT"
@@ -113,6 +118,31 @@ class EntityType(StrEnum):
     FUND = "fund"
     SECTOR = "sector"
     INDEX = "index"
+
+
+class EntityResolverPath(StrEnum):
+    """实体结果所走的唯一、低基数解析路径。"""
+
+    EXPLICIT_CODE = "explicit_code"
+    EXACT_NAME = "exact_name"
+    ALIAS = "alias"
+    FUZZY = "fuzzy"
+    INHERITED = "inherited"
+    ENTITYLESS = "entityless"
+    MODEL_FALLBACK = "model_fallback"
+    AMBIGUOUS = "ambiguous"
+    CONFLICT = "conflict"
+    UNRESOLVED = "unresolved"
+
+
+class EntityCatalogStatus(StrEnum):
+    """权威目录对最终实体候选的校验状态。"""
+
+    NOT_REQUIRED = "not_required"
+    LOCAL = "local"
+    VERIFIED = "verified"
+    NOT_FOUND = "not_found"
+    UNAVAILABLE = "unavailable"
 
 
 class RouteFamily(StrEnum):
@@ -433,6 +463,41 @@ class Entity:
 
 
 @dataclass(frozen=True, slots=True)
+class EntityModelRequest:
+    """传给实体模型 Adapter 的最小化、供应商无关请求。
+
+    Attributes:
+        message: 当前轮自然语言，不包含历史、记忆、Skill 或工具载荷。
+        allowed_types: 模型允许提出的有限实体类型。
+    """
+
+    message: str
+    allowed_types: tuple[EntityType, ...] = tuple(EntityType)
+
+    def __post_init__(self) -> None:
+        if not self.message.strip():
+            raise ContractViolationError("entity model message must not be blank")
+
+
+@dataclass(frozen=True, slots=True)
+class EntityModelResolution:
+    """模型 Adapter 完成结构校验后返回的候选与调用预算。"""
+
+    candidates: tuple[Entity, ...]
+    confidence: float
+    model_calls: int
+    repair_count: int
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.confidence <= 1.0:
+            raise ContractViolationError("entity model confidence is outside [0, 1]")
+        if self.model_calls < 1 or self.model_calls > 2:
+            raise ContractViolationError("entity model calls must be within the frozen budget")
+        if self.repair_count not in {0, 1} or self.repair_count >= self.model_calls:
+            raise ContractViolationError("entity model repair count is invalid")
+
+
+@dataclass(frozen=True, slots=True)
 class EntityResolutionResult:
     """实体解析结果；歧义时不选择主实体。"""
 
@@ -443,6 +508,10 @@ class EntityResolutionResult:
     resolved_entities: tuple[Entity, ...] = ()
     clarification: str | None = None
     error_code: ErrorCode | None = None
+    resolver_path: EntityResolverPath = EntityResolverPath.UNRESOLVED
+    model_calls: int = 0
+    repair_count: int = 0
+    catalog_status: EntityCatalogStatus = EntityCatalogStatus.NOT_REQUIRED
 
 
 @dataclass(frozen=True, slots=True)

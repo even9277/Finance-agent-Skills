@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 import sys
 
@@ -29,7 +30,7 @@ def test_route_eval_executes_two_stage_router() -> None:
             current_message=str(turns[-1]["content"]),
             recent_messages=tuple(str(turn["content"]) for turn in turns[:-1]),
         )
-        decision = router.route(packet, resolver.resolve(packet))
+        decision = router.route(packet, asyncio.run(resolver.resolve(packet)))
         assert decision.family.value == row["gold"]["final_route"], row["case_id"]
         assert decision.skill_name == row["gold"].get("skill_id"), row["case_id"]
         assert decision.confidence >= 0.85 or decision.family.value == "fallback"
