@@ -8,6 +8,7 @@ from backend.infrastructure.chat.providers import (
     OpenAICompatibleModelProvider,
     build_read_only_tool_provider,
 )
+from backend.infrastructure.chat.entity_resolution import get_entity_resolver
 from backend.infrastructure.chat.repository import SqlAlchemyConversationRepository
 from backend.infrastructure.chat.trace import SkillTraceSink
 from backend.infrastructure.chat.tool_runtime import get_tool_runtime
@@ -42,6 +43,7 @@ def build_chat_use_case(db: AsyncSession) -> ControlledChatUseCase:
         skill_reranker=build_skill_reranker(),
         skill_rerank_top_k=settings.skill_rerank_top_k,
         tool_runtime=get_tool_runtime(),
+        entity_resolver=get_entity_resolver(),
     )
     retrieval = None
     if settings.enable_memory:

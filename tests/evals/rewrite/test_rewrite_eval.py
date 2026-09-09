@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 import sys
 
@@ -32,7 +33,7 @@ def test_rewrite_eval_executes_route_specific_rewriters() -> None:
             current_message=str(turns[-1]["content"]),
             recent_messages=tuple(str(turn["content"]) for turn in turns[:-1]),
         )
-        entities = resolver.resolve(packet)
+        entities = asyncio.run(resolver.resolve(packet))
         route = router.route(packet, entities)
         result = rewriter.rewrite(packet, entities, route)
         gold = row["gold"]

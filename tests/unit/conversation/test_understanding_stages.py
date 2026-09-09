@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 
@@ -30,7 +31,7 @@ from src.skills.skill_registry import SkillRegistry  # noqa: E402
 def test_router_never_replaces_authoritative_entity() -> None:
     """确认 Router 只选择能力链，不重新猜测或覆盖实体。"""
     packet = ContextPacket(current_message="贵州茅台 600519.SH 现在还能买吗")
-    entities = AuthoritativeEntityResolver().resolve(packet)
+    entities = asyncio.run(AuthoritativeEntityResolver().resolve(packet))
     before = entities.entity
 
     decision = TwoStageRouter(SkillRegistry().conversation_snapshot()).route(packet, entities)
@@ -45,7 +46,7 @@ def test_router_never_replaces_authoritative_entity() -> None:
 def test_low_confidence_sop_match_requires_confirmation() -> None:
     """确认弱 SOP 命中不会直接进入工具阶段。"""
     packet = ContextPacket(current_message="分析一下贵州茅台 600519.SH")
-    entities = AuthoritativeEntityResolver().resolve(packet)
+    entities = asyncio.run(AuthoritativeEntityResolver().resolve(packet))
 
     decision = TwoStageRouter(SkillRegistry().conversation_snapshot()).route(packet, entities)
 

@@ -91,6 +91,7 @@ class _Workflow:
     def __init__(self, events: list[dict[str, object]], failure: Exception | None = None) -> None:
         self._events = events
         self._failure = failure
+        self.started = False
 
     async def astream_events(
         self,
@@ -99,6 +100,7 @@ class _Workflow:
         version: str,
     ) -> Any:
         assert version == "v2"
+        self.started = True
         for event in self._events:
             yield event
         if self._failure is not None:
@@ -137,6 +139,7 @@ def _run_with(
     commits: list[dict[str, object]],
     recorder: _Recorder,
     initial_state: dict[str, object] | None = None,
+    initial_state_error: Exception | None = None,
     command: str = "离线固定指令",
 ) -> Mock:
     """在隔离端口中运行报告服务并返回 finalize mock。"""
@@ -158,7 +161,10 @@ def _run_with(
         patch.object(
             agent_service,
             "_build_initial_state",
-            new=AsyncMock(return_value=effective_initial_state),
+            new=AsyncMock(
+                return_value=effective_initial_state,
+                side_effect=initial_state_error,
+            ),
         ),
         patch.object(agent_service, "_get_workflow", return_value=workflow),
         patch.object(agent_service, "initialize_execution_logger", return_value=execution),
@@ -177,6 +183,27 @@ def _run_with(
             )
         )
     return finalize
+
+
+@pytest.mark.unit
+def test_report_does_not_start_agents_after_entity_resolution_failure() -> None:
+    """实体未确认时报告必须在四 Agent fan-out 前失败。"""
+    workflow = _Workflow([])
+    report = _report()
+    commits: list[dict[str, object]] = []
+    recorder = _Recorder(report)
+
+    finalize = _run_with(
+        workflow,
+        report=report,
+        commits=commits,
+        recorder=recorder,
+        initial_state_error=RuntimeError("ENTITY_NOT_FOUND"),
+    )
+
+    assert workflow.started is False
+    assert report.status == "failed"
+    assert finalize.call_args.kwargs["success"] is False
 
 
 @pytest.mark.unit

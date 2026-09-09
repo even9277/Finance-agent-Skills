@@ -33,6 +33,7 @@ from backend.infrastructure.chat.providers import (  # noqa: E402
     OpenAICompatibleModelProvider,
     TushareToolProvider,
 )
+from backend.infrastructure.chat.entity_resolution import get_entity_resolver  # noqa: E402
 from backend.infrastructure.chat.testing import FakeToolProvider  # noqa: E402
 from backend.infrastructure.chat.tool_runtime import (  # noqa: E402
     set_tool_runtime_for_testing,
@@ -58,6 +59,8 @@ class _LiveCase:
     test_id: str
     question: str
     use_real_tushare: bool
+    expected_symbol: str
+    expected_resolver_path: str
 
 
 _LIVE_CASES = (
@@ -65,11 +68,22 @@ _LIVE_CASES = (
         test_id="d03-live-01",
         question="查询贵州茅台 600519.SH 的基础信息和近期行情，并说明估值分析应关注什么。",
         use_real_tushare=False,
+        expected_symbol="600519.SH",
+        expected_resolver_path="explicit_code",
     ),
     _LiveCase(
         test_id="d03-live-02",
         question="查询贵州茅台 600519.SH 的基础信息、近期行情和核心财务指标，给出审慎结论。",
         use_real_tushare=True,
+        expected_symbol="600519.SH",
+        expected_resolver_path="explicit_code",
+    ),
+    _LiveCase(
+        test_id="d09-live-01",
+        question="请分析隆基绿能近期行情和核心财务指标，并给出审慎结论。",
+        use_real_tushare=True,
+        expected_symbol="601012.SH",
+        expected_resolver_path="model_fallback",
     ),
 )
 
@@ -226,7 +240,9 @@ def test_live_websocket_streams_real_model_and_controlled_evidence(
     _require_protected_live_configuration()
     # 参数化案例各自创建 TestClient 事件循环，不能复用上一个案例的异步锁。
     set_tool_runtime_for_testing(None)
+    get_entity_resolver.cache_clear()
     request.addfinalizer(lambda: set_tool_runtime_for_testing(None))
+    request.addfinalizer(get_entity_resolver.cache_clear)
 
     database_path = tmp_path / f"{case.test_id}.db"
     trace_path = tmp_path / f"{case.test_id}-trace.jsonl"
@@ -321,7 +337,7 @@ def test_live_websocket_streams_real_model_and_controlled_evidence(
     assert persisted[1].content == reply
 
     assert observations
-    assert {item.symbol for item in observations} == {"600519.SH"}
+    assert {item.symbol for item in observations} == {case.expected_symbol}
     expected_source_prefix = "tushare:" if case.use_real_tushare else "fixture:"
     assert all(item.source.startswith(expected_source_prefix) for item in observations)
 
@@ -357,6 +373,17 @@ def test_live_websocket_streams_real_model_and_controlled_evidence(
     span_stages = [
         item.get("stage") for item in workflow_records if item.get("record_type") == "span"
     ]
+    entity_spans = [
+        item
+        for item in workflow_records
+        if item.get("record_type") == "span" and item.get("stage") == "entity_resolution"
+    ]
+    assert len(entity_spans) == 1
+    entity_attributes = entity_spans[0]["data"]["attributes"]
+    assert entity_attributes["resolver_path"] == case.expected_resolver_path
+    if case.expected_resolver_path == "model_fallback":
+        assert entity_attributes["model_calls"] in {1, 2}
+        assert entity_attributes["catalog_status"] == "verified"
     assert span_stages[:10] == [
         "context",
         "entity_resolution",

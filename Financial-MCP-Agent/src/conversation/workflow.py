@@ -293,7 +293,22 @@ class ControlledConversationWorkflow:
         skill_reranker: SkillRerankerPort | None = None,
         skill_rerank_top_k: int | None = None,
         tool_runtime: ToolRuntimePort | None = None,
+        entity_resolver: AuthoritativeEntityResolver | None = None,
     ) -> None:
+        """装配一条无 Web/数据库依赖的受控工作流。
+
+        Args:
+            model: 只基于已验收证据生成回答的模型端口。
+            tool: 执行已授权只读金融工具的端口。
+            trace: 接收低敏阶段事件的端口。
+            budget: 可选单轮步骤、重试与时间预算。
+            skill_catalog: 当前请求固定使用的 Skill 目录快照。
+            skill_loader: 按阶段裁剪 Skill 内容的可选加载器。
+            skill_reranker: 可选在线 Skill 候选重排端口。
+            skill_rerank_top_k: 允许进入在线重排的候选上限。
+            tool_runtime: 可选工具限流与熔断治理端口。
+            entity_resolver: 可注入的唯一异步实体解析器；默认使用离线确定性实现。
+        """
         self._trace = trace
         self._budget = budget or RunBudget()
         self._skill_loader = skill_loader
@@ -302,7 +317,7 @@ class ControlledConversationWorkflow:
         tool_catalog = ToolGovernanceCatalog.default()
         self._services = _WorkflowServices(
             context=ContextBuilder(),
-            entity=AuthoritativeEntityResolver(),
+            entity=entity_resolver or AuthoritativeEntityResolver(),
             router=TwoStageRouter(
                 catalog,
                 reranker=skill_reranker,
@@ -389,7 +404,7 @@ class ControlledConversationWorkflow:
             )
 
             started = time.perf_counter()
-            entity_result = self._services.entity.resolve(packet)
+            entity_result = await self._services.entity.resolve(packet)
             state.transition(RunPhase.ENTITY_RESOLVED)
             self._emit(
                 events,
@@ -401,6 +416,16 @@ class ControlledConversationWorkflow:
                 attributes=(
                     EventAttribute(key="candidate_count", value=len(entity_result.candidates)),
                     EventAttribute(key="confidence", value=entity_result.confidence),
+                    EventAttribute(
+                        key="resolver_path",
+                        value=entity_result.resolver_path.value,
+                    ),
+                    EventAttribute(key="model_calls", value=entity_result.model_calls),
+                    EventAttribute(key="repair_count", value=entity_result.repair_count),
+                    EventAttribute(
+                        key="catalog_status",
+                        value=entity_result.catalog_status.value,
+                    ),
                 ),
             )
 

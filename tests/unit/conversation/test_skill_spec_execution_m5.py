@@ -61,7 +61,7 @@ def _build_skill_plan(query: str):
     catalog_snapshot = registry.conversation_snapshot(runtime)
     loader = registry.get_loader(runtime)
     packet = ContextPacket(current_message=query)
-    entities = AuthoritativeEntityResolver().resolve(packet)
+    entities = asyncio.run(AuthoritativeEntityResolver().resolve(packet))
     route = TwoStageRouter(catalog_snapshot).route(packet, entities)
     rewrite = RouteAwareRewriter(catalog_snapshot, skill_loader=loader).rewrite(
         packet,

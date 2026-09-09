@@ -8,6 +8,10 @@ SYNTHESIS_PROMPT_VERSION = "chat-synthesis-v4"
 _SYNTHESIS_PROMPT_PATH = Path(__file__).with_name("synthesis_v4.md")
 SKILL_RERANK_PROMPT_VERSION = "skill-rerank-v1"
 _SKILL_RERANK_PROMPT_PATH = Path(__file__).with_name("skill_rerank_v1.md")
+ENTITY_RESOLUTION_PROMPT_VERSION = "entity-resolution-v1"
+_ENTITY_RESOLUTION_PROMPT_PATH = Path(__file__).with_name("entity_resolution_v1.md")
+ENTITY_RESOLUTION_REPAIR_PROMPT_VERSION = "entity-resolution-repair-v1"
+_ENTITY_RESOLUTION_REPAIR_PROMPT_PATH = Path(__file__).with_name("entity_resolution_repair_v1.md")
 
 
 def load_synthesis_prompt() -> str:
@@ -37,4 +41,34 @@ def load_skill_rerank_prompt() -> str:
     content = _SKILL_RERANK_PROMPT_PATH.read_text(encoding="utf-8").strip()
     if not content:
         raise RuntimeError("skill rerank prompt must not be empty")
+    return content
+
+
+def load_entity_resolution_prompt() -> str:
+    """读取只提出有限金融实体候选的版本化 Prompt。
+
+    Returns:
+        非空系统 Prompt；模型输出仍须经严格 schema 和权威目录回查。
+
+    Raises:
+        RuntimeError: Prompt 资产为空。
+    """
+    content = _ENTITY_RESOLUTION_PROMPT_PATH.read_text(encoding="utf-8").strip()
+    if not content:
+        raise RuntimeError("entity resolution prompt must not be empty")
+    return content
+
+
+def load_entity_resolution_repair_prompt() -> str:
+    """读取只允许修复 JSON 语法的版本化 Prompt。
+
+    Returns:
+        非空修复 Prompt；不得借修复更换候选或补充解释。
+
+    Raises:
+        RuntimeError: Prompt 资产为空。
+    """
+    content = _ENTITY_RESOLUTION_REPAIR_PROMPT_PATH.read_text(encoding="utf-8").strip()
+    if not content:
+        raise RuntimeError("entity resolution repair prompt must not be empty")
     return content

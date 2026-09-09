@@ -146,6 +146,12 @@ class Settings(BaseSettings):
     chat_router_model: str = "kimi-k2.5"
     chat_resolver_model: str = "kimi-k2.5"
     chat_skill_synthesis_model: str = ""
+    # 实体解析：确定性优先，模型最多一次语法修复，长尾结果由目录回查。
+    entity_resolution_timeout_sec: int = 8
+    entity_resolution_repair_attempts: int = 1
+    entity_catalog_ttl_sec: int = 300
+    entity_fuzzy_threshold: float = 0.75
+    entity_fuzzy_margin: float = 0.08
     # Skill rerank 默认关闭；开启时只允许接收 top-K routing metadata。
     skill_rerank_provider: str = "disabled"
     skill_rerank_model: str = ""
@@ -259,6 +265,30 @@ class Settings(BaseSettings):
             raise ValueError("skill_rerank_top_k must be between 1 and 5")
         return value
 
+    @field_validator("entity_resolution_repair_attempts")
+    @classmethod
+    def _validate_entity_resolution_repair_attempts(cls, value: int) -> int:
+        """只允许关闭修复或执行一次 JSON 语法修复。"""
+        if value not in {0, 1}:
+            raise ValueError("entity_resolution_repair_attempts must be zero or one")
+        return value
+
+    @field_validator("entity_fuzzy_threshold")
+    @classmethod
+    def _validate_entity_fuzzy_threshold(cls, value: float) -> float:
+        """限制确定性模糊命中的最低相似度。"""
+        if not 0 < value <= 1:
+            raise ValueError("entity_fuzzy_threshold must be in (0, 1]")
+        return value
+
+    @field_validator("entity_fuzzy_margin")
+    @classmethod
+    def _validate_entity_fuzzy_margin(cls, value: float) -> float:
+        """限制第一、第二候选的最小分差配置。"""
+        if not 0 <= value <= 1:
+            raise ValueError("entity_fuzzy_margin must be in [0, 1]")
+        return value
+
     @field_validator(
         "stm_context_budget_tokens",
         "stm_keep_recent",
@@ -295,6 +325,8 @@ class Settings(BaseSettings):
         "memory_index_worker_max_retries",
         "memory_index_worker_lease_sec",
         "skill_rerank_timeout_sec",
+        "entity_resolution_timeout_sec",
+        "entity_catalog_ttl_sec",
         "web_news_timeout_sec",
         "web_news_freshness_days",
         "web_news_rate_limit_per_min",

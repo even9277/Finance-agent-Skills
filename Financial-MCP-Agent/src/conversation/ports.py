@@ -8,6 +8,9 @@ from typing import Protocol
 from .contracts import (
     ConversationRequest,
     ConversationResult,
+    Entity,
+    EntityModelRequest,
+    EntityModelResolution,
     ModelSynthesisChunk,
     ModelSynthesisRequest,
     SkillRerankRequest,
@@ -19,6 +22,22 @@ from .contracts import (
     ToolRuntimeOutcome,
     WorkflowEvent,
 )
+
+
+class EntityResolutionModelPort(Protocol):
+    """隔离用于长尾候选提出的受控模型 Adapter。"""
+
+    async def resolve(self, request: EntityModelRequest) -> EntityModelResolution:
+        """返回已通过严格结构校验的候选与模型调用预算。"""
+        ...
+
+
+class EntityCatalogPort(Protocol):
+    """按 canonical symbol 回查权威金融实体目录。"""
+
+    async def lookup(self, symbol: str) -> Entity | None:
+        """返回目录确认实体；不存在时返回 `None`，不可用时抛稳定异常。"""
+        ...
 
 
 class ModelPort(Protocol):

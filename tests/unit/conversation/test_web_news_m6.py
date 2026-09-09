@@ -142,7 +142,7 @@ def test_market_move_plan_registers_optional_web_news_with_minimal_query() -> No
         recent_messages=("我的持仓成本是 180 元，内部策略叫 alpha-secret",),
         retrieved_memories=(),
     )
-    entities = AuthoritativeEntityResolver().resolve(packet)
+    entities = asyncio.run(AuthoritativeEntityResolver().resolve(packet))
     route = TwoStageRouter(snapshot).route(packet, entities)
     rewrite = RouteAwareRewriter(snapshot, skill_loader=loader).rewrite(packet, entities, route)
     assert rewrite.skill_name == "market-move-explain"
@@ -431,7 +431,7 @@ def test_web_failure_degrades_through_single_executor_but_web_alone_is_never_ana
     snapshot = registry.conversation_snapshot(runtime)
     loader = registry.get_loader(runtime)
     packet = ContextPacket(current_message="宁德时代今天为什么突然跌了")
-    entities = AuthoritativeEntityResolver().resolve(packet)
+    entities = asyncio.run(AuthoritativeEntityResolver().resolve(packet))
     route = TwoStageRouter(snapshot).route(packet, entities)
     rewrite = RouteAwareRewriter(snapshot, skill_loader=loader).rewrite(packet, entities, route)
     assert rewrite.skill_name is not None
