@@ -464,7 +464,9 @@ Before implementation, rollback is simply discarding the unexecuted plan. During
 - [x] Milestone 6: Protected Real API Acceptance
   - Completed: 2026-09-09
   - Evidence: `d09-live-01` 真实 WebSocket 链 1 passed / 2 deselected / 0 skipped，64.24s；resolver model `tongyi-xiaomi-analysis-pro`，synthesis `glm-5.1`，Tushare source、`model_fallback`、`601012.SH`、catalog verified 和脱敏均断言通过；随后 22 项离线回归 green。
-- [ ] Milestone 7: Review, PR, CI, Squash Merge, and Handoff
+- [x] Milestone 7: Review, PR, CI, Squash Merge, and Handoff
+  - Completed: 2026-09-09
+  - Evidence: commit `d56f505` pushed；PR #57 opened and linked to #56；four CI jobs green；two blocking self-review findings fixed before commit；squash merge and final SHA are recorded by GitHub and the final handoff after this governance record is pushed。
 
 ## 16. Decision Log
 
@@ -488,6 +490,7 @@ Before implementation, rollback is simply discarding the unexecuted plan. During
 | 2026-09-09 | 报告只接受一只 confirmed stock，并在构造 LangGraph state 前抛 `REPORT_ENTITY_UNRESOLVED` | 防止歧义、非股票和未确认候选进入四 Agent fan-out | M4 report tests |
 | 2026-09-09 | M5 采用仓库既有分层命令和完整 Compose，而非只重复 D09 focused tests | 验证实体合同未破坏记忆、报告治理、流式协议、前端或容器装配 | M5 verification |
 | 2026-09-09 | protected live 固定使用静态目录未包含的“隆基绿能”，并同时要求真实 Tushare 与真实流式 synthesis | 单凭显式代码或只测 Resolver Adapter 无法证明真实产品链的模型兜底 | M6 acceptance |
+| 2026-09-09 | PR 前独立视角 review 把代码侧 `allowed_types` 与二次 repair 失败计数列为 blocking | Prompt 不是安全边界，且实际外呼次数必须与 Trace 一致 | M7 review |
 
 ## 17. Surprises & Discoveries
 
@@ -507,10 +510,10 @@ Before implementation, rollback is simply discarding the unexecuted plan. During
 
 ## 18. Outcomes & Retrospective
 
-- What changed: 待实施后填写。
-- What was verified: 待实施后填写，不得预填结果。
-- What remains risky: 待真实 API、CI 和 review 后填写。
-- What should be improved next: 待本轮 bad case 和评测数据后填写。
+- What changed: 对话、报告、CLI 与生产工具统一为 async deterministic-first Resolver；长尾模型候选经过 strict schema、代码白名单和 Tushare grounding；旧 Prompt/解析器/正则调用路径已删除。
+- What was verified: full default 476 passed；frontend 54 passed/build green；offline Compose 367 passed；真实 D09 WebSocket + resolver model + Tushare + synthesis 1 passed；PR #57 四项 CI green。
+- What remains risky: 当前动态 Catalog 只覆盖 A 股股票，基金/指数/板块长尾目录仍为 deferred；fuzzy 阈值仅由固定样例校准；仓库既有 deprecation/前端 chunk warnings 未纳入 D09。
+- What should be improved next: 收集真实 bad cases 校准 fuzzy 与 alias；若产品要覆盖长尾基金/指数/板块，扩展同一 Catalog Port，不新增第二 Resolver；持续保留 protected live 单例费用门禁。
 
 ## 19. Deferred Work
 
